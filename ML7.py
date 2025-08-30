@@ -1708,14 +1708,3 @@ if "render_app" in globals():
 else:
     st.error("render_app() not found (this should not happen).")
 
-If you need a fresh requirements.txt, use:
-
-streamlit>=1.32,<2
-pandas>=2.1,<3
-numpy>=1.26,<3
-yfinance>=0.2.38,<0.3
-tzdata>=2024.1
-pytz>=2024.1
-
-Happy trading research 📈
-
