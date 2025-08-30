@@ -1913,7 +1913,7 @@ with tab3:
     st.caption("Real-time anchor touch pattern detection with market regime analysis")
     
     # ═══════════════════════════════════════════════════════════════════════════════
-    # INPUT CONTROLS WITH AUTO-UPDATE
+    # INPUT CONTROLS WITH AUTO-POPULATE FROM SPX
     # ═══════════════════════════════════════════════════════════════════════════════
     
     col1, col2 = st.columns(2)
@@ -1935,11 +1935,36 @@ with tab3:
     
     st.markdown("Reference Line Configuration")
     
+    # Auto-populate from SPX anchors if available
+    default_anchor_price = 6000.0
+    default_anchor_time = time(17, 0)
+    default_slope = 0.0
+    
+    if st.session_state.get('spx_analysis_ready', False):
+        # Check for skyline anchor first (preferred)
+        es_data = st.session_state.get('es_anchor_data', pd.DataFrame())
+        if not es_data.empty:
+            es_swings = detect_swings_simple(es_data)
+            es_skyline, es_baseline = get_anchor_points(es_swings)
+            
+            if es_skyline:
+                es_price, es_time = es_skyline
+                default_anchor_price = es_price + st.session_state.current_offset
+                default_anchor_time = es_time.astimezone(CT_TZ).time()
+                default_slope = st.session_state.spx_slopes['skyline']
+                st.info("Auto-populated from SPX Skyline anchor")
+            elif es_baseline:
+                es_price, es_time = es_baseline
+                default_anchor_price = es_price + st.session_state.current_offset
+                default_anchor_time = es_time.astimezone(CT_TZ).time()
+                default_slope = st.session_state.spx_slopes['baseline']
+                st.info("Auto-populated from SPX Baseline anchor")
+    
     ref_col1, ref_col2, ref_col3 = st.columns(3)
     with ref_col1:
         anchor_price = st.number_input(
             "Anchor Price",
-            value=6000.0,
+            value=default_anchor_price,
             step=0.1, format="%.2f",
             key="sig_anchor_price"
         )
@@ -1947,14 +1972,14 @@ with tab3:
     with ref_col2:
         anchor_time_input = st.time_input(
             "Anchor Time (CT)",
-            value=time(17, 0),
+            value=default_anchor_time,
             key="sig_anchor_time"
         )
     
     with ref_col3:
         ref_slope = st.number_input(
             "Slope per 30min",
-            value=0.268,
+            value=default_slope,
             step=0.001, format="%.3f",
             key="sig_ref_slope"
         )
@@ -2052,7 +2077,6 @@ with tab3:
 # ═══════════════════════════════════════════════════════════════════════════════
 # END OF SIGNALS & EMA TAB
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 
 
