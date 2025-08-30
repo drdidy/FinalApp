@@ -1935,30 +1935,73 @@ with tab3:
     
     st.markdown("Reference Line Configuration")
     
-    # Auto-populate from SPX anchors if available
-    default_anchor_price = 6000.0
-    default_anchor_time = time(17, 0)
-    default_slope = 0.0
+    # Auto-populate from SPX anchors - analyze BOTH skyline and baseline
+    skyline_config = None
+    baseline_config = None
     
     if st.session_state.get('spx_analysis_ready', False):
-        # Check for skyline anchor first (preferred)
         es_data = st.session_state.get('es_anchor_data', pd.DataFrame())
         if not es_data.empty:
             es_swings = detect_swings_simple(es_data)
             es_skyline, es_baseline = get_anchor_points(es_swings)
             
+            current_offset = st.session_state.current_offset
+            
             if es_skyline:
                 es_price, es_time = es_skyline
-                default_anchor_price = es_price + st.session_state.current_offset
-                default_anchor_time = es_time.astimezone(CT_TZ).time()
-                default_slope = st.session_state.spx_slopes['skyline']
-                st.info("Auto-populated from SPX Skyline anchor")
-            elif es_baseline:
+                skyline_config = {
+                    'price': es_price + current_offset,
+                    'time': es_time.astimezone(CT_TZ).time(),
+                    'slope': st.session_state.spx_slopes['skyline']
+                }
+            
+            if es_baseline:
                 es_price, es_time = es_baseline
-                default_anchor_price = es_price + st.session_state.current_offset
-                default_anchor_time = es_time.astimezone(CT_TZ).time()
-                default_slope = st.session_state.spx_slopes['baseline']
-                st.info("Auto-populated from SPX Baseline anchor")
+                baseline_config = {
+                    'price': es_price + current_offset,
+                    'time': es_time.astimezone(CT_TZ).time(),
+                    'slope': st.session_state.spx_slopes['baseline']
+                }
+    
+    # Display both anchor configurations
+    if skyline_config and baseline_config:
+        st.success("Auto-populated from both SPX Skyline and Baseline anchors")
+        
+        anchor_col1, anchor_col2 = st.columns(2)
+        with anchor_col1:
+            st.markdown("**Skyline Reference**")
+            st.write(f"Price: ${skyline_config['price']:.2f}")
+            st.write(f"Time: {skyline_config['time']}")
+            st.write(f"Slope: {skyline_config['slope']:+.3f}")
+        
+        with anchor_col2:
+            st.markdown("**Baseline Reference**")
+            st.write(f"Price: ${baseline_config['price']:.2f}")
+            st.write(f"Time: {baseline_config['time']}")
+            st.write(f"Slope: {baseline_config['slope']:+.3f}")
+        
+        # Use skyline as primary for reference line, but analyze both
+        default_anchor_price = skyline_config['price']
+        default_anchor_time = skyline_config['time']
+        default_slope = skyline_config['slope']
+        
+    elif skyline_config:
+        st.info("Auto-populated from SPX Skyline anchor only")
+        default_anchor_price = skyline_config['price']
+        default_anchor_time = skyline_config['time']
+        default_slope = skyline_config['slope']
+        
+    elif baseline_config:
+        st.info("Auto-populated from SPX Baseline anchor only")
+        default_anchor_price = baseline_config['price']
+        default_anchor_time = baseline_config['time']
+        default_slope = baseline_config['slope']
+        
+    else:
+        st.warning("No SPX anchors available - using manual configuration")
+        default_anchor_price = 6000.0
+        default_anchor_time = time(17, 0)
+        default_slope = 0.0
     
     ref_col1, ref_col2, ref_col3 = st.columns(3)
     with ref_col1:
