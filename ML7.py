@@ -377,11 +377,93 @@ with col3:
 
 
 
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # SPX PROPHET - PART 2: SPX ANCHORS TAB
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY/EXIT ANALYSIS FUNCTIONS (DEFINED FIRST)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calculate_entry_exit_table(projection_df: pd.DataFrame, anchor_type: str) -> pd.DataFrame:
+    """Calculate entry/exit probabilities and targets for each time slot"""
+    if projection_df.empty:
+        return pd.DataFrame()
+    
+    analysis_rows = []
+    
+    for idx, row in projection_df.iterrows():
+        time_slot = row['Time']
+        price = row['Price']
+        
+        # Calculate dynamic stops based on recent range
+        stop_distance = price * 0.008  # 0.8% dynamic stop
+        
+        # TP1 and TP2 calculations
+        tp1_distance = stop_distance * 1.5  # 1.5R
+        tp2_distance = stop_distance * 2.5  # 2.5R
+        
+        # Direction bias based on anchor type
+        is_bullish_bias = anchor_type in ['SKYLINE', 'HIGH'] and st.session_state.spx_slopes.get(anchor_type.lower(), 0) > 0
+        
+        if is_bullish_bias:
+            entry_price = price
+            stop_price = price - stop_distance
+            tp1_price = price + tp1_distance
+            tp2_price = price + tp2_distance
+            direction = "LONG"
+        else:
+            entry_price = price  
+            stop_price = price + stop_distance
+            tp1_price = price - tp1_distance
+            tp2_price = price - tp2_distance
+            direction = "SHORT"
+        
+        # Calculate probabilities based on anchor line interaction
+        entry_prob = calculate_entry_probability(price, anchor_type)
+        tp1_prob = calculate_target_probability(tp1_distance, stop_distance, 1)
+        tp2_prob = calculate_target_probability(tp2_distance, stop_distance, 2)
+        
+        analysis_rows.append({
+            'Time': time_slot,
+            'Direction': direction,
+            'Entry': round(entry_price, 2),
+            'Stop': round(stop_price, 2),
+            'TP1': round(tp1_price, 2),
+            'TP2': round(tp2_price, 2),
+            'Risk': round(stop_distance, 2),
+            'Entry_Prob': f"{entry_prob:.1f}%",
+            'TP1_Prob': f"{tp1_prob:.1f}%", 
+            'TP2_Prob': f"{tp2_prob:.1f}%"
+        })
+    
+    return pd.DataFrame(analysis_rows)
+
+def calculate_entry_probability(price: float, anchor_type: str) -> float:
+    """Calculate entry probability based on anchor line strength"""
+    # Base probability varies by anchor type
+    base_probs = {
+        'HIGH': 65, 'CLOSE': 70, 'LOW': 65,
+        'SKYLINE': 75, 'BASELINE': 80
+    }
+    
+    base_prob = base_probs.get(anchor_type, 65)
+    
+    # Adjust for time of day (market open has higher volatility)
+    # This is a simplified model - you can enhance based on your experience
+    return min(95, max(45, base_prob))
+
+def calculate_target_probability(target_distance: float, stop_distance: float, target_num: int) -> float:
+    """Calculate probability of reaching target based on risk-reward ratio"""
+    rr_ratio = target_distance / stop_distance
+    
+    # Probability decreases with higher R targets
+    if target_num == 1:  # TP1
+        base_prob = 70 - (rr_ratio - 1.5) * 10
+    else:  # TP2
+        base_prob = 45 - (rr_ratio - 2.5) * 8
+    
+    return min(85, max(25, base_prob))
 
 # Create main tabs
 tab1, tab2, tab3, tab4 = st.tabs(["📈 SPX Anchors", "📚 Stock Anchors", "✅ Signals & EMA", "🧮 Contract Tool"])
@@ -590,88 +672,8 @@ with tab1:
                 st.warning("No baseline anchor detected in ES data")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENTRY/EXIT ANALYSIS FUNCTIONS
+# END OF SPX ANCHORS TAB
 # ═══════════════════════════════════════════════════════════════════════════════
-
-def calculate_entry_exit_table(projection_df: pd.DataFrame, anchor_type: str) -> pd.DataFrame:
-    """Calculate entry/exit probabilities and targets for each time slot"""
-    if projection_df.empty:
-        return pd.DataFrame()
-    
-    analysis_rows = []
-    
-    for idx, row in projection_df.iterrows():
-        time_slot = row['Time']
-        price = row['Price']
-        
-        # Calculate dynamic stops based on recent range
-        stop_distance = price * 0.008  # 0.8% dynamic stop
-        
-        # TP1 and TP2 calculations
-        tp1_distance = stop_distance * 1.5  # 1.5R
-        tp2_distance = stop_distance * 2.5  # 2.5R
-        
-        # Direction bias based on anchor type
-        is_bullish_bias = anchor_type in ['SKYLINE', 'HIGH'] and st.session_state.spx_slopes.get(anchor_type.lower(), 0) > 0
-        
-        if is_bullish_bias:
-            entry_price = price
-            stop_price = price - stop_distance
-            tp1_price = price + tp1_distance
-            tp2_price = price + tp2_distance
-            direction = "LONG"
-        else:
-            entry_price = price  
-            stop_price = price + stop_distance
-            tp1_price = price - tp1_distance
-            tp2_price = price - tp2_distance
-            direction = "SHORT"
-        
-        # Calculate probabilities based on anchor line interaction
-        entry_prob = calculate_entry_probability(price, anchor_type)
-        tp1_prob = calculate_target_probability(tp1_distance, stop_distance, 1)
-        tp2_prob = calculate_target_probability(tp2_distance, stop_distance, 2)
-        
-        analysis_rows.append({
-            'Time': time_slot,
-            'Direction': direction,
-            'Entry': round(entry_price, 2),
-            'Stop': round(stop_price, 2),
-            'TP1': round(tp1_price, 2),
-            'TP2': round(tp2_price, 2),
-            'Risk': round(stop_distance, 2),
-            'Entry_Prob': f"{entry_prob:.1f}%",
-            'TP1_Prob': f"{tp1_prob:.1f}%", 
-            'TP2_Prob': f"{tp2_prob:.1f}%"
-        })
-    
-    return pd.DataFrame(analysis_rows)
-
-def calculate_entry_probability(price: float, anchor_type: str) -> float:
-    """Calculate entry probability based on anchor line strength"""
-    # Base probability varies by anchor type
-    base_probs = {
-        'HIGH': 65, 'CLOSE': 70, 'LOW': 65,
-        'SKYLINE': 75, 'BASELINE': 80
-    }
-    
-    base_prob = base_probs.get(anchor_type, 65)
-    
-    # Adjust for time of day (market open has higher volatility)
-    # This is a simplified model - you can enhance based on your experience
-    return min(95, max(45, base_prob))
-
-def calculate_target_probability(target_distance: float, stop_distance: float, target_num: int) -> float:
-    """Calculate probability of reaching target based on risk-reward ratio"""
-    rr_ratio = target_distance / stop_distance
-    
-    # Probability decreases with higher R targets
-    if target_num == 1:  # TP1
-        base_prob = 70 - (rr_ratio - 1.5) * 10
-    else:  # TP2
-        base_prob = 45 - (rr_ratio - 2.5) * 8
-    
-    return min(85, max(25, base_prob))
 
 
 
