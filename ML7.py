@@ -1,1710 +1,1728 @@
-# ============================================================
-# MarketLens Pro v5 — COMPLETE APP (single file)
-# Analytics-focused (no simulation). Advisory only.
-# - SPX Skyline/Baseline projections (08:30–14:30 CT)
-# - Stocks Skyline/Baseline (per-ticker, your STOCK_SLOPES)
-# - Contract Tool: entry/stop/target + probability overlay
-# - Signals & Probabilities engine (historical frequencies)
-# - yfinance normalizer (handles MultiIndex/duplicate columns)
-# - Brace-safe CSS (no f-string traps)
-# ============================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPX PROPHET - CLEAN VERSION
+# PART 1: FOUNDATION & STRATEGY (NO EXTERNAL DEPENDENCIES)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-from __future__ import annotations
-
-# ---------- Standard libs ----------
-import os
+import json
+import base64
 from datetime import datetime, date, time, timedelta
-from typing import Dict, List, Tuple, Optional
-
-# ---------- Third-party ----------
-import pandas as pd
+from copy import deepcopy
+from typing import Dict, List, Optional, Tuple
 import numpy as np
+import pandas as pd
 import streamlit as st
 
-# ---------- Streamlit page config (must be early) ----------
+# ═══════════════════════════════════════════════════════════════════════════════
+# STRATEGY CLASS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SPXForecastStrategy:
+    """Core SPX forecasting strategy based on time-block calculations and slope projections."""
+    
+    def __init__(self):
+        # Default slopes for each asset
+        self.base_slopes = {
+            "SPX_HIGH": -0.2792, "SPX_CLOSE": -0.2792, "SPX_LOW": -0.2792,
+            "TSLA": -0.1508, "NVDA": -0.0485, "AAPL": -0.0750,
+            "MSFT": -0.17, "AMZN": -0.03, "GOOGL": -0.07,
+            "META": -0.035, "NFLX": -0.23,
+        }
+        
+        # Current slopes (can be modified)
+        self.slopes = self.base_slopes.copy()
+        
+        # SPX operates 8:30-14:30, others 7:30-14:30
+        self.spx_start_time = time(8, 30)
+        self.general_start_time = time(7, 30)
+    
+    def generate_time_slots(self, start_time: time = None) -> List[str]:
+        """Generate 30-minute time slots for forecasting."""
+        if start_time is None:
+            start_time = self.general_start_time
+            
+        base = datetime(2025, 1, 1, start_time.hour, start_time.minute)
+        slots = []
+        
+        # Calculate number of slots (15 total, minus 2 if SPX starts at 8:30)
+        num_slots = 15 - (2 if start_time.hour == 8 and start_time.minute == 30 else 0)
+        
+        for i in range(num_slots):
+            slot_time = base + timedelta(minutes=30 * i)
+            slots.append(slot_time.strftime("%H:%M"))
+            
+        return slots
+    
+    def calculate_spx_blocks(self, anchor_time: datetime, target_time: datetime) -> int:
+        """Calculate time blocks for SPX (skips 4:00 PM hour)."""
+        blocks = 0
+        current = anchor_time
+        
+        while current < target_time:
+            if current.hour != 16:  # Skip 4:00 PM hour
+                blocks += 1
+            current += timedelta(minutes=30)
+            
+        return blocks
+    
+    def calculate_stock_blocks(self, anchor_time: datetime, target_time: datetime) -> int:
+        """Calculate time blocks for regular stocks (simple 30-min intervals)."""
+        time_diff = target_time - anchor_time
+        return max(0, int(time_diff.total_seconds() // 1800))  # 1800 seconds = 30 minutes
+    
+    def project_price(self, base_price: float, slope: float, blocks: int) -> float:
+        """Core price projection formula."""
+        return base_price + (slope * blocks)
+    
+    def generate_forecast_table(self, base_price: float, slope: float, anchor_time: datetime, 
+                              forecast_date: date, is_spx: bool = True, fan_mode: bool = False) -> pd.DataFrame:
+        """Generate a forecast table for given parameters."""
+        
+        # Get appropriate time slots
+        start_time = self.spx_start_time if is_spx else self.general_start_time
+        slots = self.generate_time_slots(start_time)
+        
+        rows = []
+        for slot in slots:
+            hour, minute = map(int, slot.split(":"))
+            target_time = datetime.combine(forecast_date, time(hour, minute))
+            
+            # Calculate blocks based on asset type
+            if is_spx:
+                blocks = self.calculate_spx_blocks(anchor_time, target_time)
+            else:
+                blocks = self.calculate_stock_blocks(anchor_time, target_time)
+            
+            # Generate projection
+            if fan_mode:
+                # Fan mode: entry and exit prices
+                entry_price = self.project_price(base_price, slope, blocks)
+                exit_price = self.project_price(base_price, -slope, blocks)
+                rows.append({
+                    "Time": slot,
+                    "Entry": round(entry_price, 2),
+                    "Exit": round(exit_price, 2)
+                })
+            else:
+                # Regular mode: single projected price
+                projected_price = self.project_price(base_price, slope, blocks)
+                rows.append({
+                    "Time": slot,
+                    "Projected": round(projected_price, 2)
+                })
+        
+        return pd.DataFrame(rows)
+    
+    def spx_forecast(self, high_price: float, high_time: time, close_price: float, close_time: time,
+                    low_price: float, low_time: time, forecast_date: date) -> Dict[str, pd.DataFrame]:
+        """Generate SPX forecast with all three anchor points."""
+        
+        # Create anchor datetimes (previous day)
+        prev_day = forecast_date - timedelta(days=1)
+        high_anchor = datetime.combine(prev_day, high_time)
+        close_anchor = datetime.combine(prev_day, close_time)
+        low_anchor = datetime.combine(prev_day, low_time)
+        
+        forecasts = {}
+        
+        # Generate forecasts for each anchor
+        for anchor_type, price, anchor_time, slope_key in [
+            ("High", high_price, high_anchor, "SPX_HIGH"),
+            ("Close", close_price, close_anchor, "SPX_CLOSE"),
+            ("Low", low_price, low_anchor, "SPX_LOW")
+        ]:
+            forecasts[anchor_type] = self.generate_forecast_table(
+                price, self.slopes[slope_key], anchor_time, forecast_date, 
+                is_spx=True, fan_mode=True
+            )
+        
+        return forecasts
+    
+    def contract_line_forecast(self, low1_price: float, low1_time: time, low2_price: float, 
+                             low2_time: time, forecast_date: date) -> Tuple[pd.DataFrame, Dict]:
+        """Generate contract line forecast using two-point interpolation."""
+        
+        # Create anchor datetime
+        anchor_time = datetime.combine(forecast_date, low1_time)
+        
+        # Calculate slope between the two points
+        low2_datetime = datetime.combine(forecast_date, low2_time)
+        blocks_between = self.calculate_spx_blocks(anchor_time, low2_datetime)
+        
+        if blocks_between == 0:
+            slope = 0
+        else:
+            slope = (low2_price - low1_price) / blocks_between
+        
+        # Generate forecast table
+        forecast_table = self.generate_forecast_table(
+            low1_price, slope, anchor_time, forecast_date, 
+            is_spx=False, fan_mode=False
+        )
+        
+        # Return table and contract parameters for lookup
+        contract_params = {
+            "anchor_time": anchor_time,
+            "slope": slope,
+            "base_price": low1_price
+        }
+        
+        return forecast_table, contract_params
+    
+    def lookup_contract_price(self, contract_params: Dict, lookup_time: time, forecast_date: date) -> float:
+        """Look up contract price at any specific time."""
+        if not contract_params:
+            return 0.0
+            
+        target_time = datetime.combine(forecast_date, lookup_time)
+        blocks = self.calculate_spx_blocks(contract_params["anchor_time"], target_time)
+        
+        return self.project_price(contract_params["base_price"], contract_params["slope"], blocks)
+    
+    def stock_forecast(self, ticker: str, low_price: float, low_time: time,
+                      high_price: float, high_time: time, forecast_date: date) -> Dict[str, pd.DataFrame]:
+        """Generate stock forecast with low and high anchors."""
+        
+        if ticker not in self.slopes:
+            raise ValueError(f"Unknown ticker: {ticker}")
+        
+        # Create anchor datetimes
+        low_anchor = datetime.combine(forecast_date, low_time)
+        high_anchor = datetime.combine(forecast_date, high_time)
+        
+        forecasts = {
+            "Low": self.generate_forecast_table(
+                low_price, self.slopes[ticker], low_anchor, forecast_date,
+                is_spx=False, fan_mode=True
+            ),
+            "High": self.generate_forecast_table(
+                high_price, self.slopes[ticker], high_anchor, forecast_date,
+                is_spx=False, fan_mode=True
+            )
+        }
+        
+        return forecasts
+    
+    def update_slope(self, asset: str, new_slope: float):
+        """Update slope for a specific asset."""
+        if asset in self.slopes:
+            self.slopes[asset] = new_slope
+    
+    def reset_slopes(self):
+        """Reset all slopes to default values."""
+        self.slopes = self.base_slopes.copy()
+    
+    def get_available_tickers(self) -> List[str]:
+        """Get list of available stock tickers."""
+        return [k for k in self.slopes.keys() if not k.startswith("SPX_")]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE CONFIGURATION & INITIALIZATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
 st.set_page_config(
-    page_title="MarketLens Pro v5",
-    page_icon="📈",
+    page_title="SPX Prophet",
+    page_icon="🔮",
     layout="wide",
     initial_sidebar_state="expanded",
+    menu_items={'About': "SPX Prophet - Advanced Financial Forecasting Tool"}
 )
 
-# ---------- Timezones ----------
-try:
-    from zoneinfo import ZoneInfo
-    CT = ZoneInfo("America/Chicago")
-    UTC = ZoneInfo("UTC")
-    _HAS_PYTZ = False
-except Exception:
-    import pytz  # type: ignore
-    CT = pytz.timezone("America/Chicago")
-    UTC = pytz.UTC
-    _HAS_PYTZ = True
+# Initialize strategy
+@st.cache_resource
+def get_strategy():
+    return SPXForecastStrategy()
 
-# Optional data provider
-try:
-    import yfinance as yf  # noqa: F401
-    HAS_YF = True
-except Exception:
-    HAS_YF = False
+strategy = get_strategy()
 
-# ---------- App meta ----------
-APP_NAME = "MarketLens Pro v5"
-APP_TAGLINE = "Analytics for SPX Entries (No Simulation • Advisory Only)"
-APP_VERSION = "6.1.0"
+# Session state initialization
+if 'current_forecasts' not in st.session_state:
+    st.session_state.current_forecasts = {}
+if 'contract_params' not in st.session_state:
+    st.session_state.contract_params = {}
+if 'contract_table' not in st.session_state:
+    st.session_state.contract_table = pd.DataFrame()
+if 'selected_page' not in st.session_state:
+    st.session_state.selected_page = "SPX"
 
-# ============================================================
-# HIDDEN MODEL CONSTANTS (your latest slopes)
-# ============================================================
-# SPX per 30-minute block
-SPX_SLOPES = {
-    "skyline": 0.268,   # positive
-    "baseline": -0.235  # negative
+# ═══════════════════════════════════════════════════════════════════════════════
+# STYLING & CSS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+.main {
+    font-family: 'Inter', sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
 }
 
-# Stock slope magnitudes (± per 30-minute block)
-STOCK_SLOPES = {
-    "AAPL": 0.0155,
-    "MSFT": 0.0541,
-    "NVDA": 0.0086,
-    "AMZN": 0.0139,
-    "GOOGL": 0.0122,
-    "TSLA": 0.0285,
-    "META": 0.0674,
-    "NFLX": 0.0230,
-}
-CORE_SYMBOLS = list(STOCK_SLOPES.keys())
-
-# ============================================================
-# STRATEGY HYPOTHESES (analytics only)
-# ============================================================
-HYPOTHESES = {
-    "H1_BASELINE_TOUCH_LONG": dict(
-        id="H1_BASELINE_TOUCH_LONG",
-        title="Baseline Touch → Long (Call)",
-        definition=(
-            "If RTH underlying price touches the Baseline anchor (drawn from the previous session window), "
-            "probability of an upward reaction increases; analyze historical frequency of bounce vs fail."
-        ),
-    ),
-    "H2_SKYLINE_OVN_DROP_SHORT": dict(
-        id="H2_SKYLINE_OVN_DROP_SHORT",
-        title="Skyline Touch + Overnight Drop → Short (Put)",
-        definition=(
-            "If underlying touches Skyline anchor and subsequently trades below it through the overnight, "
-            "opening below into RTH, probability of downside continuation increases; analyze follow-through vs reclaim."
-        ),
-    ),
+.hero-container {
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.1), rgba(139, 92, 246, 0.1));
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    backdrop-filter: blur(10px);
+    padding: 2rem;
+    margin: 1rem 0;
+    text-align: center;
+    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
 }
 
-PROB_KEYS = [
-    "direction_prob_up",
-    "direction_prob_down",
-    "entry_success_prob",
-    "exit_success_prob",
-]
-
-# ============================================================
-# UTILS
-# ============================================================
-def get_env_flag(name: str, default: bool = False) -> bool:
-    v = str(os.environ.get(name, "")).strip().lower()
-    if v in ("1", "true", "yes", "y", "on"): return True
-    if v in ("0", "false", "no", "n", "off"): return False
-    return default
-
-def now_ct() -> datetime:
-    return datetime.now(tz=CT)
-
-def to_ct(dt: datetime) -> datetime:
-    if getattr(dt, "tzinfo", None) is None:
-        return dt.replace(tzinfo=CT) if not _HAS_PYTZ else CT.localize(dt)
-    try:
-        return dt.astimezone(CT)
-    except Exception:
-        try:
-            return dt.tz_convert(CT)  # pandas Timestamp
-        except Exception:
-            return dt
-
-def to_utc(dt: datetime) -> datetime:
-    if getattr(dt, "tzinfo", None) is None:
-        return dt.replace(tzinfo=UTC) if not _HAS_PYTZ else UTC.localize(dt)
-    try:
-        return dt.astimezone(UTC)
-    except Exception:
-        try:
-            return dt.tz_convert(UTC)
-        except Exception:
-            return dt
-
-def ensure_dtindex_utc(df: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise TypeError("DataFrame index must be a pandas.DatetimeIndex")
-    tz = getattr(df.index, "tz", None)
-    if tz is None:
-        df.index = df.index.tz_localize(UTC)
-    elif tz != UTC:
-        df.index = df.index.tz_convert(UTC)
-    return df
-
-def normalize_ohlcv(df: pd.DataFrame, symbol: str | None = None) -> pd.DataFrame:
-    """
-    Make yfinance output predictable:
-      - If MultiIndex columns, pick the given symbol or the only top level.
-      - Drop duplicate columns.
-      - Map 'Adj Close' -> 'Close' if 'Close' missing.
-      - Keep only ['Open','High','Low','Close','Volume'].
-      - Ensure numeric dtype for OHLCV.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    # If MultiIndex (e.g., ('ES=F','Open')), reduce to one level
-    if isinstance(df.columns, pd.MultiIndex):
-        lv0 = df.columns.get_level_values(0)
-        if symbol is not None and symbol in set(lv0):
-            df = df.xs(symbol, axis=1, level=0, drop_level=True)
-        else:
-            uniq0 = list(dict.fromkeys(lv0))
-            if len(uniq0) == 1:
-                df = df.droplevel(0, axis=1)
-            else:
-                df = df.xs(uniq0[0], axis=1, level=0, drop_level=True)
-
-    # Remove duplicate column names
-    if df.columns.duplicated().any():
-        df = df.loc[:, ~df.columns.duplicated()]
-
-    # Use Adj Close if Close missing
-    if "Close" not in df.columns and "Adj Close" in df.columns:
-        df = df.rename(columns={"Adj Close": "Close"})
-
-    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-    if keep:
-        df = df[keep].copy()
-
-    for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    return df
-
-# Trading day helpers
-def previous_weekday(d: date) -> date:
-    while d.weekday() >= 5: d -= timedelta(days=1)
-    return d
-
-def next_weekday(d: date) -> date:
-    while d.weekday() >= 5: d += timedelta(days=1)
-    return d
-
-# ============================================================
-# SESSION STATE INIT
-# ============================================================
-DEFAULT_THEME = {
-    "bg_gradient": (
-        "radial-gradient(1200px 800px at 10% -10%, rgba(255,255,255,0.06), transparent), "
-        "linear-gradient(135deg, #0e0f13 0%, #0a0b10 40%, #0b111b 100%)"
-    ),
-    "card_bg": "rgba(255,255,255,0.06)",
-    "card_border": "rgba(255,255,255,0.10)",
-    "accent": "#7dd3fc",
-    "accent_hi": "#22d3ee",
-    "text": "rgba(255,255,255,0.92)",
-    "muted": "rgba(255,255,255,0.65)",
-    "danger": "#ef4444",
-    "success": "#22c55e",
-    "warning": "#f59e0b",
+.hero-title {
+    font-size: 3rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 0.5rem;
 }
 
-def init_state() -> None:
-    ss = st.session_state
-    ss.setdefault("theme", DEFAULT_THEME.copy())
+.hero-subtitle {
+    font-size: 1.2rem;
+    color: rgba(255, 255, 255, 0.7);
+    margin-bottom: 1rem;
+}
 
-    # Hidden model constants
-    ss.setdefault("spx_slopes", SPX_SLOPES.copy())
-    ss.setdefault("stock_slopes", STOCK_SLOPES.copy())
+.metric-card {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    padding: 1.5rem;
+    backdrop-filter: blur(10px);
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+    transition: all 0.3s ease;
+    height: 100%;
+}
 
-    # Analytics config
-    ss.setdefault("analytics", {
-        "lookahead_blocks": 4,  # N x 30-min blocks
-        "rr_target": 1.0,       # reward:risk
-        "stop_blocks": 2,       # not used directly (we use risk_points), kept for future
-        "use_close_only": True,
-        "risk_points": 5.0,     # default risk unit for entries
-    })
+.metric-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.15);
+    border-color: rgba(255, 255, 255, 0.2);
+}
 
-    # Contract tool
-    ss.setdefault("contracts", {
-        "overnight_call_entry_price": None,  # call at swing low
-        "overnight_put_entry_price": None,   # put at skyline touch
-    })
+.input-container {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    padding: 1.5rem;
+    backdrop-filter: blur(10px);
+    margin: 1rem 0;
+}
 
-    ss.setdefault("strategy_hypotheses", HYPOTHESES.copy())
-    ss.setdefault("settings", {
-        "timezone": "America/Chicago",
-        "debug": get_env_flag("MLPRO_DEBUG", False),
-    })
-    ss.setdefault("nav", "Dashboard")
+/* Hide Streamlit elements */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
 
-# ============================================================
-# THEMING (brace-safe CSS via Template; no f-strings here)
-# ============================================================
-from string import Template
+/* Animation */
+.fade-in {
+    animation: fadeIn 0.6s ease-out;
+}
 
-def inject_css(theme: Dict[str, str]) -> None:
-    bg     = theme["bg_gradient"]
-    card   = theme["card_bg"]
-    border = theme["card_border"]
-    text   = theme["text"]
-    muted  = theme["muted"]
-    accent = theme["accent"]
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+</style>
+""", unsafe_allow_html=True)
 
-    tpl = Template("""
-    <style>
-      /* App background */
-      [data-testid="stAppViewContainer"] {
-        background: $bg;
-      }
-      /* Subtle star sparkle */
-      @keyframes floatSparkles {
-        0% { background-position: 0px 0px, 0px 0px; }
-        100% { background-position: 1000px 1000px, -800px 600px; }
-      }
-      [data-testid="stAppViewContainer"]::before {
-        content: "";
-        position: fixed; inset: 0; pointer-events: none;
-        background-image:
-          radial-gradient(2px 2px at 20% 30%, rgba(255,255,255,0.12), transparent 40%),
-          radial-gradient(1px 1px at 70% 10%, rgba(255,255,255,0.10), transparent 45%);
-        animation: floatSparkles 60s linear infinite;
-      }
-      /* Global type color */
-      html, body, [data-testid="stAppViewContainer"] * { color: $text; }
-      /* Sidebar */
-      section[data-testid="stSidebar"] > div {
-        background: $card;
-        backdrop-filter: blur(22px);
-        border-right: 1px solid $border;
-      }
-      section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
-      section[data-testid="stSidebar"] label,
-      section[data-testid="stSidebar"] span { color: $muted; }
-      /* Glass cards */
-      .ml-card {
-        background: $card;
-        border: 1px solid $border;
-        border-radius: 16px;
-        padding: 18px 18px;
-        box-shadow: 0 8px 30px rgba(0,0,0,0.18);
-        transition: transform .25s ease, box-shadow .25s ease, border-color .25s ease;
-      }
-      .ml-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 16px 54px rgba(0,0,0,0.25);
-        border-color: $accent;
-      }
-      .pill {
-        display:inline-block; padding:2px 10px; border-radius:999px;
-        border:1px solid $border; background: rgba(255,255,255,0.04);
-        color:$muted; font-size:12px;
-      }
-      .brand-title { font-weight:700; letter-spacing:.3px; font-size:20px; }
-      .muted { color:$muted; }
-      .stButton > button {
-        border-radius: 12px; border:1px solid $border;
-        background: rgba(255,255,255,0.05);
-        transition: box-shadow .2s ease, transform .2s ease, border-color .2s ease;
-      }
-      .stButton > button:hover {
-        border-color:$accent; transform: translateY(-1px);
-        box-shadow:0 10px 30px rgba(0,0,0,0.25);
-      }
-    </style>
-    """)
-    css = tpl.substitute(bg=bg, card=card, border=border, text=text, muted=muted, accent=accent)
-    st.markdown(css, unsafe_allow_html=True)
+# ═══════════════════════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ============================================================
-# UI COMPONENTS (topbar)
-# ============================================================
-def topbar():
-    t = now_ct().strftime("%a, %b %d • %I:%M %p CT")
-    cols = st.columns([1.2, 1, 1, 1])
-    with cols[0]:
-        st.markdown(
-            f"""
-            <div class="ml-card" style="padding:14px 16px; display:flex; align-items:center; gap:12px;">
-              <div class="pill">v{APP_VERSION}</div>
-              <div class="brand-title">{APP_NAME}</div>
-              <div class="muted" style="margin-left:8px;">{APP_TAGLINE}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with cols[1]:
-        st.markdown(
-            f"""
-            <div class="ml-card" style="text-align:center">
-              <div class="muted">Clock</div>
-              <div style="font-size:18px; font-weight:600">{t}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with cols[2]:
-        st.markdown(
-            f"""
-            <div class="ml-card" style="text-align:center">
-              <div class="muted">Data Provider</div>
-              <div style="font-size:18px; font-weight:600">{'yfinance ✓' if HAS_YF else 'yfinance —'}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with cols[3]:
-        st.markdown(
-            f"""
-            <div class="ml-card" style="text-align:center">
-              <div class="muted">Mode</div>
-              <div style="font-size:18px; font-weight:600">
-                {'Debug' if st.session_state['settings']['debug'] else 'Standard'}
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-# ============================================================
-# RTH & session windows
-# ============================================================
-RTH_START = time(8, 30)   # 08:30 CT
-RTH_END   = time(14, 30)  # 14:30 CT
-
-def prev_trading_day_base(now_ct_val: datetime) -> date:
-    return previous_weekday((now_ct_val - timedelta(days=1)).date())
-
-def projection_day_default(now_ct_val: datetime) -> date:
-    d = now_ct_val.date()
-    return d if d.weekday() < 5 else next_weekday(d)
-
-def generate_rth_times_ct(day: date) -> List[datetime]:
-    slots: List[datetime] = []
-    t = datetime.combine(day, RTH_START, tzinfo=CT)
-    end_dt = datetime.combine(day, RTH_END, tzinfo=CT)
-    while t <= end_dt:
-        slots.append(t)
-        t += timedelta(minutes=30)
-    return slots
-
-def _as_ct(dt_like) -> datetime:
-    """Ensure tz-aware CT datetime from pandas.Timestamp or datetime."""
-    if hasattr(dt_like, "to_pydatetime"):
-        dt_like = dt_like.to_pydatetime()
-    if getattr(dt_like, "tzinfo", None) is None:
-        try:
-            return dt_like.replace(tzinfo=CT)
-        except Exception:
-            return CT.localize(dt_like)  # pytz path
-    try:
-        return dt_like.astimezone(CT)
-    except Exception:
-        try:
-            return dt_like.tz_convert(CT)  # pandas
-        except Exception:
-            return dt_like
-
-# ============================================================
-# yfinance fetchers (normalized)
-# ============================================================
-def _yf_download(symbol: str, start_dt_utc: datetime, end_dt_utc: datetime, interval: str = "30m") -> pd.DataFrame:
-    if not HAS_YF:
-        return pd.DataFrame()
-    df = yf.download(
-        symbol,
-        interval=interval,
-        start=start_dt_utc.replace(tzinfo=None),
-        end=end_dt_utc.replace(tzinfo=None),
-        progress=False,
-        auto_adjust=True,
-        prepost=False,
-        threads=True,
-        group_by="column",
-    )
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df.index = pd.to_datetime(df.index)
-    df = ensure_dtindex_utc(df)
-    df = normalize_ohlcv(df, symbol=symbol)
-    return df
-
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=64)
-def _yf_download_cached(symbol: str, start_dt_utc: datetime, end_dt_utc: datetime, interval: str = "30m") -> pd.DataFrame:
-    if not HAS_YF:
-        return pd.DataFrame()
-    df = yf.download(
-        symbol,
-        interval=interval,
-        start=start_dt_utc.replace(tzinfo=None),
-        end=end_dt_utc.replace(tzinfo=None),
-        progress=False,
-        auto_adjust=True,
-        prepost=False,
-        threads=True,
-        group_by="column",
-    )
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df.index = pd.to_datetime(df.index)
-    df = ensure_dtindex_utc(df)
-    df = normalize_ohlcv(df, symbol=symbol)
-    return df
-
-def _yf_download_ext(symbol: str, start_dt_utc: datetime, end_dt_utc: datetime,
-                     interval: str = "30m", prepost: bool = True) -> pd.DataFrame:
-    if not HAS_YF:
-        return pd.DataFrame()
-    df = yf.download(
-        symbol,
-        interval=interval,
-        start=start_dt_utc.replace(tzinfo=None),
-        end=end_dt_utc.replace(tzinfo=None),
-        progress=False,
-        auto_adjust=True,
-        prepost=prepost,
-        threads=True,
-        group_by="column",
-    )
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df.index = pd.to_datetime(df.index)
-    df = ensure_dtindex_utc(df)
-    df = normalize_ohlcv(df, symbol=symbol)
-    return df
-
-# ============================================================
-# Fetchers using the above
-# ============================================================
-def fetch_es_30m_for_prev_day_window(prev_day: date) -> pd.DataFrame:
+def create_metric_card(icon: str, title: str, value: str, subtitle: str = ""):
+    """Create a beautiful metric card"""
+    return f"""
+    <div class="metric-card fade-in">
+        <div style="font-size: 2.5rem; margin-bottom: 1rem;">{icon}</div>
+        <div style="font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem;">{value}</div>
+        <div style="font-size: 0.9rem; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.5px;">{title}</div>
+        {f'<div style="font-size: 0.8rem; margin-top: 0.5rem; opacity: 0.6;">{subtitle}</div>' if subtitle else ''}
+    </div>
     """
-    Fetch ES futures (ES=F) for the previous trading day's 'Asian window' 17:00–19:30 CT.
-    """
-    start_ct = datetime.combine(prev_day, time(0, 0), tzinfo=CT)
-    end_ct   = datetime.combine(prev_day + timedelta(days=1), time(23, 59), tzinfo=CT)
-    df = _yf_download("ES=F", to_utc(start_ct), to_utc(end_ct), interval="30m")
-    if df.empty:
-        return df
-    df_ct = df.tz_convert(CT)
-    win_start = datetime.combine(prev_day, time(17, 0), tzinfo=CT)
-    win_end   = datetime.combine(prev_day, time(19, 30), tzinfo=CT)
-    df_ct = df_ct.loc[(df_ct.index >= win_start) & (df_ct.index <= win_end)].copy()
-    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df_ct.columns]
-    return df_ct[cols] if cols else df_ct
 
-def _fetch_symbol_30m_ct_range(symbol: str, start_ct: datetime, end_ct: datetime) -> pd.DataFrame:
-    df = _yf_download_cached(symbol, to_utc(start_ct), to_utc(end_ct), interval="30m")
-    if df.empty:
-        return df
-    return df.tz_convert(CT)
-
-def fetch_rth_30m_for_day(symbol: str, day: date) -> pd.DataFrame:
-    """Fetch an entire calendar day and filter to 08:30–14:30 CT."""
-    start_ct = datetime.combine(day, time(0, 0), tzinfo=CT)
-    end_ct   = datetime.combine(day, time(23, 59), tzinfo=CT)
-    df_ct = _fetch_symbol_30m_ct_range(symbol, start_ct, end_ct)
-    if df_ct.empty:
-        return df_ct
-    rth_mask = (df_ct.index.time >= time(8,30)) & (df_ct.index.time <= time(14,30))
-    return df_ct.loc[rth_mask].copy()
-
-def fetch_equity_30m_for_prev_day_window(symbol: str, prev_day: date) -> pd.DataFrame:
-    """
-    For equities, use extended-hours to capture 17:00–19:30 CT.
-    """
-    start_ct = datetime.combine(prev_day, time(0, 0), tzinfo=CT)
-    end_ct   = datetime.combine(prev_day + timedelta(days=1), time(23, 59), tzinfo=CT)
-    df = _yf_download_ext(symbol, to_utc(start_ct), to_utc(end_ct), interval="30m", prepost=True)
-    if df.empty:
-        return df
-    df_ct = df.tz_convert(CT)
-    win_start = datetime.combine(prev_day, time(17, 0), tzinfo=CT)
-    win_end   = datetime.combine(prev_day, time(19, 30), tzinfo=CT)
-    df_ct = df_ct.loc[(df_ct.index >= win_start) & (df_ct.index <= win_end)].copy()
-    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df_ct.columns]
-    return df_ct[cols] if cols else df_ct
-
-# ============================================================
-# Anchors, projections, analytics helpers
-# ============================================================
-def kth_extreme_by_close(df_ct: pd.DataFrame, k: int = 1) -> Tuple[Tuple[Optional[float], Optional[datetime]], Tuple[Optional[float], Optional[datetime]]]:
-    """
-    Return ((kth_high_close, t_high), (kth_low_close, t_low)) from df.
-    k=1 -> highest/lowest, k=2 -> second highest/lowest, etc.
-    """
-    if df_ct.empty or "Close" not in df_ct.columns:
-        return (None, None), (None, None)
-
-    highs = df_ct.sort_values("Close", ascending=False).iloc[:k]
-    lows  = df_ct.sort_values("Close", ascending=True).iloc[:k]
-    if len(highs) < k or len(lows) < k:
-        return (None, None), (None, None)
-
-    kth_high_row = highs.iloc[-1]
-    kth_low_row  = lows.iloc[-1]
-    kth_high_price = float(kth_high_row["Close"])
-    kth_low_price  = float(kth_low_row["Close"])
-    kth_high_time = highs.index[-1]
-    kth_low_time  = lows.index[-1]
-    return (kth_high_price, kth_high_time), (kth_low_price, kth_low_time)
-
-def build_projection_table(anchor_price: float, anchor_time_ct: datetime, slope_per_block: float, slots_ct: List[datetime]) -> pd.DataFrame:
-    """
-    Slope units = price change per 30-min block.
-    Price(t) = anchor_price + slope * blocks_since_anchor
-    """
-    rows = []
-    for t in slots_ct:
-        delta_minutes = (t - anchor_time_ct).total_seconds() / 60.0
-        blocks = int(np.floor(delta_minutes / 30.0))
-        price = anchor_price + slope_per_block * blocks
-        rows.append({"Time_CT": t.strftime("%Y-%m-%d %H:%M"), "Price": round(price, 4)})
-    return pd.DataFrame(rows)
-
-def line_value_at(anchor_price: float, anchor_time_ct: datetime, slope_per_block: float, t: datetime) -> float:
-    """Value of projected line at time t (30m blocks)."""
-    blocks = int(np.floor((t - anchor_time_ct).total_seconds() / 60.0 / 30.0))
-    return float(anchor_price + slope_per_block * blocks)
-
-def first_touch_time(rth_df_ct: pd.DataFrame, anchor_price: float, anchor_time_ct: datetime,
-                     slope_per_block: float, touch_pad: float = 0.0) -> Optional[datetime]:
-    """
-    Return the first RTH bar time where the bar's [Low, High] touches the projected line (±touch_pad).
-    """
-    if rth_df_ct.empty:
-        return None
-    for t, row in rth_df_ct.iterrows():
-        lv = line_value_at(anchor_price, anchor_time_ct, slope_per_block, t)
-        lo = float(row.get("Low", np.nan))
-        hi = float(row.get("High", np.nan))
-        if np.isnan(lo) or np.isnan(hi):
-            continue
-        if (lo - touch_pad) <= lv <= (hi + touch_pad):
-            return _as_ct(t)
-    return None
-
-def evaluate_path_long(rth_df_ct: pd.DataFrame, entry_time: datetime, entry_price: float,
-                       lookahead_blocks: int, risk_points: float, rr_target: float) -> Tuple[bool, bool, Optional[datetime]]:
-    """
-    Long logic (Baseline-touch):
-      - entry_success: did High reach entry + rr*risk before Low hit entry - risk, within horizon?
-      - exit_success:  Close at horizon >= entry (favorable close)
-    """
-    if rth_df_ct.empty:
-        return (False, False, None)
-    target = entry_price + rr_target * risk_points
-    stop   = entry_price - risk_points
-
-    times = [t for t in rth_df_ct.index if t >= entry_time][:lookahead_blocks+1]
-    if len(times) == 0:
-        return (False, False, None)
-
-    for t in times:
-        row = rth_df_ct.loc[t]
-        hi = float(row.get("High", np.nan))
-        lo = float(row.get("Low", np.nan))
-        if not np.isnan(hi) and hi >= target:
-            if not np.isnan(lo) and lo <= stop:
-                return (False, False, t)
-            return (True, True, t)
-        if not np.isnan(lo) and lo <= stop:
-            return (False, False, t)
-
-    horizon_t = times[-1]
-    close_h = float(rth_df_ct.loc[horizon_t].get("Close", np.nan))
-    exit_success = (not np.isnan(close_h)) and (close_h >= entry_price)
-    return (False, exit_success, horizon_t)
-
-def evaluate_path_short(rth_df_ct: pd.DataFrame, entry_time: datetime, entry_price: float,
-                        lookahead_blocks: int, risk_points: float, rr_target: float) -> Tuple[bool, bool, Optional[datetime]]:
-    """
-    Short logic (Skyline overnight-drop):
-      - entry_success: did Low reach entry - rr*risk before High hit entry + risk?
-      - exit_success:  Close at horizon <= entry
-    """
-    if rth_df_ct.empty:
-        return (False, False, None)
-    target = entry_price - rr_target * risk_points
-    stop   = entry_price + risk_points
-
-    times = [t for t in rth_df_ct.index if t >= entry_time][:lookahead_blocks+1]
-    if len(times) == 0:
-        return (False, False, None)
-
-    for t in times:
-        row = rth_df_ct.loc[t]
-        hi = float(row.get("High", np.nan))
-        lo = float(row.get("Low", np.nan))
-        if not np.isnan(lo) and lo <= target:
-            if not np.isnan(hi) and hi >= stop:
-                return (False, False, t)
-            return (True, True, t)
-        if not np.isnan(hi) and hi >= stop:
-            return (False, False, t)
-
-    horizon_t = times[-1]
-    close_h = float(rth_df_ct.loc[horizon_t].get("Close", np.nan))
-    exit_success = (not np.isnan(close_h)) and (close_h <= entry_price)
-    return (False, exit_success, horizon_t)
-
-def direction_move_prob(rth_df_ct: pd.DataFrame, entry_time: datetime, lookahead_blocks: int) -> Tuple[float, float]:
-    """
-    Direction probability based on close at horizon vs entry close.
-    Returns (prob_up, prob_down) as 0/1 for a single path; caller aggregates.
-    """
-    idx = [t for t in rth_df_ct.index if t <= entry_time]
-    if not idx:
-        return (0.0, 0.0)
-    entry_bar = idx[-1]
-    entry_close = float(rth_df_ct.loc[entry_bar].get("Close", np.nan))
-    future = [t for t in rth_df_ct.index if t > entry_time][:lookahead_blocks]
-    if not future:
-        return (0.0, 0.0)
-    horizon_t = future[-1]
-    horizon_close = float(rth_df_ct.loc[horizon_t].get("Close", np.nan))
-    if np.isnan(entry_close) or np.isnan(horizon_close):
-        return (0.0, 0.0)
-    return (1.0, 0.0) if horizon_close >= entry_close else (0.0, 1.0)
-
-# ============================================================
-# Historical scanners (probabilities)
-# ============================================================
-def scan_baseline_touch_signals(lookback_days: int, k: int, es_to_spx_offset: float,
-                                risk_points: float, lookahead_blocks: int, rr_target: float,
-                                symbol_underlying: str = "ES=F",
-                                touch_pad: float = 0.0) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    events = []
-    counted = 0
-    dir_up = dir_down = 0.0
-    succ_entry = succ_exit = 0.0
-
-    day = previous_weekday(now_ct().date())
-    processed = 0
-    while processed < lookback_days:
-        proj_day = day
-        prev_day = previous_weekday(proj_day - timedelta(days=1))
-
-        df_es_win = fetch_es_30m_for_prev_day_window(prev_day)
-        if not df_es_win.empty:
-            (_, _), (lo_price, lo_time) = kth_extreme_by_close(df_es_win, k=k)
-            if lo_price is not None and lo_time is not None:
-                lo_price_adj = lo_price + es_to_spx_offset
-                lo_time_ct   = _as_ct(lo_time)
-
-                rth = fetch_rth_30m_for_day(symbol_underlying, proj_day)
-                if not rth.empty:
-                    touch_t = first_touch_time(rth, lo_price_adj, lo_time_ct, st.session_state["spx_slopes"]["baseline"], touch_pad=touch_pad)
-                    if touch_t is not None:
-                        counted += 1
-                        entry_price = line_value_at(lo_price_adj, lo_time_ct, st.session_state["spx_slopes"]["baseline"], touch_t)
-                        e_succ, x_succ, t_res = evaluate_path_long(
-                            rth, touch_t, entry_price, lookahead_blocks, risk_points, rr_target
-                        )
-                        up, down = direction_move_prob(rth, touch_t, lookahead_blocks)
-                        dir_up  += up
-                        dir_down += down
-                        succ_entry += 1.0 if e_succ else 0.0
-                        succ_exit  += 1.0 if x_succ else 0.0
-                        events.append(dict(
-                            projection_day=str(proj_day),
-                            model="Baseline→Long",
-                            k=k,
-                            offset=es_to_spx_offset,
-                            touch_time=str(touch_t),
-                            entry_price=round(entry_price, 4),
-                            entry_success=bool(e_succ),
-                            exit_success=bool(x_succ),
-                            resolved_time=str(t_res) if t_res else None,
-                            dir_up=int(up == 1.0),
-                            dir_down=int(down == 1.0),
-                        ))
-
-        day = previous_weekday(proj_day - timedelta(days=1))
-        processed += 1
-
-    if counted == 0:
-        return pd.DataFrame(), dict(
-            direction_prob_up=0.0,
-            direction_prob_down=0.0,
-            entry_success_prob=0.0,
-            exit_success_prob=0.0,
-            samples=0,
-        )
-
-    summary = dict(
-        direction_prob_up=round(dir_up / counted, 4),
-        direction_prob_down=round(dir_down / counted, 4),
-        entry_success_prob=round(succ_entry / counted, 4),
-        exit_success_prob=round(succ_exit / counted, 4),
-        samples=int(counted),
-    )
-    return pd.DataFrame(events), summary
-
-def scan_skyline_overnight_drop_signals(lookback_days: int, k: int, es_to_spx_offset: float,
-                                        risk_points: float, lookahead_blocks: int, rr_target: float,
-                                        symbol_underlying: str = "ES=F",
-                                        touch_pad: float = 0.0) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    events = []
-    counted = 0
-    dir_up = dir_down = 0.0
-    succ_entry = succ_exit = 0.0
-
-    day = previous_weekday(now_ct().date())
-    processed = 0
-    while processed < lookback_days:
-        proj_day = day
-        prev_day = previous_weekday(proj_day - timedelta(days=1))
-
-        df_es_win = fetch_es_30m_for_prev_day_window(prev_day)
-        if not df_es_win.empty:
-            (hi_price, hi_time), _ = kth_extreme_by_close(df_es_win, k=k)
-            if hi_price is not None and hi_time is not None:
-                hi_price_adj = hi_price + es_to_spx_offset
-                hi_time_ct   = _as_ct(hi_time)
-
-                rth = fetch_rth_30m_for_day(symbol_underlying, proj_day)
-                if not rth.empty:
-                    rth_830 = rth.loc[rth.index.time == time(8,30)]
-                    if not rth_830.empty:
-                        t0 = rth_830.index[0]
-                        skyline_at_830 = line_value_at(hi_price_adj, hi_time_ct, st.session_state["spx_slopes"]["skyline"], t0)
-                        open_830 = float(rth_830.iloc[0].get("Open", np.nan))
-                        if not np.isnan(open_830) and open_830 < skyline_at_830 - touch_pad:
-                            counted += 1
-                            entry_time = t0
-                            entry_price = open_830
-                            e_succ, x_succ, t_res = evaluate_path_short(
-                                rth, entry_time, entry_price, lookahead_blocks, risk_points, rr_target
-                            )
-                            up, down = direction_move_prob(rth, entry_time, lookahead_blocks)
-                            dir_up  += up
-                            dir_down += down
-                            succ_entry += 1.0 if e_succ else 0.0
-                            succ_exit  += 1.0 if x_succ else 0.0
-                            events.append(dict(
-                                projection_day=str(proj_day),
-                                model="Skyline→Short (OVN drop)",
-                                k=k,
-                                offset=es_to_spx_offset,
-                                open_time=str(entry_time),
-                                skyline_at_open=round(skyline_at_830, 4),
-                                entry_price=round(entry_price, 4),
-                                entry_success=bool(e_succ),
-                                exit_success=bool(x_succ),
-                                resolved_time=str(t_res) if t_res else None,
-                                dir_up=int(up == 1.0),
-                                dir_down=int(down == 1.0),
-                            ))
-
-        day = previous_weekday(proj_day - timedelta(days=1))
-        processed += 1
-
-    if counted == 0:
-        return pd.DataFrame(), dict(
-            direction_prob_up=0.0,
-            direction_prob_down=0.0,
-            entry_success_prob=0.0,
-            exit_success_prob=0.0,
-            samples=0,
-        )
-
-    summary = dict(
-        direction_prob_up=round(dir_up / counted, 4),
-        direction_prob_down=round(dir_down / counted, 4),
-        entry_success_prob=round(succ_entry / counted, 4),
-        exit_success_prob=round(succ_exit / counted, 4),
-        samples=int(counted),
-    )
-    return pd.DataFrame(events), summary
-
-# ============================================================
-# Contract mapping helpers
-# ============================================================
-def map_contract_from_anchor(anchor_under: float, anchor_contract: float,
-                             entry_under: float, elasticity: float) -> float:
-    """
-    Linear advisory mapping (no greeks/IV):
-      contract_entry ≈ anchor_contract + elasticity * (entry_under - anchor_under)
-    elasticity: $ contract change per 1 point of underlying.
-    """
-    return float(anchor_contract + elasticity * (entry_under - anchor_under))
-
-def contract_levels_from_entry(entry_contract: float, risk_points: float, rr_target: float,
-                               side: str, elasticity: float, slippage: float = 0.0) -> Tuple[float, float]:
-    """
-    Compute (stop_contract, target_contract) from contract entry using the same underlying R:R geometry,
-    but scaled with elasticity (advisory). Slippage adjusts pessimistically.
-    """
-    if side == "long":
-        stop_c   = entry_contract - elasticity * risk_points + slippage
-        target_c = entry_contract + elasticity * (rr_target * risk_points) - slippage
-    else:  # short
-        stop_c   = entry_contract + elasticity * risk_points + slippage
-        target_c = entry_contract - elasticity * (rr_target * risk_points) - slippage
-    return float(round(stop_c, 4)), float(round(target_c, 4))
-
-# ============================================================
-# UI PAGES
-# ============================================================
-def page_dashboard():
-    st.markdown("### Overview")
-    n_consts = len(st.session_state["spx_slopes"]) + len(st.session_state["stock_slopes"])
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown(
-            """
-            <div class="ml-card">
-              <div class="muted">Strategy Focus</div>
-              <div style="font-size:20px; font-weight:700;">Analytics, not Simulation</div>
-              <div class="muted" style="margin-top:6px;">
-                Probabilities for direction, entry success, and exit success — advisory only.
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
-    with c2:
-        st.markdown(
-            f"""
-            <div class="ml-card">
-              <div class="muted">Hidden Model Vars</div>
-              <div style="font-size:22px; font-weight:700;">{n_consts} constants</div>
-              <div class="muted" style="margin-top:6px;">Slopes kept out of UI</div>
-            </div>
-            """, unsafe_allow_html=True)
-    with c3:
-        st.markdown(
-            """
-            <div class="ml-card">
-              <div class="muted">Key Hypotheses</div>
-              <div style="font-size:14px; margin-top:6px;">
-                • Baseline touch → Call bounce<br/>
-                • Skyline touch + overnight drop → Put follow-through
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-# ---------- SPX Skyline ----------
-def page_spx_skyline_v2():
-    st.markdown("### SPX Skyline")
-    if not HAS_YF:
-        st.warning("yfinance not available. Install it and rerun: `pip install yfinance`.")
-        return
-
-    colA, colB, colC, colD = st.columns([1.2, 1, 1, 1.2])
-    with colA:
-        prev_day_default = prev_trading_day_base(now_ct())
-        prev_day_input = st.date_input(
-            "Previous trading day (for ES window)",
-            value=prev_day_default,
-            help="Uses ES=F 30m candles in the 17:00–19:30 CT window."
-        )
-    with colB:
-        k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0, help="k=1 highest/lowest close; k=2 second; k=3 third")
-    with colC:
-        es_to_spx_offset = st.number_input("ES→SPX offset", value=0.0, step=0.5)
-    with colD:
-        projection_day = st.date_input("Projection day", value=projection_day_default(now_ct()))
-
-    df_es_win = fetch_es_30m_for_prev_day_window(prev_day_input)
-    if df_es_win.empty:
-        st.error("No ES data returned for the selected previous day. Try another date or check your connection.")
-        return
-
-    (hi_price, hi_time), (lo_price, lo_time) = kth_extreme_by_close(df_es_win, k=k)
-    if hi_price is None or lo_price is None:
-        st.error("Could not compute k-th extremes from ES window.")
-        return
-
-    hi_price_adj = hi_price + es_to_spx_offset
-    lo_price_adj = lo_price + es_to_spx_offset
-    hi_time_ct = _as_ct(hi_time)
-    lo_time_ct = _as_ct(lo_time)
-
-    slots_ct = generate_rth_times_ct(projection_day)
-    spx_skyline_slope  = st.session_state["spx_slopes"]["skyline"]
-    spx_baseline_slope = st.session_state["spx_slopes"]["baseline"]
-
-    sky_df  = build_projection_table(hi_price_adj, hi_time_ct, spx_skyline_slope,  slots_ct)
-    base_df = build_projection_table(lo_price_adj, lo_time_ct, spx_baseline_slope, slots_ct)
-
-    st.session_state["spx_anchors"] = {
-        "previous_day": prev_day_input,
-        "projection_day": projection_day,
-        "skyline": {"price": hi_price_adj, "time": hi_time_ct},
-        "baseline": {"price": lo_price_adj, "time": lo_time_ct},
-        "k": k,
-        "offset": es_to_spx_offset,
-    }
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Skyline anchor** (k-th high close)")
-        st.caption(f"Time: {hi_time_ct.strftime('%Y-%m-%d %H:%M CT')} • Price (ES+offset): {hi_price_adj:.4f} • k={k}")
-        st.dataframe(sky_df, hide_index=True, use_container_width=True)
+def display_forecast_table(df: pd.DataFrame, title: str):
+    """Display a forecast table with nice formatting"""
+    st.subheader(title)
+    
+    # Format the dataframe
+    if not df.empty:
+        display_df = df.copy()
+        
+        # Format price columns
+        for col in ['Entry', 'Exit', 'Projected']:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].apply(lambda x: f"${x:.2f}")
+        
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        
+        # Download button
+        csv = df.to_csv(index=False)
         st.download_button(
-            "📥 Download Skyline CSV",
-            data=sky_df.to_csv(index=False),
-            file_name=f"SPX_Skyline_{projection_day}.csv",
-            mime="text/csv",
-            key="dl_skyline_csv",
+            label=f"📥 Download {title} Data",
+            data=csv,
+            file_name=f"{title.lower().replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
         )
-    with c2:
-        st.markdown("**Baseline anchor** (k-th low close)")
-        st.caption(f"Time: {lo_time_ct.strftime('%Y-%m-%d %H:%M CT')} • Price (ES+offset): {lo_price_adj:.4f} • k={k}")
-        st.dataframe(base_df, hide_index=True, use_container_width=True)
-        st.download_button(
-            "📥 Download Baseline CSV",
-            data=base_df.to_csv(index=False),
-            file_name=f"SPX_Baseline_{projection_day}.csv",
-            mime="text/csv",
-            key="dl_baseline_csv_from_sky",
-        )
+    else:
+        st.info("No data to display")
 
-    with st.expander("ES 30m window (prev day 17:00–19:30 CT)", expanded=False):
-        df_show = df_es_win.copy()
-        df_show.index = df_show.index.tz_convert(CT)
-        st.dataframe(df_show, use_container_width=True)
+# ═══════════════════════════════════════════════════════════════════════════════
+# HEADER SECTION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ---------- SPX Baseline ----------
-def _anchor_summary_card(title: str, when_ct: datetime, price: float, extra: str = ""):
-    st.markdown(
-        f"""
-        <div class="ml-card">
-            <div style="font-size:0.9rem; opacity:.7; margin-bottom:.25rem;">{title}</div>
-            <div style="font-size:1.2rem; font-weight:700;">{price:.4f}</div>
-            <div class="muted" style="margin-top:.25rem;">
-                {when_ct.strftime('%Y-%m-%d %H:%M CT')} {extra}
+def render_hero_section():
+    """Render the hero section"""
+    current_time = datetime.now().strftime("%H:%M:%S")
+    market_status = "🟢 Market Open" if 9 <= datetime.now().hour <= 16 else "🔴 Market Closed"
+    
+    st.markdown(f"""
+    <div class="hero-container">
+        <h1 class="hero-title">🔮 SPX Prophet</h1>
+        <p class="hero-subtitle">Advanced Financial Forecasting with Time-Based Projections</p>
+        <div style="display: flex; justify-content: center; gap: 2rem; margin-top: 1rem;">
+            <div style="background: rgba(255,255,255,0.1); padding: 0.5rem 1rem; border-radius: 8px;">
+                <strong>⏰ {current_time}</strong>
+            </div>
+            <div style="background: rgba(255,255,255,0.1); padding: 0.5rem 1rem; border-radius: 8px;">
+                <strong>{market_status}</strong>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    </div>
+    """, unsafe_allow_html=True)
 
-def page_spx_baseline_v2():
-    st.markdown("### SPX Baseline")
-    if not HAS_YF:
-        st.warning("yfinance not available. Install it and rerun: `pip install yfinance`.")
-        return
+render_hero_section()
 
-    reuse = "spx_anchors" in st.session_state
-    if reuse:
-        with st.expander("Reuse Skyline settings", expanded=True):
-            reuse = st.toggle(
-                "Use Skyline k / previous day / projection day / ES→SPX offset",
-                value=True
-            )
+# Success message
+st.sidebar.success("✅ SPX Prophet Loaded Successfully!")
 
-    if reuse and "spx_anchors" in st.session_state:
-        sky = st.session_state["spx_anchors"]
-        prev_day_input   = sky["previous_day"]
-        projection_day   = sky["projection_day"]
-        k                = sky["k"]
-        es_to_spx_offset = sky["offset"]
-        st.caption("Using settings from Skyline.")
-    else:
-        colA, colB, colC, colD = st.columns([1.2, 1, 1, 1.2])
-        with colA:
-            prev_day_input = st.date_input(
-                "Previous trading day (for ES window)",
-                value=prev_trading_day_base(now_ct()),
-                help="ES=F 30m candles, 17:00–19:30 CT window."
-            )
-        with colB:
-            k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0)
-        with colC:
-            es_to_spx_offset = st.number_input("ES→SPX offset", value=0.0, step=0.5)
-        with colD:
-            projection_day = st.date_input(
-                "Projection day",
-                value=projection_day_default(now_ct()),
-                help="08:30–14:30 CT will be projected."
-            )
 
-    df_es_win = fetch_es_30m_for_prev_day_window(prev_day_input)
-    if df_es_win.empty:
-        st.error("No ES data returned for the selected previous day.")
-        return
 
-    (hi_price, hi_time), (lo_price, lo_time) = kth_extreme_by_close(df_es_win, k=k)
-    if hi_price is None or lo_price is None:
-        st.error("Could not compute k-th extremes from ES window.")
-        return
 
-    lo_price_adj = (lo_price or 0.0) + es_to_spx_offset
-    lo_time_ct   = _as_ct(lo_time)
 
-    hi_price_adj = (hi_price or 0.0) + es_to_spx_offset
-    hi_time_ct   = _as_ct(hi_time)
+# ═══════════════════════════════════════════════════════════════════════════════
+# PART 2: NAVIGATION & SPX FORECASTING PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    slots_ct = generate_rth_times_ct(projection_day)
-    spx_baseline_slope = st.session_state["spx_slopes"]["baseline"]
-    base_df = build_projection_table(lo_price_adj, lo_time_ct, spx_baseline_slope, slots_ct)
+# ═══════════════════════════════════════════════════════════════════════════════
+# NAVIGATION SIDEBAR
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    st.session_state.setdefault("spx_anchors", {})
-    st.session_state["spx_anchors"].update({
-        "previous_day": prev_day_input,
-        "projection_day": projection_day,
-        "k": k,
-        "offset": es_to_spx_offset,
-        "baseline": {"price": lo_price_adj, "time": lo_time_ct},
-        "skyline": st.session_state["spx_anchors"].get("skyline", {"price": hi_price_adj, "time": hi_time_ct}),
-    })
+st.sidebar.markdown("## 🧭 Navigation")
 
-    cTop1, cTop2 = st.columns(2)
-    with cTop1:
-        _anchor_summary_card("Baseline anchor (k-th LOW close, ES+offset)", lo_time_ct, lo_price_adj, f"• k={k}")
-    with cTop2:
-        _anchor_summary_card("Skyline anchor (k-th HIGH close, ES+offset)", hi_time_ct, hi_price_adj, f"• k={k}")
-
-    st.markdown("#### Baseline Projection (08:30–14:30 CT)")
-    st.dataframe(base_df, hide_index=True, use_container_width=True)
-    st.download_button(
-        "📥 Download Baseline CSV",
-        data=base_df.to_csv(index=False),
-        file_name=f"SPX_Baseline_{projection_day}.csv",
-        mime="text/csv",
-        key="dl_baseline_csv",
-    )
-
-    with st.expander("ES 30m window (prev day 17:00–19:30 CT)", expanded=False):
-        df_show = df_es_win.copy()
-        df_show.index = df_show.index.tz_convert(CT)
-        st.dataframe(df_show, use_container_width=True)
-
-# ---------- Signals & Probabilities ----------
-def page_signals_probabilities_v2():
-    st.markdown("### Signals & Probabilities — Analytics Only")
-
-    if not HAS_YF:
-        st.warning("yfinance not available. Install before running: `pip install yfinance`.")
-        return
-
-    st.session_state.setdefault("analytics", {})
-    analytics = st.session_state["analytics"]
-    analytics.setdefault("lookahead_blocks", 4)
-    analytics.setdefault("rr_target", 1.0)
-    analytics.setdefault("risk_points", 5.0)
-
-    cA, cB, cC, cD = st.columns([1.1, 1, 1, 1.2])
-    with cA:
-        lookback_days = st.number_input("Lookback trading days", min_value=5, max_value=60, value=40, step=5,
-                                        help="Yahoo intraday supports ~60d. 30–40d is a good start.")
-    with cB:
-        k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0)
-    with cC:
-        es_to_spx_offset = st.number_input("ES→SPX offset (points)", value=0.0, step=0.5)
-    with cD:
-        risk_points = st.number_input("Risk unit (points)", value=float(analytics["risk_points"]), step=0.5,
-                                      help="Used to compute target (RR×risk) and stop (risk).")
-
-    cE, cF = st.columns(2)
-    with cE:
-        lookahead_blocks = st.number_input("Horizon (30-min blocks)", min_value=1, max_value=16,
-                                           value=int(analytics["lookahead_blocks"]), step=1)
-    with cF:
-        rr_target = st.number_input("Reward:Risk target", min_value=0.1, max_value=5.0,
-                                    value=float(analytics["rr_target"]), step=0.1)
-
-    st.session_state["analytics"].update({
-        "lookahead_blocks": int(lookahead_blocks),
-        "rr_target": float(rr_target),
-        "risk_points": float(risk_points),
-    })
-
-    st.markdown("#### H1: Baseline-touch → Long (Call)")
-    with st.spinner("Scanning history for Baseline-touch long signals..."):
-        df1, s1 = scan_baseline_touch_signals(
-            lookback_days=int(lookback_days),
-            k=int(k),
-            es_to_spx_offset=float(es_to_spx_offset),
-            risk_points=float(risk_points),
-            lookahead_blocks=int(lookahead_blocks),
-            rr_target=float(rr_target),
-            symbol_underlying="ES=F",
-            touch_pad=0.0,
-        )
-    if df1.empty:
-        st.info("No Baseline-touch signals found in the selected lookback.")
-    else:
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1: st.metric("Samples", s1["samples"])
-        with c2: st.metric("Dir ↑ prob", f'{s1["direction_prob_up"]:.2%}')
-        with c3: st.metric("Dir ↓ prob", f'{s1["direction_prob_down"]:.2%}')
-        with c4: st.metric("Entry success", f'{s1["entry_success_prob"]:.2%}')
-        with c5: st.metric("Exit success", f'{s1["exit_success_prob"]:.2%}')
-        st.dataframe(df1.tail(20), use_container_width=True, hide_index=True)
-
-    st.markdown("#### H2: Skyline-touch + Overnight Drop → Short (Put)")
-    with st.spinner("Scanning history for Skyline-overnight-drop short signals..."):
-        df2, s2 = scan_skyline_overnight_drop_signals(
-            lookback_days=int(lookback_days),
-            k=int(k),
-            es_to_spx_offset=float(es_to_spx_offset),
-            risk_points=float(risk_points),
-            lookahead_blocks=int(lookahead_blocks),
-            rr_target=float(rr_target),
-            symbol_underlying="ES=F",
-            touch_pad=0.0,
-        )
-    if df2.empty:
-        st.info("No Skyline overnight-drop signals found in the selected lookback.")
-    else:
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1: st.metric("Samples", s2["samples"])
-        with c2: st.metric("Dir ↑ prob", f'{s2["direction_prob_up"]:.2%}')
-        with c3: st.metric("Dir ↓ prob", f'{s2["direction_prob_down"]:.2%}')
-        with c4: st.metric("Entry success", f'{s2["entry_success_prob"]:.2%}')
-        with c5: st.metric("Exit success", f'{s2["exit_success_prob"]:.2%}')
-        st.dataframe(df2.tail(20), use_container_width=True, hide_index=True)
-
-    st.caption("Notes: Analytics only (no simulation). Results are historical frequencies under the stated rules.")
-
-# ---------- Contract Tool ----------
-def detect_entry_baseline_long(rth_df_ct: pd.DataFrame,
-                               lo_anchor_price: float, lo_anchor_time_ct: datetime,
-                               baseline_slope: float, touch_pad: float = 0.0) -> Optional[Tuple[datetime, float]]:
-    t = first_touch_time(rth_df_ct, lo_anchor_price, lo_anchor_time_ct, baseline_slope, touch_pad=touch_pad)
-    if t is None:
-        return None
-    price = line_value_at(lo_anchor_price, lo_anchor_time_ct, baseline_slope, t)
-    return (t, float(round(price, 4)))
-
-def detect_entry_skyline_short_overnight_drop(rth_df_ct: pd.DataFrame,
-                                              hi_anchor_price: float, hi_anchor_time_ct: datetime,
-                                              skyline_slope: float, touch_pad: float = 0.0) -> Optional[Tuple[datetime, float]]:
-    rth_830 = rth_df_ct.loc[rth_df_ct.index.time == time(8, 30)]
-    if rth_830.empty:
-        return None
-    t0 = rth_830.index[0]
-    skyline_at_830 = line_value_at(hi_anchor_price, hi_anchor_time_ct, skyline_slope, t0)
-    open_830 = float(rth_830.iloc[0].get("Open", np.nan))
-    if np.isnan(open_830):
-        return None
-    if open_830 < (skyline_at_830 - touch_pad):
-        return (t0, float(round(open_830, 4)))
-    return None
-
-def page_contract_tool_v2():
-    st.markdown("### Contract Tool — Entries • Stops • Targets • Probabilities (Advisory Only)")
-
-    if not HAS_YF:
-        st.warning("yfinance not available. Install before running the full app: `pip install yfinance`.")
-        return
-
-    st.session_state.setdefault("analytics", {})
-    st.session_state["analytics"].setdefault("lookahead_blocks", 4)
-    st.session_state["analytics"].setdefault("rr_target", 1.0)
-    st.session_state["analytics"].setdefault("risk_points", 5.0)
-
-    colS1, colS2, colS3, colS4 = st.columns([1.1, 1, 1, 1.2])
-    with colS1:
-        strat = st.selectbox(
-            "Strategy",
-            ["Baseline touch → Call (Long)", "Skyline overnight drop → Put (Short)"],
-            index=0
-        )
-    with colS2:
-        k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0)
-    with colS3:
-        es_to_spx_offset = st.number_input("ES→SPX offset (points)", value=0.0, step=0.5)
-    with colS4:
-        lookback_days = st.number_input("Lookback days (for probabilities)", min_value=5, max_value=60, value=40, step=5)
-
-    colP1, colP2, colP3, colP4 = st.columns(4)
-    with colP1:
-        risk_points = st.number_input("Risk (points)", value=float(st.session_state["analytics"]["risk_points"]), step=0.5)
-    with colP2:
-        rr_target = st.number_input("Reward:Risk", value=float(st.session_state["analytics"]["rr_target"]), min_value=0.1, max_value=5.0, step=0.1)
-    with colP3:
-        elasticity = st.number_input("Elasticity ($ per 1 pt underlying)", value=1.00, min_value=0.0, step=0.05,
-                                     help="Advisory mapping from underlying points to contract $ change.")
-    with colP4:
-        slippage = st.number_input("Slippage ($)", value=0.00, min_value=0.0, step=0.05)
-
-    default_prev = previous_weekday(now_ct().date() - timedelta(days=1))
-    default_proj = previous_weekday(now_ct().date())
-
-    have_anchors = "spx_anchors" in st.session_state
-    with st.expander("Anchors & Days", expanded=not have_anchors):
-        colA, colB = st.columns(2)
-        with colA:
-            prev_day = st.date_input("Previous trading day (for ES window)", value=default_prev,
-                                     help="17:00–19:30 CT window to pick k-th highs/lows from ES=F.")
-        with colB:
-            projection_day = st.date_input("Projection day (RTH 08:30–14:30 CT)", value=default_proj)
-
-        refresh = st.checkbox("Compute/refresh anchors for these days", value=not have_anchors)
-        if refresh:
-            df_es_win = fetch_es_30m_for_prev_day_window(prev_day)
-            if df_es_win.empty:
-                st.error("No ES data for the selected previous day.")
-                return
-            (hi_price, hi_time), (lo_price, lo_time) = kth_extreme_by_close(df_es_win, k=int(k))
-            if hi_price is None or lo_price is None:
-                st.error("Could not compute k-th extremes from ES window.")
-                return
-            st.session_state["spx_anchors"] = {
-                "previous_day": prev_day,
-                "projection_day": projection_day,
-                "skyline": {"price": float(hi_price) + es_to_spx_offset, "time": _as_ct(hi_time)},
-                "baseline": {"price": float(lo_price) + es_to_spx_offset, "time": _as_ct(lo_time)},
-                "k": int(k),
-                "offset": float(es_to_spx_offset),
-            }
-        else:
-            if not have_anchors:
-                st.warning("No anchors in session; check 'Compute/refresh anchors'.")
-                return
-            prev_day      = st.session_state["spx_anchors"]["previous_day"]
-            projection_day= st.session_state["spx_anchors"]["projection_day"]
-
-    colC1, colC2 = st.columns(2)
-    with colC1:
-        call_ref = st.number_input(
-            "Overnight Call Contract Price at Baseline Swing Low (anchor)",
-            value=st.session_state["contracts"].get("overnight_call_entry_price") or 0.0,
-            min_value=0.0, step=0.05, format="%.2f",
-            help="Used to map to a call entry price at RTH baseline-touch."
-        )
-    with colC2:
-        put_ref = st.number_input(
-            "Overnight Put Contract Price at Skyline Touch (anchor)",
-            value=st.session_state["contracts"].get("overnight_put_entry_price") or 0.0,
-            min_value=0.0, step=0.05, format="%.2f",
-            help="Used to map to a put entry price at RTH overnight-drop case."
-        )
-    st.session_state["contracts"]["overnight_call_entry_price"] = float(call_ref)
-    st.session_state["contracts"]["overnight_put_entry_price"]  = float(put_ref)
-
-    rth = fetch_rth_30m_for_day("ES=F", projection_day)
-    if rth.empty:
-        st.error("No RTH data fetched for the projection day.")
-        return
-
-    cols = ["Time_CT","RefLine","Side","Entry_Under","Stop_Under","Target_Under",
-            "Entry_Contract","Stop_Contract","Target_Contract","RR"]
-    rows = []
-
-    # Probability overlay package
-    if "Baseline touch" in strat:
-        df_hist, prob_pack = scan_baseline_touch_signals(
-            lookback_days=int(lookback_days),
-            k=int(k),
-            es_to_spx_offset=float(es_to_spx_offset),
-            risk_points=float(risk_points),
-            lookahead_blocks=int(st.session_state["analytics"]["lookahead_blocks"]),
-            rr_target=float(rr_target),
-            symbol_underlying="ES=F",
-            touch_pad=0.0,
-        )
-    else:
-        df_hist, prob_pack = scan_skyline_overnight_drop_signals(
-            lookback_days=int(lookback_days),
-            k=int(k),
-            es_to_spx_offset=float(es_to_spx_offset),
-            risk_points=float(risk_points),
-            lookahead_blocks=int(st.session_state["analytics"]["lookahead_blocks"]),
-            rr_target=float(rr_target),
-            symbol_underlying="ES=F",
-            touch_pad=0.0,
-        )
-
-    base = st.session_state["spx_anchors"]["baseline"]
-    sky  = st.session_state["spx_anchors"]["skyline"]
-    baseline_slope = st.session_state["spx_slopes"]["baseline"]
-    skyline_slope  = st.session_state["spx_slopes"]["skyline"]
-
-    if "Baseline touch" in strat:
-        side = "long"
-        anchor_price = float(base["price"])
-        anchor_time  = _as_ct(base["time"])
-        for t in rth.index:
-            ref_line = line_value_at(anchor_price, anchor_time, baseline_slope, t)
-            rows.append([t.strftime("%Y-%m-%d %H:%M"), round(ref_line,4), "CALL","","","","","","", f"{rr_target:.2f}"])
-
-        det = detect_entry_baseline_long(rth, anchor_price, anchor_time, baseline_slope, touch_pad=0.0)
-        if det is None:
-            st.info("No Baseline touch detected during RTH. Table shows the Baseline reference line only.")
-        else:
-            entry_t, entry_under = det
-            stop_under   = entry_under - float(risk_points)
-            target_under = entry_under + float(rr_target) * float(risk_points)
-            entry_contract = map_contract_from_anchor(
-                anchor_under=anchor_price,
-                anchor_contract=float(call_ref),
-                entry_under=entry_under,
-                elasticity=float(elasticity),
-            )
-            stop_c, target_c = contract_levels_from_entry(
-                entry_contract=float(entry_contract),
-                risk_points=float(risk_points),
-                rr_target=float(rr_target),
-                side="long",
-                elasticity=float(elasticity),
-                slippage=float(slippage),
-            )
-            for r in rows:
-                if r[0] == entry_t.strftime("%Y-%m-%d %H:%M"):
-                    r[3] = round(entry_under,4)
-                    r[4] = round(stop_under,4)
-                    r[5] = round(target_under,4)
-                    r[6] = round(entry_contract,4)
-                    r[7] = stop_c
-                    r[8] = target_c
-                    break
-    else:
-        side = "short"
-        anchor_price = float(sky["price"])
-        anchor_time  = _as_ct(sky["time"])
-        for t in rth.index:
-            ref_line = line_value_at(anchor_price, anchor_time, skyline_slope, t)
-            rows.append([t.strftime("%Y-%m-%d %H:%M"), round(ref_line,4), "PUT","","","","","","", f"{rr_target:.2f}"])
-
-        det = detect_entry_skyline_short_overnight_drop(rth, anchor_price, anchor_time, skyline_slope, touch_pad=0.0)
-        if det is None:
-            st.info("No overnight drop below Skyline at 08:30 detected. Table shows Skyline reference line only.")
-        else:
-            entry_t, entry_under = det
-            stop_under   = entry_under + float(risk_points)
-            target_under = entry_under - float(rr_target) * float(risk_points)
-            entry_contract = map_contract_from_anchor(
-                anchor_under=anchor_price,
-                anchor_contract=float(put_ref),
-                entry_under=entry_under,
-                elasticity=float(elasticity),
-            )
-            stop_c, target_c = contract_levels_from_entry(
-                entry_contract=float(entry_contract),
-                risk_points=float(risk_points),
-                rr_target=float(rr_target),
-                side="short",
-                elasticity=float(elasticity),
-                slippage=float(slippage),
-            )
-            for r in rows:
-                if r[0] == entry_t.strftime("%Y-%m-%d %H:%M"):
-                    r[3] = round(entry_under,4)
-                    r[4] = round(stop_under,4)
-                    r[5] = round(target_under,4)
-                    r[6] = round(entry_contract,4)
-                    r[7] = stop_c
-                    r[8] = target_c
-                    break
-
-    df_entries = pd.DataFrame(rows, columns=cols)
-    st.markdown("#### Entries Table (08:30–14:30 CT)")
-    st.dataframe(df_entries, use_container_width=True, hide_index=True)
-    st.download_button(
-        "📥 Download Entries CSV",
-        data=df_entries.to_csv(index=False),
-        file_name=f"Entries_{('CALL' if side=='long' else 'PUT')}_{st.session_state['spx_anchors']['projection_day']}.csv",
-        mime="text/csv",
-        key="dl_entries_csv",
-    )
-
-    if prob_pack["samples"] == 0:
-        st.info("No historical samples in the chosen lookback to compute probabilities.")
-    else:
-        st.markdown("#### Probability Overlay (historical frequencies)")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1: st.metric("Samples", prob_pack["samples"])
-        with c2: st.metric("Dir ↑ prob", f'{prob_pack["direction_prob_up"]:.2%}')
-        with c3: st.metric("Dir ↓ prob", f'{prob_pack["direction_prob_down"]:.2%}')
-        with c4: st.metric("Entry success", f'{prob_pack["entry_success_prob"]:.2%}')
-        with c5: st.metric("Exit success", f'{prob_pack["exit_success_prob"]:.2%}')
-        st.caption("Advisory analytics only — not trading advice. Pure historical frequencies under stated rules.")
-
-# ---------- Stocks Baseline ----------
-def _stock_slopes(symbol: str) -> Tuple[float, float]:
-    mag = float(STOCK_SLOPES.get(symbol, 0.0))
-    return (mag, -mag)
-
-def _fill_entries_rows(rth_df_ct: pd.DataFrame, refline_fn, side_label: str,
-                       rr_target: float, risk_points: float) -> List[List]:
-    rows: List[List] = []
-    for t in rth_df_ct.index:
-        ref_line = float(round(refline_fn(t), 4))
-        rows.append([t.strftime("%Y-%m-%d %H:%M"), ref_line, side_label, "", "", "", "", "", "", f"{rr_target:.2f}"])
-    return rows
-
-def page_stocks_baseline_v2():
-    st.markdown("### Stocks • Baseline (per-ticker)")
-    if not HAS_YF:
-        st.warning("yfinance not available. Install before running: `pip install yfinance`.")
-        return
-
-    lookahead_blocks = int(st.session_state["analytics"].get("lookahead_blocks", 4))
-    rr_target = float(st.session_state["analytics"].get("rr_target", 1.0))
-    risk_points = float(st.session_state["analytics"].get("risk_points", 1.0))
-
-    cTop = st.columns([1.2, 1, 1, 1.2])
-    with cTop[0]:
-        symbols = st.multiselect("Tickers", CORE_SYMBOLS, default=CORE_SYMBOLS[:4])
-    with cTop[1]:
-        k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0)
-    with cTop[2]:
-        prev_day = st.date_input("Previous trading day (for anchor window)", value=previous_weekday(now_ct().date()))
-    with cTop[3]:
-        projection_day = st.date_input("Projection day", value=previous_weekday(now_ct().date()))
-
-    cOpts = st.columns(3)
-    with cOpts[0]:
-        touch_pad = st.number_input("Touch tolerance (pts)", value=0.0, step=0.1)
-    with cOpts[1]:
-        risk_points = st.number_input("Risk (pts)", value=risk_points, step=0.5)
-    with cOpts[2]:
-        rr_target = st.number_input("Reward:Risk", value=rr_target, min_value=0.1, max_value=5.0, step=0.1)
-
-    for sym in symbols:
-        st.markdown(f"#### {sym} — Baseline")
-        df_win = fetch_equity_30m_for_prev_day_window(sym, prev_day)
-        if df_win.empty:
-            st.info(f"No data for {sym} in 17:00–19:30 CT window on {prev_day}.")
-            continue
-
-        (hi_price, hi_time), (lo_price, lo_time) = kth_extreme_by_close(df_win, k=int(k))
-        if lo_price is None or lo_time is None:
-            st.info(f"Could not compute k-th LOW for {sym}.")
-            continue
-
-        sky_slope, base_slope = _stock_slopes(sym)
-
-        lo_price_adj = float(lo_price)
-        lo_time_ct   = _as_ct(lo_time)
-        slots_ct     = generate_rth_times_ct(projection_day)
-        _ = build_projection_table(lo_price_adj, lo_time_ct, base_slope, slots_ct)  # not shown separately
-
-        rth = fetch_rth_30m_for_day(sym, projection_day)
-        if rth.empty:
-            st.info(f"No RTH data for {sym} on {projection_day}.")
-            continue
-
-        entry_det = detect_entry_baseline_long(rth, lo_price_adj, lo_time_ct, base_slope, touch_pad=touch_pad)
-        rows = _fill_entries_rows(rth, lambda t: line_value_at(lo_price_adj, lo_time_ct, base_slope, t), "CALL", rr_target, risk_points)
-
-        if entry_det is not None:
-            entry_t, entry_under = entry_det
-            stop_under   = entry_under - float(risk_points)
-            target_under = entry_under + float(rr_target) * float(risk_points)
-            for r in rows:
-                if r[0] == entry_t.strftime("%Y-%m-%d %H:%M"):
-                    r[3] = round(entry_under, 4)
-                    r[4] = round(stop_under, 4)
-                    r[5] = round(target_under, 4)
-                    break
-        else:
-            st.caption("No Baseline touch detected during RTH; table shows reference line only.")
-
-        df_entries = pd.DataFrame(rows, columns=["Time_CT","RefLine","Side","Entry_Under","Stop_Under","Target_Under",
-                                                 "Entry_Contract","Stop_Contract","Target_Contract","RR"])
-        cL, cR = st.columns([1.1, 1])
-        with cL:
-            st.dataframe(df_entries, use_container_width=True, hide_index=True)
-        with cR:
-            st.download_button(
-                "📥 Download Baseline CSV",
-                data=df_entries.to_csv(index=False),
-                file_name=f"{sym}_Baseline_{projection_day}.csv",
-                mime="text/csv",
-                key=f"dl_{sym}_baseline_csv",
-            )
-            st.markdown(
-                f"""
-                <div class="ml-card">
-                  <div class="muted">Anchor</div>
-                  <div><b>LOW</b> {lo_price_adj:.4f} @ {lo_time_ct.strftime('%Y-%m-%d %H:%M CT')}</div>
-                  <div class="muted" style="margin-top:6px;">Slope: {base_slope:+.4f} / 30m</div>
-                </div>
-                """, unsafe_allow_html=True
-            )
-
-        with st.expander(f"{sym} — Previous-day window (17:00–19:30 CT)", expanded=False):
-            df_show = df_win.copy()
-            df_show.index = df_show.index.tz_convert(CT)
-            st.dataframe(df_show, use_container_width=True)
-
-# ---------- Stocks Skyline ----------
-def page_stocks_skyline_v2():
-    st.markdown("### Stocks • Skyline (per-ticker)")
-    if not HAS_YF:
-        st.warning("yfinance not available. Install before running: `pip install yfinance`.")
-        return
-
-    lookahead_blocks = int(st.session_state["analytics"].get("lookahead_blocks", 4))
-    rr_target = float(st.session_state["analytics"].get("rr_target", 1.0))
-    risk_points = float(st.session_state["analytics"].get("risk_points", 1.0))
-
-    cTop = st.columns([1.2, 1, 1, 1.2])
-    with cTop[0]:
-        symbols = st.multiselect("Tickers", CORE_SYMBOLS, default=CORE_SYMBOLS[:4])
-    with cTop[1]:
-        k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0)
-    with cTop[2]:
-        prev_day = st.date_input("Previous trading day (for anchor window)", value=previous_weekday(now_ct().date()))
-    with cTop[3]:
-        projection_day = st.date_input("Projection day", value=previous_weekday(now_ct().date()))
-
-    cOpts = st.columns(3)
-    with cOpts[0]:
-        touch_pad = st.number_input("Touch tolerance (pts)", value=0.0, step=0.1)
-    with cOpts[1]:
-        risk_points = st.number_input("Risk (pts)", value=risk_points, step=0.5)
-    with cOpts[2]:
-        rr_target = st.number_input("Reward:Risk", value=rr_target, min_value=0.1, max_value=5.0, step=0.1)
-
-    for sym in symbols:
-        st.markdown(f"#### {sym} — Skyline")
-        df_win = fetch_equity_30m_for_prev_day_window(sym, prev_day)
-        if df_win.empty:
-            st.info(f"No data for {sym} in 17:00–19:30 CT window on {prev_day}.")
-            continue
-
-        (hi_price, hi_time), (lo_price, lo_time) = kth_extreme_by_close(df_win, k=int(k))
-        if hi_price is None or hi_time is None:
-            st.info(f"Could not compute k-th HIGH for {sym}.")
-            continue
-
-        sky_slope, base_slope = _stock_slopes(sym)
-
-        hi_price_adj = float(hi_price)
-        hi_time_ct   = _as_ct(hi_time)
-        slots_ct     = generate_rth_times_ct(projection_day)
-        _ = build_projection_table(hi_price_adj, hi_time_ct, sky_slope, slots_ct)
-
-        rth = fetch_rth_30m_for_day(sym, projection_day)
-        if rth.empty:
-            st.info(f"No RTH data for {sym} on {projection_day}.")
-            continue
-
-        det = detect_entry_skyline_short_overnight_drop(rth, hi_price_adj, hi_time_ct, sky_slope, touch_pad=touch_pad)
-        rows = _fill_entries_rows(rth, lambda t: line_value_at(hi_price_adj, hi_time_ct, sky_slope, t), "PUT", rr_target, risk_points)
-
-        if det is not None:
-            entry_t, entry_under = det
-            stop_under   = entry_under + float(risk_points)
-            target_under = entry_under - float(rr_target) * float(risk_points)
-            for r in rows:
-                if r[0] == entry_t.strftime("%Y-%m-%d %H:%M"):
-                    r[3] = round(entry_under, 4)
-                    r[4] = round(stop_under, 4)
-                    r[5] = round(target_under, 4)
-                    break
-        else:
-            st.caption("No 08:30 open below Skyline detected; table shows reference line only.")
-
-        df_entries = pd.DataFrame(rows, columns=["Time_CT","RefLine","Side","Entry_Under","Stop_Under","Target_Under",
-                                                 "Entry_Contract","Stop_Contract","Target_Contract","RR"])
-        cL, cR = st.columns([1.1, 1])
-        with cL:
-            st.dataframe(df_entries, use_container_width=True, hide_index=True)
-        with cR:
-            st.download_button(
-                "📥 Download Skyline CSV",
-                data=df_entries.to_csv(index=False),
-                file_name=f"{sym}_Skyline_{projection_day}.csv",
-                mime="text/csv",
-                key=f"dl_{sym}_skyline_csv",
-            )
-            st.markdown(
-                f"""
-                <div class="ml-card">
-                  <div class="muted">Anchor</div>
-                  <div><b>HIGH</b> {hi_price_adj:.4f} @ {hi_time_ct.strftime('%Y-%m-%d %H:%M CT')}</div>
-                  <div class="muted" style="margin-top:6px;">Slope: {sky_slope:+.4f} / 30m</div>
-                </div>
-                """, unsafe_allow_html=True
-            )
-
-        with st.expander(f"{sym} — Previous-day window (17:00–19:30 CT)", expanded=False):
-            df_show = df_win.copy()
-            df_show.index = df_show.index.tz_convert(CT)
-            st.dataframe(df_show, use_container_width=True)
-
-# ---------- Settings ----------
-def page_settings():
-    st.markdown("### Settings")
-    st.caption("Non-sensitive preferences only; model constants remain internal.")
-    cols = st.columns(4)
-    with cols[0]:
-        la = st.number_input("Lookahead blocks (30-min each)", min_value=1, max_value=16,
-                             value=int(st.session_state["analytics"]["lookahead_blocks"]), step=1)
-    with cols[1]:
-        rr = st.number_input("Reward:Risk target", min_value=0.1, max_value=5.0,
-                             value=float(st.session_state["analytics"]["rr_target"]), step=0.1)
-    with cols[2]:
-        rp = st.number_input("Risk unit (points)", min_value=0.1, max_value=50.0,
-                             value=float(st.session_state["analytics"]["risk_points"]), step=0.5)
-    with cols[3]:
-        debug = st.toggle("Debug mode", value=st.session_state["settings"]["debug"])
-    st.session_state["analytics"]["lookahead_blocks"] = int(la)
-    st.session_state["analytics"]["rr_target"] = float(rr)
-    st.session_state["analytics"]["risk_points"] = float(rp)
-    st.session_state["settings"]["debug"] = bool(debug)
-    st.success("Settings saved.")
-
-# ---------- About ----------
-def page_about():
-    st.markdown("### About")
-    st.write(
-        f"""**{APP_NAME}** — {APP_TAGLINE}
-- Version: {APP_VERSION}
-- Timezone: America/Chicago (CT)
-- Data: yfinance {'available' if HAS_YF else 'not detected'}
-- UI: Dark glassmorphism
-- Mode: Analytics only (no simulation). Not a trading app."""
-    )
-
-# ---------- Router ----------
-PAGES = {
-    "Dashboard": page_dashboard,
-    "SPX • Skyline": page_spx_skyline_v2,
-    "SPX • Baseline": page_spx_baseline_v2,
-    "Signals • Probabilities": page_signals_probabilities_v2,
-    "Contract • Tool": page_contract_tool_v2,
-    "Stocks • Skyline": page_stocks_skyline_v2,
-    "Stocks • Baseline": page_stocks_baseline_v2,
-    "Settings": page_settings,
-    "About": page_about,
+# Page selection
+page_options = {
+    "SPX": "🧭 SPX Forecast",
+    "Contract": "📈 Contract Line", 
+    "TSLA": "🚗 Tesla",
+    "NVDA": "🧠 NVIDIA",
+    "AAPL": "🍎 Apple",
+    "MSFT": "🪟 Microsoft",
+    "AMZN": "📦 Amazon",
+    "GOOGL": "🔍 Google",
+    "META": "📘 Meta",
+    "NFLX": "📺 Netflix"
 }
 
-# ============================================================
-# APP RENDERER & BOOT
-# ============================================================
-def render_app() -> None:
-    init_state()
-    inject_css(st.session_state["theme"])
+selected_page = st.sidebar.selectbox(
+    "Select Page",
+    options=list(page_options.keys()),
+    format_func=lambda x: page_options[x],
+    index=0
+)
 
-    # Sidebar nav
-    with st.sidebar:
-        st.markdown("#### Navigation")
-        choice = st.radio(
-            "Choose a section",
-            list(PAGES.keys()),
-            index=list(PAGES.keys()).index(st.session_state.get("nav", "Dashboard")),
-            label_visibility="collapsed",
+st.session_state.selected_page = selected_page
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SLOPE MANAGEMENT IN SIDEBAR
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.sidebar.markdown("## 📐 Slope Management")
+
+with st.sidebar.expander("🔧 Adjust Slopes", expanded=False):
+    st.markdown("**SPX Slopes:**")
+    
+    # SPX slopes
+    for spx_key in ["SPX_HIGH", "SPX_CLOSE", "SPX_LOW"]:
+        new_slope = st.slider(
+            spx_key.replace("SPX_", ""),
+            min_value=-1.0,
+            max_value=1.0,
+            value=strategy.slopes[spx_key],
+            step=0.0001,
+            format="%.4f",
+            key=f"slope_{spx_key}"
         )
-        st.session_state["nav"] = choice
-        st.divider()
-        st.markdown("#### Quick Info")
-        st.caption(f"Local time (CT): {now_ct():%Y-%m-%d %I:%M %p}")
+        strategy.slopes[spx_key] = new_slope
+    
+    st.markdown("**Stock Slopes:**")
+    
+    # Stock slopes
+    for ticker in strategy.get_available_tickers():
+        new_slope = st.slider(
+            ticker,
+            min_value=-1.0,
+            max_value=1.0,
+            value=strategy.slopes[ticker],
+            step=0.0001,
+            format="%.4f",
+            key=f"slope_{ticker}"
+        )
+        strategy.slopes[ticker] = new_slope
+    
+    if st.button("🔄 Reset All Slopes", key="reset_all_slopes"):
+        strategy.reset_slopes()
+        st.success("✅ All slopes reset to defaults")
+        st.rerun()
 
-    # Top bar + page body
-    topbar()
-    PAGES[st.session_state["nav"]]()
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPX FORECASTING PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ---- Final boot (call exactly once) ----
-if "render_app" in globals():
-    if not st.session_state.get("__MLP_BOOTED__", False):
-        st.session_state["__MLP_BOOTED__"] = True
-    render_app()
-else:
-    st.error("render_app() not found (this should not happen).")
+if selected_page == "SPX":
+    st.markdown("## 🧭 SPX Forecasting Dashboard")
+    st.caption("Generate forecasts using High, Close, and Low anchor points from the previous day")
+    
+    # Input section
+    st.markdown("### 📊 Forecast Parameters")
+    
+    # Date selection
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        forecast_date = st.date_input(
+            "📅 Forecast Date",
+            value=date.today() + timedelta(days=1),
+            min_value=date.today(),
+            max_value=date.today() + timedelta(days=30),
+            key="spx_forecast_date"
+        )
+    
+    with col2:
+        weekday_name = forecast_date.strftime("%A")
+        st.info(f"📅 **{weekday_name}** - {forecast_date.strftime('%B %d, %Y')}")
+    
+    st.markdown("---")
+    
+    # Anchor points input
+    st.markdown("### 🎯 Previous Day Anchor Points")
+    
+    # Create three columns for anchors
+    high_col, close_col, low_col = st.columns(3)
+    
+    with high_col:
+        st.markdown("**🟢 High Anchor**")
+        high_price = st.number_input(
+            "High Price",
+            value=6185.8,
+            min_value=0.0,
+            step=0.1,
+            format="%.2f",
+            key="spx_high_price"
+        )
+        high_time = st.time_input(
+            "High Time",
+            value=time(11, 30),
+            key="spx_high_time"
+        )
+    
+    with close_col:
+        st.markdown("**🔵 Close Anchor**")
+        close_price = st.number_input(
+            "Close Price",
+            value=6170.2,
+            min_value=0.0,
+            step=0.1,
+            format="%.2f",
+            key="spx_close_price"
+        )
+        close_time = st.time_input(
+            "Close Time",
+            value=time(15, 0),
+            key="spx_close_time"
+        )
+    
+    with low_col:
+        st.markdown("**🔴 Low Anchor**")
+        low_price = st.number_input(
+            "Low Price",
+            value=6130.4,
+            min_value=0.0,
+            step=0.1,
+            format="%.2f",
+            key="spx_low_price"
+        )
+        low_time = st.time_input(
+            "Low Time",
+            value=time(13, 30),
+            key="spx_low_time"
+        )
+    
+    # Quick metrics
+    if high_price > 0 and low_price > 0 and close_price > 0:
+        price_range = high_price - low_price
+        range_percentage = (price_range / close_price) * 100
+        
+        st.markdown("### 📈 Quick Metrics")
+        
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
+        
+        with metric_col1:
+            st.markdown(
+                create_metric_card("📊", "Range", f"${price_range:.2f}", f"{range_percentage:.1f}% of close"),
+                unsafe_allow_html=True
+            )
+        
+        with metric_col2:
+            volatility = "Low" if range_percentage < 2 else "High" if range_percentage > 5 else "Normal"
+            st.markdown(
+                create_metric_card("⚡", "Volatility", volatility, f"{range_percentage:.1f}% range"),
+                unsafe_allow_html=True
+            )
+        
+        with metric_col3:
+            midpoint = (high_price + low_price) / 2
+            close_position = "Above Mid" if close_price > midpoint else "Below Mid"
+            st.markdown(
+                create_metric_card("🎯", "Close Position", close_position, f"Mid: ${midpoint:.2f}"),
+                unsafe_allow_html=True
+            )
+    
+    st.markdown("---")
+    
+    # Generate forecast button
+    if st.button("🚀 Generate SPX Forecast", key="generate_spx_forecast", type="primary"):
+        with st.spinner("🔮 Generating SPX forecasts..."):
+            try:
+                # Generate forecasts
+                forecasts = strategy.spx_forecast(
+                    high_price, high_time, close_price, close_time,
+                    low_price, low_time, forecast_date
+                )
+                
+                # Store in session state
+                st.session_state.current_forecasts = forecasts
+                st.session_state.forecast_metadata = {
+                    "date": forecast_date,
+                    "high_price": high_price,
+                    "close_price": close_price,
+                    "low_price": low_price,
+                    "generated_at": datetime.now()
+                }
+                
+                st.success("✅ SPX forecasts generated successfully!")
+                
+            except Exception as e:
+                st.error(f"❌ Error generating forecasts: {str(e)}")
+    
+    # Display results
+    if st.session_state.current_forecasts:
+        st.markdown("## 📊 SPX Forecast Results")
+        
+        forecasts = st.session_state.current_forecasts
+        metadata = st.session_state.get('forecast_metadata', {})
+        
+        # Summary metrics
+        total_forecasts = len(forecasts)
+        forecast_date_str = str(metadata.get('date', 'N/A'))
+        
+        summary_col1, summary_col2 = st.columns(2)
+        
+        with summary_col1:
+            st.markdown(
+                create_metric_card("📅", "Forecast Date", forecast_date_str, "Target date"),
+                unsafe_allow_html=True
+            )
+        
+        with summary_col2:
+            st.markdown(
+                create_metric_card("🔢", "Anchor Points", str(total_forecasts), "Generated forecasts"),
+                unsafe_allow_html=True
+            )
+        
+        # Create tabs for each anchor
+        if len(forecasts) >= 3:
+            high_tab, close_tab, low_tab = st.tabs(["🟢 High Anchor", "🔵 Close Anchor", "🔴 Low Anchor"])
+            
+            with high_tab:
+                if "High" in forecasts:
+                    display_forecast_table(forecasts["High"], "High Anchor Forecast")
+            
+            with close_tab:
+                if "Close" in forecasts:
+                    display_forecast_table(forecasts["Close"], "Close Anchor Forecast")
+            
+            with low_tab:
+                if "Low" in forecasts:
+                    display_forecast_table(forecasts["Low"], "Low Anchor Forecast")
+        
+        # Export all data
+        st.markdown("### 📤 Export Options")
+        
+        if st.button("📥 Download All SPX Data", key="download_all_spx"):
+            # Combine all forecasts into one file
+            all_data = []
+            for anchor_name, forecast_df in forecasts.items():
+                df_copy = forecast_df.copy()
+                df_copy['Anchor'] = anchor_name
+                all_data.append(df_copy)
+            
+            if all_data:
+                combined_df = pd.concat(all_data, ignore_index=True)
+                csv = combined_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Combined SPX Forecasts",
+                    data=csv,
+                    file_name=f"spx_all_forecasts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="download_combined_spx"
+                )
+    
+    else:
+        st.info("👆 Enter your anchor prices and times, then click 'Generate SPX Forecast' to see results.")
 
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PART 3: CONTRACT LINE PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if selected_page == "Contract":
+    st.markdown("## 📈 Contract Line Forecasting")
+    st.caption("Create forecasts using two-point interpolation between contract price levels")
+    
+    # Contract line explanation
+    with st.expander("ℹ️ How Contract Line Works", expanded=False):
+        st.markdown("""
+        **Contract Line Forecasting** uses two price points at different times to create a trend line:
+        
+        1. **Low-1**: Your first reference point (price + time)
+        2. **Low-2**: Your second reference point (price + time)  
+        3. **Slope Calculation**: The system calculates the rate of change between these points
+        4. **Projection**: Extends this trend across all time slots for the forecast day
+        
+        This method is particularly useful for options trading and intraday momentum strategies.
+        """)
+    
+    # Input section
+    st.markdown("### ⚙️ Contract Parameters")
+    
+    # Date input
+    contract_date = st.date_input(
+        "📅 Contract Date",
+        value=date.today() + timedelta(days=1),
+        min_value=date.today(),
+        max_value=date.today() + timedelta(days=30),
+        key="contract_date"
+    )
+    
+    st.markdown("---")
+    
+    # Two-column layout for input
+    input_col1, input_col2 = st.columns(2)
+    
+    with input_col1:
+        st.markdown('<div class="input-container">', unsafe_allow_html=True)
+        st.markdown("**📍 Low-1 Reference Point**")
+        
+        low1_price = st.number_input(
+            "💰 Low-1 Price",
+            value=10.0,
+            min_value=0.0,
+            step=0.01,
+            format="%.2f",
+            key="low1_price",
+            help="First reference price point"
+        )
+        
+        low1_time = st.time_input(
+            "⏰ Low-1 Time",
+            value=time(2, 0),
+            step=300,  # 5-minute steps
+            key="low1_time",
+            help="Time for first reference point"
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    with input_col2:
+        st.markdown('<div class="input-container">', unsafe_allow_html=True)
+        st.markdown("**📍 Low-2 Reference Point**")
+        
+        low2_price = st.number_input(
+            "💰 Low-2 Price",
+            value=12.0,
+            min_value=0.0,
+            step=0.01,
+            format="%.2f",
+            key="low2_price",
+            help="Second reference price point"
+        )
+        
+        low2_time = st.time_input(
+            "⏰ Low-2 Time",
+            value=time(3, 30),
+            step=300,  # 5-minute steps
+            key="low2_time",
+            help="Time for second reference point"
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Validation and analytics
+    if low2_time <= low1_time:
+        st.error("⚠️ Low-2 time must be after Low-1 time")
+    else:
+        # Calculate metrics
+        time_minutes = (datetime.combine(contract_date, low2_time) - 
+                       datetime.combine(contract_date, low1_time)).total_seconds() / 60
+        
+        price_change = low2_price - low1_price
+        price_change_pct = (price_change / low1_price) * 100 if low1_price > 0 else 0
+        hourly_rate = (price_change / time_minutes) * 60 if time_minutes > 0 else 0
+        
+        # Display analytics
+        st.markdown("### 📊 Contract Analytics")
+        
+        analytics_col1, analytics_col2, analytics_col3 = st.columns(3)
+        
+        with analytics_col1:
+            st.markdown(
+                create_metric_card(
+                    "💰", "Price Change", f"${price_change:+.2f}", 
+                    f"{price_change_pct:+.1f}%"
+                ),
+                unsafe_allow_html=True
+            )
+        
+        with analytics_col2:
+            st.markdown(
+                create_metric_card(
+                    "⚡", "Hourly Rate", f"${hourly_rate:+.2f}/hr", 
+                    f"{time_minutes:.0f} min span"
+                ),
+                unsafe_allow_html=True
+            )
+        
+        with analytics_col3:
+            trend_emoji = "📈" if price_change > 0 else "📉" if price_change < 0 else "➡️"
+            trend_text = "Bullish" if price_change > 0 else "Bearish" if price_change < 0 else "Flat"
+            st.markdown(
+                create_metric_card(
+                    trend_emoji, "Trend", trend_text, 
+                    "Direction indicator"
+                ),
+                unsafe_allow_html=True
+            )
+    
+    st.markdown("---")
+    
+    # Generate contract forecast button
+    if st.button("🎯 Generate Contract Line Forecast", key="generate_contract", type="primary"):
+        
+        if low2_time <= low1_time:
+            st.error("❌ Please ensure Low-2 time is after Low-1 time")
+        else:
+            with st.spinner("📈 Generating contract line forecast..."):
+                try:
+                    # Generate contract forecast
+                    contract_table, contract_params = strategy.contract_line_forecast(
+                        low1_price, low1_time, low2_price, low2_time, contract_date
+                    )
+                    
+                    # Store in session state
+                    st.session_state.contract_params = contract_params
+                    st.session_state.contract_table = contract_table
+                    st.session_state.contract_metadata = {
+                        "date": contract_date,
+                        "low1_price": low1_price,
+                        "low1_time": low1_time,
+                        "low2_price": low2_price,
+                        "low2_time": low2_time,
+                        "slope": contract_params.get("slope", 0)
+                    }
+                    
+                    st.success("✅ Contract line forecast generated!")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error generating contract forecast: {str(e)}")
+    
+    # Display contract results
+    if not st.session_state.contract_table.empty:
+        st.markdown("## 📊 Contract Line Results")
+        
+        contract_df = st.session_state.contract_table
+        metadata = st.session_state.get("contract_metadata", {})
+        
+        # Results summary
+        if not contract_df.empty:
+            min_price = contract_df['Projected'].min()
+            max_price = contract_df['Projected'].max()
+            price_range = max_price - min_price
+            
+            result_col1, result_col2, result_col3 = st.columns(3)
+            
+            with result_col1:
+                st.markdown(
+                    create_metric_card("📉", "Min Price", f"${min_price:.2f}", "Lowest projection"),
+                    unsafe_allow_html=True
+                )
+            
+            with result_col2:
+                st.markdown(
+                    create_metric_card("📈", "Max Price", f"${max_price:.2f}", "Highest projection"),
+                    unsafe_allow_html=True
+                )
+            
+            with result_col3:
+                st.markdown(
+                    create_metric_card("📏", "Range", f"${price_range:.2f}", "Total spread"),
+                    unsafe_allow_html=True
+                )
+        
+        # Display the table
+        display_forecast_table(contract_df, "Contract Line Projection")
+    
+    # Real-time lookup section
+    st.markdown("---")
+    st.markdown("### 🔍 Real-Time Price Lookup")
+    st.caption("Get instant price projections for any time using your contract line")
+    
+    if not st.session_state.contract_params:
+        st.warning("⚠️ Generate a contract line forecast first to use the lookup system")
+    else:
+        lookup_col1, lookup_col2 = st.columns([1, 2])
+        
+        with lookup_col1:
+            lookup_time = st.time_input(
+                "🕐 Lookup Time",
+                value=time(9, 25),
+                step=300,
+                key="lookup_time_input",
+                help="Enter any time to get projected price"
+            )
+            
+            if st.button("🔍 Lookup Price", key="lookup_button"):
+                try:
+                    contract_date = st.session_state.contract_metadata.get("date", date.today())
+                    lookup_price = strategy.lookup_contract_price(
+                        st.session_state.contract_params, 
+                        lookup_time, 
+                        contract_date
+                    )
+                    
+                    st.session_state.last_lookup_result = {
+                        "time": lookup_time,
+                        "price": lookup_price
+                    }
+                    
+                except Exception as e:
+                    st.error(f"❌ Lookup error: {str(e)}")
+        
+        with lookup_col2:
+            # Display lookup result
+            if hasattr(st.session_state, 'last_lookup_result'):
+                result = st.session_state.last_lookup_result
+                
+                st.markdown(
+                    f"""
+                    <div style="background: linear-gradient(135deg, #6366f1, #8b5cf6); 
+                               padding: 1rem; border-radius: 12px; text-align: center; color: white;">
+                        <h3 style="margin: 0; font-size: 1.2rem;">💰 Projected Price</h3>
+                        <h2 style="margin: 0.5rem 0; font-size: 2rem; font-weight: bold;">
+                            ${result["price"]:.2f}
+                        </h2>
+                        <p style="margin: 0; opacity: 0.8;">
+                            @ {result["time"].strftime('%H:%M')}
+                        </p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                
+                # Additional analytics
+                base_price = st.session_state.contract_metadata.get("low1_price", 0)
+                if base_price > 0:
+                    price_change = result["price"] - base_price
+                    change_percent = (price_change / base_price) * 100
+                    
+                    change_col1, change_col2 = st.columns(2)
+                    with change_col1:
+                        st.metric("📊 Price Change", f"${price_change:+.2f}")
+                    with change_col2:
+                        st.metric("📈 Percentage", f"{change_percent:+.1f}%")
+    
+    # Batch lookup feature
+    st.markdown("---")
+    st.markdown("**⚡ Batch Lookup**")
+    st.caption("Enter multiple times separated by commas (e.g., 09:30, 10:00, 14:30)")
+    
+    batch_times_input = st.text_input(
+        "Times (HH:MM format)",
+        placeholder="09:30, 10:00, 11:30, 14:00",
+        key="batch_lookup_input"
+    )
+    
+    if st.button("🔍 Batch Lookup", key="batch_lookup_button") and batch_times_input and st.session_state.contract_params:
+        try:
+            # Parse times
+            time_strings = [t.strip() for t in batch_times_input.split(',')]
+            lookup_results = []
+            
+            contract_date = st.session_state.contract_metadata.get("date", date.today())
+            
+            for time_str in time_strings:
+                try:
+                    hour, minute = map(int, time_str.split(':'))
+                    lookup_time_obj = time(hour, minute)
+                    
+                    price = strategy.lookup_contract_price(
+                        st.session_state.contract_params,
+                        lookup_time_obj,
+                        contract_date
+                    )
+                    
+                    lookup_results.append({
+                        'Time': time_str,
+                        'Projected Price': f"${price:.2f}",
+                        'Price (Raw)': price
+                    })
+                    
+                except ValueError:
+                    st.warning(f"⚠️ Invalid time format: {time_str}")
+            
+            if lookup_results:
+                # Display results table
+                results_df = pd.DataFrame(lookup_results)
+                
+                # Add change calculations
+                if len(results_df) > 1:
+                    results_df['Change'] = results_df['Price (Raw)'].diff()
+                    results_df['Change'] = results_df['Change'].apply(
+                        lambda x: f"${x:+.2f}" if pd.notna(x) else "-"
+                    )
+                
+                # Style and display
+                display_columns = ['Time', 'Projected Price']
+                if 'Change' in results_df.columns:
+                    display_columns.append('Change')
+                
+                st.dataframe(
+                    results_df[display_columns],
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                # Download batch results
+                csv = results_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Batch Results",
+                    data=csv,
+                    file_name=f"batch_lookup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="download_batch"
+                )
+                
+        except Exception as e:
+            st.error(f"❌ Batch lookup error: {str(e)}")
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PART 4: INDIVIDUAL STOCK PAGES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Stock information dictionary
+stock_info = {
+    "TSLA": {"name": "Tesla", "icon": "🚗", "sector": "Automotive"},
+    "NVDA": {"name": "NVIDIA", "icon": "🧠", "sector": "Semiconductors"},
+    "AAPL": {"name": "Apple", "icon": "🍎", "sector": "Technology"},
+    "MSFT": {"name": "Microsoft", "icon": "🪟", "sector": "Technology"},
+    "AMZN": {"name": "Amazon", "icon": "📦", "sector": "E-commerce"},
+    "GOOGL": {"name": "Google", "icon": "🔍", "sector": "Technology"},
+    "META": {"name": "Meta", "icon": "📘", "sector": "Social Media"},
+    "NFLX": {"name": "Netflix", "icon": "📺", "sector": "Streaming"}
+}
+
+# Handle stock pages
+if selected_page in stock_info:
+    ticker = selected_page
+    info = stock_info[ticker]
+    
+    # Page header
+    st.markdown(f"## {info['icon']} {info['name']} ({ticker}) Analysis")
+    st.caption(f"Individual stock forecasting for {info['name']} in the {info['sector']} sector")
+    
+    # Current slope display
+    current_slope = strategy.slopes.get(ticker, 0)
+    slope_color = "🟢" if current_slope > 0 else "🔴" if current_slope < 0 else "🟡"
+    
+    st.info(f"**Current Slope:** {slope_color} {current_slope:.4f}")
+    
+    # Analysis parameters
+    st.markdown("### ⚙️ Analysis Parameters")
+    
+    # Date and basic settings
+    analysis_col1, analysis_col2 = st.columns(2)
+    
+    with analysis_col1:
+        analysis_date = st.date_input(
+            "📅 Analysis Date",
+            value=date.today() + timedelta(days=1),
+            min_value=date.today(),
+            max_value=date.today() + timedelta(days=30),
+            key=f"{ticker}_analysis_date"
+        )
+    
+    with analysis_col2:
+        st.info(f"📅 **{analysis_date.strftime('%A')}** - {analysis_date.strftime('%B %d, %Y')}")
+    
+    st.markdown("---")
+    
+    # Stock data entry
+    st.markdown("### 📋 Previous Day Data Entry")
+    
+    # Two-column layout for low and high anchors
+    low_col, high_col = st.columns(2)
+    
+    with low_col:
+        st.markdown('<div class="input-container">', unsafe_allow_html=True)
+        st.markdown("**📉 Low Anchor**")
+        
+        low_price = st.number_input(
+            "Previous Day Low Price",
+            value=0.0,
+            min_value=0.0,
+            step=0.01,
+            format="%.2f",
+            key=f"{ticker}_low_price",
+            help=f"Enter {ticker}'s previous day low price"
+        )
+        
+        low_time = st.time_input(
+            "Low Time",
+            value=time(7, 30),
+            key=f"{ticker}_low_time",
+            help="Time when the low occurred"
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    with high_col:
+        st.markdown('<div class="input-container">', unsafe_allow_html=True)
+        st.markdown("**📈 High Anchor**")
+        
+        high_price = st.number_input(
+            "Previous Day High Price",
+            value=0.0,
+            min_value=0.0,
+            step=0.01,
+            format="%.2f",
+            key=f"{ticker}_high_price",
+            help=f"Enter {ticker}'s previous day high price"
+        )
+        
+        high_time = st.time_input(
+            "High Time",
+            value=time(7, 30),
+            key=f"{ticker}_high_time",
+            help="Time when the high occurred"
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Validation and quick metrics
+    if low_price > 0 and high_price > 0:
+        if high_price <= low_price:
+            st.error("⚠️ High price must be greater than low price")
+        else:
+            # Calculate quick metrics
+            price_range = high_price - low_price
+            range_percentage = (price_range / low_price) * 100
+            midpoint = (high_price + low_price) / 2
+            
+            st.markdown("### 📊 Quick Analysis")
+            
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            
+            with metric_col1:
+                st.markdown(
+                    create_metric_card("💰", "Range", f"${price_range:.2f}", f"{range_percentage:.1f}%"),
+                    unsafe_allow_html=True
+                )
+            
+            with metric_col2:
+                volatility = "Low" if range_percentage < 3 else "High" if range_percentage > 8 else "Normal"
+                st.markdown(
+                    create_metric_card("⚡", "Volatility", volatility, f"{range_percentage:.1f}% range"),
+                    unsafe_allow_html=True
+                )
+            
+            with metric_col3:
+                st.markdown(
+                    create_metric_card("🎯", "Midpoint", f"${midpoint:.2f}", "Range center"),
+                    unsafe_allow_html=True
+                )
+    
+    st.markdown("---")
+    
+    # Generate analysis button
+    generate_key = f"generate_{ticker}_analysis"
+    
+    if st.button(f"🚀 Generate {ticker} Analysis", key=generate_key, type="primary"):
+        
+        # Validation
+        if low_price <= 0 or high_price <= 0:
+            st.error("❌ Please enter valid prices for both low and high anchors")
+        elif high_price <= low_price:
+            st.error("❌ High price must be greater than low price")
+        else:
+            with st.spinner(f"📊 Analyzing {ticker}..."):
+                try:
+                    # Generate stock forecast
+                    forecast = strategy.stock_forecast(
+                        ticker,
+                        low_price, low_time,
+                        high_price, high_time,
+                        analysis_date
+                    )
+                    
+                    # Store results in session state with ticker-specific key
+                    forecast_key = f"{ticker}_forecasts"
+                    metadata_key = f"{ticker}_metadata"
+                    
+                    st.session_state[forecast_key] = forecast
+                    st.session_state[metadata_key] = {
+                        "date": analysis_date,
+                        "low_price": low_price,
+                        "low_time": low_time,
+                        "high_price": high_price,
+                        "high_time": high_time,
+                        "generated_at": datetime.now()
+                    }
+                    
+                    st.success(f"✅ {ticker} analysis complete!")
+                    
+                except Exception as e:
+                    st.error(f"❌ Analysis error: {str(e)}")
+    
+    # Display results
+    forecast_key = f"{ticker}_forecasts"
+    metadata_key = f"{ticker}_metadata"
+    
+    if forecast_key in st.session_state:
+        st.markdown(f"## 📊 {ticker} Analysis Results")
+        
+        forecast_data = st.session_state[forecast_key]
+        metadata = st.session_state.get(metadata_key, {})
+        
+        # Results summary
+        analysis_date_str = str(metadata.get('date', 'N/A'))
+        
+        summary_col1, summary_col2 = st.columns(2)
+        
+        with summary_col1:
+            st.markdown(
+                create_metric_card("📅", "Analysis Date", analysis_date_str, "Target date"),
+                unsafe_allow_html=True
+            )
+        
+        with summary_col2:
+            anchors_count = len(forecast_data)
+            st.markdown(
+                create_metric_card("🔢", "Anchor Points", str(anchors_count), "Generated forecasts"),
+                unsafe_allow_html=True
+            )
+        
+        # Create tabs for Low and High anchors
+        if "Low" in forecast_data and "High" in forecast_data:
+            low_tab, high_tab, summary_tab = st.tabs(["📉 Low Anchor", "📈 High Anchor", "📋 Summary"])
+            
+            with low_tab:
+                low_df = forecast_data["Low"]
+                display_forecast_table(low_df, f"{ticker} Low Anchor Forecast")
+                
+                # Low anchor insights
+                if not low_df.empty and 'Entry' in low_df.columns:
+                    entry_range = low_df['Entry'].max() - low_df['Entry'].min()
+                    exit_range = low_df['Exit'].max() - low_df['Exit'].min()
+                    avg_spread = (low_df['Entry'] - low_df['Exit']).mean()
+                    
+                    insight_col1, insight_col2, insight_col3 = st.columns(3)
+                    
+                    with insight_col1:
+                        st.metric("📊 Entry Range", f"${entry_range:.2f}")
+                    with insight_col2:
+                        st.metric("📊 Exit Range", f"${exit_range:.2f}")
+                    with insight_col3:
+                        st.metric("💰 Avg Spread", f"${avg_spread:.2f}")
+            
+            with high_tab:
+                high_df = forecast_data["High"]
+                display_forecast_table(high_df, f"{ticker} High Anchor Forecast")
+                
+                # High anchor insights
+                if not high_df.empty and 'Entry' in high_df.columns:
+                    entry_range = high_df['Entry'].max() - high_df['Entry'].min()
+                    exit_range = high_df['Exit'].max() - high_df['Exit'].min()
+                    avg_spread = (high_df['Entry'] - high_df['Exit']).mean()
+                    
+                    insight_col1, insight_col2, insight_col3 = st.columns(3)
+                    
+                    with insight_col1:
+                        st.metric("📊 Entry Range", f"${entry_range:.2f}")
+                    with insight_col2:
+                        st.metric("📊 Exit Range", f"${exit_range:.2f}")
+                    with insight_col3:
+                        st.metric("💰 Avg Spread", f"${avg_spread:.2f}")
+            
+            with summary_tab:
+                # Generate summary insights
+                low_df = forecast_data.get("Low", pd.DataFrame())
+                high_df = forecast_data.get("High", pd.DataFrame())
+                
+                if not low_df.empty and not high_df.empty:
+                    st.markdown("### 📊 Performance Comparison")
+                    
+                    # Calculate key metrics
+                    low_volatility = (low_df['Entry'].max() - low_df['Entry'].min()) / low_df['Entry'].mean() * 100
+                    high_volatility = (high_df['Entry'].max() - high_df['Entry'].min()) / high_df['Entry'].mean() * 100
+                    
+                    low_max_spread = (low_df['Entry'] - low_df['Exit']).max()
+                    high_max_spread = (high_df['Entry'] - high_df['Exit']).max()
+                    
+                    # Display comparison
+                    comparison_col1, comparison_col2 = st.columns(2)
+                    
+                    with comparison_col1:
+                        st.markdown("**📊 Volatility Analysis**")
+                        st.metric("Low Anchor Volatility", f"{low_volatility:.1f}%")
+                        st.metric("High Anchor Volatility", f"{high_volatility:.1f}%")
+                        
+                        # Risk assessment
+                        avg_volatility = (low_volatility + high_volatility) / 2
+                        risk_level = "Low" if avg_volatility < 5 else "High" if avg_volatility > 15 else "Medium"
+                        risk_emoji = {"Low": "🟢", "Medium": "🟡", "High": "🔴"}
+                        
+                        st.info(f"**Risk Level:** {risk_emoji[risk_level]} {risk_level}")
+                    
+                    with comparison_col2:
+                        st.markdown("**💰 Profit Potential**")
+                        st.metric("Low Anchor Max", f"${low_max_spread:.2f}")
+                        st.metric("High Anchor Max", f"${high_max_spread:.2f}")
+                        
+                        better_anchor = "Low" if low_max_spread > high_max_spread else "High"
+                        st.success(f"**Best Anchor:** {better_anchor}")
+                    
+                    # Overall recommendation
+                    st.markdown("### 🎯 Trading Recommendation")
+                    
+                    if risk_level == "Low" and max(low_max_spread, high_max_spread) > 5:
+                        recommendation = "🟢 **FAVORABLE** - Low risk with good profit potential"
+                    elif risk_level == "High" and max(low_max_spread, high_max_spread) > 10:
+                        recommendation = "🟡 **MODERATE** - High risk but high reward potential"
+                    elif risk_level == "Low":
+                        recommendation = "🔵 **CONSERVATIVE** - Low risk, modest returns"
+                    else:
+                        recommendation = "🔴 **CAUTION** - High risk, assess carefully"
+                    
+                    st.markdown(recommendation)
+        
+        # Export options
+        st.markdown("### 📤 Export Options")
+        
+        export_col1, export_col2 = st.columns(2)
+        
+        with export_col1:
+            if "Low" in forecast_data:
+                csv_low = forecast_data["Low"].to_csv(index=False)
+                st.download_button(
+                    f"📉 {ticker} Low Data",
+                    csv_low,
+                    f"{ticker}_low_{datetime.now().strftime('%Y%m%d')}.csv",
+                    key=f"download_{ticker}_low"
+                )
+        
+        with export_col2:
+            if "High" in forecast_data:
+                csv_high = forecast_data["High"].to_csv(index=False)
+                st.download_button(
+                    f"📈 {ticker} High Data",
+                    csv_high,
+                    f"{ticker}_high_{datetime.now().strftime('%Y%m%d')}.csv",
+                    key=f"download_{ticker}_high"
+                )
+    
+    else:
+        st.info(f"👆 Enter {ticker}'s previous day high and low prices, then click 'Generate {ticker} Analysis' to see results.")
+
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PART 5: SETTINGS & SLOPE MANAGEMENT (SIDEBAR ADDITIONS)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Additional sidebar features
+st.sidebar.markdown("---")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRESET MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.sidebar.markdown("## 💾 Preset Management")
+
+with st.sidebar.expander("📋 Save/Load Presets", expanded=False):
+    # Initialize presets in session state if not exists
+    if "presets" not in st.session_state:
+        st.session_state.presets = {}
+    
+    # Save preset
+    st.markdown("**💾 Save Current Slopes**")
+    preset_name = st.text_input(
+        "Preset Name",
+        placeholder="My Strategy",
+        key="preset_name_input"
+    )
+    
+    if st.button("💾 Save Preset", key="save_preset") and preset_name:
+        st.session_state.presets[preset_name] = strategy.slopes.copy()
+        st.success(f"✅ Saved preset: {preset_name}")
+    
+    # Load preset
+    if st.session_state.presets:
+        st.markdown("**📂 Load Preset**")
+        selected_preset = st.selectbox(
+            "Available Presets",
+            list(st.session_state.presets.keys()),
+            key="preset_selector"
+        )
+        
+        preset_col1, preset_col2 = st.columns(2)
+        
+        with preset_col1:
+            if st.button("📂 Load", key="load_preset"):
+                for asset, slope in st.session_state.presets[selected_preset].items():
+                    strategy.update_slope(asset, slope)
+                st.success(f"✅ Loaded: {selected_preset}")
+                st.rerun()
+        
+        with preset_col2:
+            if st.button("🗑️ Delete", key="delete_preset"):
+                del st.session_state.presets[selected_preset]
+                st.success(f"✅ Deleted: {selected_preset}")
+                st.rerun()
+    else:
+        st.info("No presets saved yet")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXPORT/IMPORT CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.sidebar.markdown("## 📤 Configuration")
+
+with st.sidebar.expander("💼 Export/Import", expanded=False):
+    # Export configuration
+    st.markdown("**📤 Export Settings**")
+    if st.button("📤 Export Config", key="export_config"):
+        config_data = {
+            "slopes": strategy.slopes,
+            "presets": st.session_state.get("presets", {}),
+            "exported_at": datetime.now().isoformat(),
+            "version": "2.0"
+        }
+        
+        config_json = json.dumps(config_data, indent=2)
+        st.download_button(
+            "📥 Download Config",
+            config_json,
+            f"spx_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            key="download_config"
+        )
+    
+    # Import configuration
+    st.markdown("**📂 Import Settings**")
+    uploaded_config = st.file_uploader(
+        "Upload Config File",
+        type=['json'],
+        key="import_config"
+    )
+    
+    if uploaded_config:
+        try:
+            config_data = json.loads(uploaded_config.read())
+            
+            if "slopes" in config_data:
+                for asset, slope in config_data["slopes"].items():
+                    if asset in strategy.slopes:
+                        strategy.update_slope(asset, slope)
+            
+            if "presets" in config_data:
+                if "presets" not in st.session_state:
+                    st.session_state.presets = {}
+                st.session_state.presets.update(config_data["presets"])
+            
+            st.success("✅ Configuration imported successfully!")
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"❌ Import error: {str(e)}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SESSION INFORMATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.sidebar.markdown("## ℹ️ Session Info")
+
+with st.sidebar.expander("📊 Current Session", expanded=False):
+    # Count active forecasts
+    spx_forecasts = len(st.session_state.get('current_forecasts', {}))
+    contract_active = not st.session_state.get('contract_table', pd.DataFrame()).empty
+    
+    stock_forecasts = 0
+    for ticker in strategy.get_available_tickers():
+        if f"{ticker}_forecasts" in st.session_state:
+            stock_forecasts += 1
+    
+    st.markdown(f"""
+    **📊 Active Forecasts:**
+    - SPX Anchors: {spx_forecasts}
+    - Contract Line: {'✅' if contract_active else '❌'}
+    - Stock Analysis: {stock_forecasts}
+    
+    **⏰ Session Time:** {datetime.now().strftime('%H:%M:%S')}
+    
+    **📅 Current Page:** {st.session_state.selected_page}
+    """)
+    
+    # Clear session data
+    if st.button("🧹 Clear All Data", key="clear_session"):
+        # Clear all forecast data
+        keys_to_clear = ['current_forecasts', 'contract_table', 'contract_params']
+        
+        # Clear stock-specific data
+        for ticker in strategy.get_available_tickers():
+            keys_to_clear.extend([f"{ticker}_forecasts", f"{ticker}_metadata"])
+        
+        for key in keys_to_clear:
+            if key in st.session_state:
+                del st.session_state[key]
+        
+        st.success("✅ All forecast data cleared!")
+        st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELP & DOCUMENTATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.sidebar.markdown("## ❓ Help")
+
+with st.sidebar.expander("📖 Quick Guide", expanded=False):
+    st.markdown("""
+    **🧭 SPX Forecasting:**
+    1. Select "SPX Forecast" page
+    2. Enter High, Close, Low prices from previous day
+    3. Set corresponding times
+    4. Generate forecast to see projections
+    
+    **📈 Contract Line:**
+    1. Go to "Contract Line" page  
+    2. Set Low-1 and Low-2 reference points
+    3. Generate forecast for interpolated prices
+    4. Use lookup for specific time queries
+    
+    **📊 Stock Analysis:**
+    1. Select any stock page (TSLA, NVDA, etc.)
+    2. Enter previous day High and Low prices
+    3. Set anchor times
+    4. Generate analysis for entry/exit projections
+    
+    **📐 Slope Management:**
+    Use the "Adjust Slopes" section to fine-tune forecasting parameters for each asset.
+    """)
+
+with st.sidebar.expander("⚙️ Tips & Tricks", expanded=False):
+    st.markdown("""
+    **💡 Best Practices:**
+    - Use accurate previous day data for better forecasts
+    - Save slope configurations as presets for different market conditions
+    - Compare multiple anchor points for validation
+    - Export data for external analysis
+    
+    **🎯 Slope Tuning:**
+    - Negative slopes: Price decreases over time
+    - Positive slopes: Price increases over time  
+    - Magnitude: How steep the price change
+    
+    **📊 Reading Results:**
+    - Entry: Suggested entry price
+    - Exit: Suggested exit price
+    - Spread: Difference between entry/exit
+    """)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FOOTER INFORMATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.sidebar.markdown("---")
+st.sidebar.markdown(
+    f"""
+    <div style="text-align: center; opacity: 0.7; font-size: 0.8rem;">
+        <strong>SPX Prophet v2.0</strong><br>
+        Session: {datetime.now().strftime('%H:%M:%S')}<br>
+        Page: {st.session_state.selected_page}
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PART 6: FOOTER & COMPLETION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN CONTENT FOOTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Add spacing before footer
+st.markdown("<br><br>", unsafe_allow_html=True)
+
+# Application footer
+st.markdown("---")
+
+# Footer with statistics and info
+footer_col1, footer_col2, footer_col3 = st.columns(3)
+
+with footer_col1:
+    st.markdown("### 📊 Session Statistics")
+    
+    # Calculate session stats
+    total_forecasts = 0
+    
+    # Count SPX forecasts
+    if st.session_state.get('current_forecasts'):
+        total_forecasts += len(st.session_state.current_forecasts)
+    
+    # Count contract line
+    if not st.session_state.get('contract_table', pd.DataFrame()).empty:
+        total_forecasts += 1
+    
+    # Count stock forecasts
+    stock_count = 0
+    for ticker in strategy.get_available_tickers():
+        if f"{ticker}_forecasts" in st.session_state:
+            stock_count += 1
+    
+    total_forecasts += stock_count
+    
+    st.markdown(f"""
+    - **Total Forecasts Generated:** {total_forecasts}
+    - **Active Stock Analysis:** {stock_count}
+    - **Current Page:** {st.session_state.selected_page}
+    - **Session Duration:** {datetime.now().strftime('%H:%M:%S')}
+    """)
+
+with footer_col2:
+    st.markdown("### 🎯 Quick Actions")
+    
+    quick_col1, quick_col2 = st.columns(2)
+    
+    with quick_col1:
+        if st.button("🔄 Reset Slopes", key="footer_reset_slopes"):
+            strategy.reset_slopes()
+            st.success("✅ Slopes reset!")
+            st.rerun()
+        
+        if st.button("📊 SPX Page", key="footer_spx"):
+            st.session_state.selected_page = "SPX"
+            st.rerun()
+    
+    with quick_col2:
+        if st.button("📈 Contract Page", key="footer_contract"):
+            st.session_state.selected_page = "Contract"  
+            st.rerun()
+        
+        if st.button("🧹 Clear Data", key="footer_clear"):
+            # Clear main forecast data
+            keys_to_clear = ['current_forecasts', 'contract_table', 'contract_params']
+            for key in keys_to_clear:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.success("✅ Data cleared!")
+            st.rerun()
+
+with footer_col3:
+    st.markdown("### ℹ️ About")
+    
+    st.markdown("""
+    **SPX Prophet v2.0**
+    
+    Advanced financial forecasting tool using time-based projections and slope analysis.
+    
+    **Features:**
+    - 🧭 SPX three-anchor forecasting
+    - 📈 Contract line interpolation  
+    - 📊 Individual stock analysis
+    - 📐 Customizable slope parameters
+    - 💾 Preset management
+    - 📤 Data export capabilities
+    """)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FINAL DISCLAIMER & LEGAL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+
+# Disclaimer
+st.markdown("""
+<div style="background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); 
+           border-radius: 16px; padding: 1rem; margin: 1rem 0; text-align: center;">
+    <h4 style="color: #f59e0b; margin-top: 0;">⚠️ Important Disclaimer</h4>
+    <p style="margin-bottom: 0; opacity: 0.8; font-size: 0.9rem;">
+        This tool is for educational and analysis purposes only. Past performance does not guarantee future results. 
+        Always conduct your own research and risk management before making any trading decisions. 
+        The creators are not responsible for any financial losses incurred from using this tool.
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+# Final footer
+st.markdown(
+    f"""
+    <div style="text-align: center; opacity: 0.6; font-size: 0.8rem; margin-top: 2rem;">
+        SPX Prophet v2.0 • Built with Streamlit • 
+        Session Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} • 
+        Page: {st.session_state.selected_page}
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUCCESS MESSAGE (DEVELOPMENT ONLY - REMOVE IN PRODUCTION)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# This message confirms the app loaded successfully
+# Remove this section when deploying to production
+if st.sidebar.button("🎉 App Status", key="app_status"):
+    st.sidebar.success("✅ SPX Prophet fully loaded!")
+    st.sidebar.info(f"Current slopes: {len(strategy.slopes)} assets configured")
+    st.sidebar.info(f"Available tickers: {len(strategy.get_available_tickers())} stocks")
+
+# End of application
+# ═══════════════════════════════════════════════════════════════════════════════
+# APPLICATION COMPLETE - ALL 6 PARTS LOADED
+# ═══════════════════════════════════════════════════════════════════════════════
