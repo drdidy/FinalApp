@@ -702,9 +702,9 @@ with tab1:
     if st.button("Generate SPX Anchors", key="spx_generate", type="primary"):
         with st.spinner("Analyzing market data..."):
             try:
-                # Auto-update offset first
-                es_data_for_offset = fetch_live_data("ES=F", prev_day, prev_day + timedelta(days=1))
-                spx_data_for_offset = fetch_live_data("^GSPC", prev_day, prev_day + timedelta(days=1))
+                # Auto-update offset for the specific historical date
+                es_data_for_offset = fetch_live_data("ES=F", prev_day, prev_day)
+                spx_data_for_offset = fetch_live_data("^GSPC", prev_day, prev_day)
                 
                 if not es_data_for_offset.empty and not spx_data_for_offset.empty:
                     st.session_state.current_offset = calculate_es_spx_offset(es_data_for_offset, spx_data_for_offset)
@@ -960,5 +960,5 @@ with tab1:
         st.info("Configure your dates and click 'Generate SPX Anchors' to begin analysis")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# END OF PART 2 - SPX ANCHORS TAB
+# END OF SPX ANCHORS TAB
 # ═══════════════════════════════════════════════════════════════════════════════
