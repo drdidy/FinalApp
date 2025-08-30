@@ -1016,3 +1016,450 @@ def calculate_stock_target_probability(ticker: str, target_distance: float, stop
     
     final_prob = base_prob + vol_adj
     return min(80, max(20, final_prob))
+
+
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPX PROPHET - PART 4: SIGNALS & EMA TAB
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab3:
+    st.subheader("Signal Detection & EMA Analysis")
+    st.caption("Single day signal detection with reference line and EMA analysis")
+    
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # INPUT CONTROLS
+    # ═══════════════════════════════════════════════════════════════════════════════
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        signal_symbol = st.text_input(
+            "Symbol", 
+            value="^GSPC",
+            key="sig_symbol"
+        )
+    
+    with col2:
+        signal_day = st.date_input(
+            "Analysis Day",
+            value=datetime.now(CT_TZ).date(),
+            key="sig_day"
+        )
+    
+    st.markdown("Reference Line Configuration")
+    
+    ref_col1, ref_col2, ref_col3 = st.columns(3)
+    with ref_col1:
+        anchor_price = st.number_input(
+            "Anchor Price",
+            value=6000.0,
+            step=0.1, format="%.2f",
+            key="sig_anchor_price"
+        )
+    
+    with ref_col2:
+        anchor_time_input = st.time_input(
+            "Anchor Time (CT)",
+            value=time(17, 0),
+            key="sig_anchor_time"
+        )
+    
+    with ref_col3:
+        ref_slope = st.number_input(
+            "Slope per 30min",
+            value=0.268,
+            step=0.001, format="%.3f",
+            key="sig_ref_slope"
+        )
+    
+    st.markdown("---")
+    
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # SIGNAL ANALYSIS EXECUTION
+    # ═══════════════════════════════════════════════════════════════════════════════
+    
+    if st.button("Generate Signals & EMA Analysis", key="sig_generate", type="primary"):
+        with st.spinner(f"Analyzing {signal_symbol} for {signal_day}..."):
+            
+            # Fetch data for analysis day
+            signal_data = fetch_live_data(signal_symbol, signal_day, signal_day)
+            
+            if signal_data.empty:
+                st.error(f"No data available for {signal_symbol} on {signal_day}")
+            else:
+                # Filter to RTH session
+                rth_data = get_session_window(signal_data, RTH_START, RTH_END)
+                
+                if rth_data.empty:
+                    st.error("No RTH data available for selected day")
+                else:
+                    # Store results
+                    st.session_state.signal_data = rth_data
+                    st.session_state.signal_anchor = {
+                        'price': anchor_price,
+                        'time': anchor_time_input,
+                        'slope': ref_slope
+                    }
+                    st.session_state.signal_symbol = signal_symbol
+                    st.session_state.signal_ready = True
+    
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # RESULTS DISPLAY
+    # ═══════════════════════════════════════════════════════════════════════════════
+    
+    if st.session_state.get('signal_ready', False):
+        signal_data = st.session_state.signal_data
+        anchor_config = st.session_state.signal_anchor
+        symbol = st.session_state.signal_symbol
+        
+        st.subheader(f"{symbol} Signal Analysis")
+        
+        # Create anchor datetime for projection
+        anchor_datetime = datetime.combine(signal_day, anchor_config['time'])
+        anchor_datetime_ct = CT_TZ.localize(anchor_datetime)
+        
+        # Generate reference line projection
+        ref_line_proj = project_anchor_line(
+            anchor_config['price'], 
+            anchor_datetime_ct,
+            anchor_config['slope'],
+            signal_day
+        )
+        
+        # Calculate indicators
+        ema8 = calculate_ema(signal_data['Close'], 8)
+        ema21 = calculate_ema(signal_data['Close'], 21)
+        vwap = calculate_vwap(signal_data)
+        
+        # Create analysis tabs
+        signal_tabs = st.tabs(["Reference Line", "BUY Signals", "SELL Signals", "EMA Analysis"])
+        
+        with signal_tabs[0]:  # Reference Line
+            st.write("Reference Line Projection")
+            st.dataframe(ref_line_proj, use_container_width=True)
+            
+            # Show anchor line interaction stats
+            line_stats = calculate_anchor_line_stats(signal_data, ref_line_proj)
+            st.write("Anchor Line Statistics")
+            st.dataframe(line_stats, use_container_width=True)
+        
+        with signal_tabs[1]:  # BUY Signals
+            buy_signals = detect_entry_signals(signal_data, ref_line_proj, "BUY")
+            if not buy_signals.empty:
+                st.write("BUY Signal Opportunities")
+                st.dataframe(buy_signals, use_container_width=True)
+            else:
+                st.info("No BUY signals detected for this day")
+        
+        with signal_tabs[2]:  # SELL Signals
+            sell_signals = detect_entry_signals(signal_data, ref_line_proj, "SELL")
+            if not sell_signals.empty:
+                st.write("SELL Signal Opportunities")
+                st.dataframe(sell_signals, use_container_width=True)
+            else:
+                st.info("No SELL signals detected for this day")
+        
+        with signal_tabs[3]:  # EMA Analysis
+            ema_analysis = calculate_ema_crossover_analysis(signal_data, ema8, ema21)
+            st.write("EMA 8/21 Crossover Analysis")
+            st.dataframe(ema_analysis, use_container_width=True)
+            
+            # EMA regime analysis
+            ema_regime = analyze_ema_regime(ema8, ema21, vwap)
+            st.write("Market Regime Analysis")
+            st.dataframe(ema_regime, use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIGNAL DETECTION FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_entry_signals(price_data: pd.DataFrame, ref_line: pd.DataFrame, signal_type: str) -> pd.DataFrame:
+    """Detect BUY/SELL signals based on anchor line interaction rules"""
+    if price_data.empty or ref_line.empty:
+        return pd.DataFrame()
+    
+    signals = []
+    
+    # Create reference line lookup
+    ref_dict = {}
+    for _, row in ref_line.iterrows():
+        ref_dict[row['Time']] = row['Price']
+    
+    for idx, bar in price_data.iterrows():
+        bar_time = format_ct_time(idx)
+        
+        if bar_time not in ref_dict:
+            continue
+            
+        ref_price = ref_dict[bar_time]
+        close_price = bar['Close']
+        open_price = bar['Open']
+        
+        # Determine if candle is bullish or bearish
+        is_bullish_candle = close_price > open_price
+        is_bearish_candle = close_price < open_price
+        
+        # Check for line touches (within 0.1% tolerance)
+        tolerance = ref_price * 0.001
+        high_touches = abs(bar['High'] - ref_price) <= tolerance
+        low_touches = abs(bar['Low'] - ref_price) <= tolerance
+        
+        signal_detected = False
+        signal_reason = ""
+        
+        if signal_type == "BUY":
+            # BUY: Bearish candle touches from above AND closes above line
+            if (is_bearish_candle and 
+                (high_touches or bar['High'] > ref_price) and 
+                close_price > ref_price):
+                signal_detected = True
+                signal_reason = "Bearish candle touched from above, closed above line"
+        
+        elif signal_type == "SELL":
+            # SELL: Bullish candle touches from below AND closes below line
+            if (is_bullish_candle and 
+                (low_touches or bar['Low'] < ref_price) and 
+                close_price < ref_price):
+                signal_detected = True
+                signal_reason = "Bullish candle touched from below, closed below line"
+        
+        if signal_detected:
+            # Calculate signal quality metrics
+            touch_quality = calculate_touch_quality(bar, ref_price)
+            volume_quality = calculate_volume_quality(bar, price_data)
+            
+            signals.append({
+                'Time': bar_time,
+                'Signal': signal_type,
+                'Entry_Price': close_price,
+                'Ref_Price': round(ref_price, 2),
+                'Touch_Quality': f"{touch_quality:.1f}%",
+                'Volume_Quality': f"{volume_quality:.1f}%",
+                'Reason': signal_reason,
+                'Probability': f"{calculate_signal_probability(touch_quality, volume_quality):.1f}%"
+            })
+    
+    return pd.DataFrame(signals)
+
+def calculate_touch_quality(bar: pd.Series, ref_price: float) -> float:
+    """Calculate quality of anchor line touch"""
+    # Closer touch = higher quality
+    high_distance = abs(bar['High'] - ref_price) / ref_price
+    low_distance = abs(bar['Low'] - ref_price) / ref_price
+    
+    closest_distance = min(high_distance, low_distance)
+    
+    # Convert to percentage (closer = higher score)
+    quality = max(0, 100 - (closest_distance * 10000))
+    return min(100, quality)
+
+def calculate_volume_quality(bar: pd.Series, data: pd.DataFrame) -> float:
+    """Calculate volume quality compared to recent average"""
+    if 'Volume' not in data.columns:
+        return 50.0
+    
+    # Get recent volume average (last 10 bars)
+    recent_avg = data['Volume'].tail(10).mean()
+    
+    if recent_avg == 0:
+        return 50.0
+    
+    volume_ratio = bar['Volume'] / recent_avg
+    
+    # Convert to quality score
+    if volume_ratio >= 1.5:
+        return 90.0
+    elif volume_ratio >= 1.2:
+        return 75.0
+    elif volume_ratio >= 0.8:
+        return 60.0
+    else:
+        return 30.0
+
+def calculate_signal_probability(touch_quality: float, volume_quality: float) -> float:
+    """Calculate overall signal probability"""
+    # Weighted combination
+    probability = (touch_quality * 0.6) + (volume_quality * 0.4)
+    return min(95, max(25, probability))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ANCHOR LINE STATISTICS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calculate_anchor_line_stats(price_data: pd.DataFrame, ref_line: pd.DataFrame) -> pd.DataFrame:
+    """Calculate statistical analysis of anchor line interactions"""
+    if price_data.empty or ref_line.empty:
+        return pd.DataFrame()
+    
+    stats = []
+    
+    # Create reference line lookup
+    ref_dict = {}
+    for _, row in ref_line.iterrows():
+        ref_dict[row['Time']] = row['Price']
+    
+    total_touches = 0
+    bounces = 0
+    penetrations = 0
+    avg_bounce_distance = 0
+    avg_penetration_depth = 0
+    
+    for idx, bar in price_data.iterrows():
+        bar_time = format_ct_time(idx)
+        
+        if bar_time not in ref_dict:
+            continue
+            
+        ref_price = ref_dict[bar_time]
+        
+        # Check for touches (within 0.2% tolerance)
+        tolerance = ref_price * 0.002
+        touches_line = (bar['Low'] <= ref_price + tolerance and 
+                       bar['High'] >= ref_price - tolerance)
+        
+        if touches_line:
+            total_touches += 1
+            
+            # Check if it bounced (closed away from line)
+            if bar['Close'] > ref_price + tolerance:
+                bounces += 1
+                avg_bounce_distance += bar['Close'] - ref_price
+            elif bar['Close'] < ref_price - tolerance:
+                penetrations += 1
+                avg_penetration_depth += ref_price - bar['Close']
+    
+    # Calculate averages
+    if bounces > 0:
+        avg_bounce_distance /= bounces
+    if penetrations > 0:
+        avg_penetration_depth /= penetrations
+    
+    bounce_rate = (bounces / total_touches * 100) if total_touches > 0 else 0
+    penetration_rate = (penetrations / total_touches * 100) if total_touches > 0 else 0
+    
+    stats.append({
+        'Metric': 'Total Line Touches',
+        'Value': total_touches,
+        'Percentage': '-'
+    })
+    
+    stats.append({
+        'Metric': 'Bounce Rate',
+        'Value': bounces,
+        'Percentage': f"{bounce_rate:.1f}%"
+    })
+    
+    stats.append({
+        'Metric': 'Penetration Rate', 
+        'Value': penetrations,
+        'Percentage': f"{penetration_rate:.1f}%"
+    })
+    
+    stats.append({
+        'Metric': 'Avg Bounce Distance',
+        'Value': f"{avg_bounce_distance:.2f}",
+        'Percentage': '-'
+    })
+    
+    stats.append({
+        'Metric': 'Avg Penetration Depth',
+        'Value': f"{avg_penetration_depth:.2f}",
+        'Percentage': '-'
+    })
+    
+    return pd.DataFrame(stats)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EMA ANALYSIS FUNCTIONS  
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calculate_ema_crossover_analysis(price_data: pd.DataFrame, ema8: pd.Series, ema21: pd.Series) -> pd.DataFrame:
+    """Detect and analyze EMA 8/21 crossovers"""
+    if price_data.empty or ema8.empty or ema21.empty:
+        return pd.DataFrame()
+    
+    crossovers = []
+    
+    for i in range(1, len(ema8)):
+        prev_8 = ema8.iloc[i-1]
+        prev_21 = ema21.iloc[i-1]
+        curr_8 = ema8.iloc[i]
+        curr_21 = ema21.iloc[i]
+        
+        # Detect crossover
+        crossover_type = None
+        if prev_8 <= prev_21 and curr_8 > curr_21:
+            crossover_type = "Bullish Cross"
+        elif prev_8 >= prev_21 and curr_8 < curr_21:
+            crossover_type = "Bearish Cross"
+        
+        if crossover_type:
+            timestamp = ema8.index[i]
+            time_ct = format_ct_time(timestamp)
+            
+            crossovers.append({
+                'Time': time_ct,
+                'Type': crossover_type,
+                'EMA8': round(curr_8, 2),
+                'EMA21': round(curr_21, 2),
+                'Price': round(price_data.iloc[i]['Close'], 2),
+                'Strength': calculate_crossover_strength(curr_8, curr_21)
+            })
+    
+    return pd.DataFrame(crossovers)
+
+def calculate_crossover_strength(ema8: float, ema21: float) -> str:
+    """Calculate strength of EMA crossover"""
+    separation = abs(ema8 - ema21) / ema21 * 100
+    
+    if separation >= 0.5:
+        return "Strong"
+    elif separation >= 0.2:
+        return "Moderate" 
+    else:
+        return "Weak"
+
+def analyze_ema_regime(ema8: pd.Series, ema21: pd.Series, vwap: pd.Series) -> pd.DataFrame:
+    """Analyze current market regime based on EMA and VWAP"""
+    if ema8.empty or ema21.empty:
+        return pd.DataFrame()
+    
+    current_8 = ema8.iloc[-1]
+    current_21 = ema21.iloc[-1]
+    current_vwap = vwap.iloc[-1] if not vwap.empty else 0
+    
+    # Determine regime
+    if current_8 > current_21:
+        ema_regime = "Bullish"
+        regime_strength = (current_8 - current_21) / current_21 * 100
+    else:
+        ema_regime = "Bearish"
+        regime_strength = (current_21 - current_8) / current_8 * 100
+    
+    # VWAP position
+    if current_vwap > 0:
+        price = ema8.iloc[-1]  # Use current price
+        vwap_position = "Above VWAP" if price > current_vwap else "Below VWAP"
+        vwap_distance = abs(price - current_vwap) / current_vwap * 100
+    else:
+        vwap_position = "N/A"
+        vwap_distance = 0
+    
+    regime_data = [{
+        'Component': 'EMA Regime',
+        'Status': ema_regime,
+        'Strength': f"{regime_strength:.2f}%",
+        'Signal': 'Bullish' if ema_regime == 'Bullish' else 'Bearish'
+    }, {
+        'Component': 'VWAP Position',
+        'Status': vwap_position,
+        'Strength': f"{vwap_distance:.2f}%",
+        'Signal': 'Bullish' if vwap_position == 'Above VWAP' else 'Bearish'
+    }]
+    
+    return pd.DataFrame(regime_data)
