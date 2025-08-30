@@ -422,3 +422,272 @@ with st.sidebar:
 # -----------------------------
 topbar()
 PAGES[st.session_state["nav"]]()
+
+
+
+
+
+# ======================================================================
+# Part 2 — SPX Skyline foundation:
+# - yfinance fetchers
+# - ES Asian-session anchor window (17:00–19:30 CT, previous trading day)
+# - Swing selectivity (k), ES→SPX offset
+# - Skyline/Baseline projections for 08:30–14:30 CT
+# - Append-only upgrade: swaps router entry to new Skyline page
+# ======================================================================
+
+from datetime import date, time, timedelta
+
+# -----------------------------
+# Helpers: trading days & time grids
+# -----------------------------
+RTH_START = time(8, 30)   # 08:30 CT
+RTH_END   = time(14, 30)  # 14:30 CT
+
+def is_weekend(dt_ct: datetime) -> bool:
+    return dt_ct.weekday() >= 5
+
+def previous_weekday(d: date) -> date:
+    # Go back to the most recent weekday (Mon–Fri)
+    while d.weekday() >= 5:
+        d = d - timedelta(days=1)
+    return d
+
+def next_weekday(d: date) -> date:
+    # Advance to next weekday (Mon–Fri)
+    while d.weekday() >= 5:
+        d = d + timedelta(days=1)
+    return d
+
+def prev_trading_day_base(today_ct: datetime) -> date:
+    # "Previous trading day" ≈ previous weekday; refine later if you add holiday calendar
+    d = (today_ct - timedelta(days=1)).date()
+    return previous_weekday(d)
+
+def projection_day_default(now_ct_val: datetime) -> date:
+    # If weekend, push to next weekday; else keep today
+    d = now_ct_val.date()
+    return d if d.weekday() < 5 else next_weekday(d)
+
+def generate_rth_times_ct(day: date):
+    # Generate 30-minute grid from 08:30 to 14:30 inclusive in CT
+    slots = []
+    t = datetime.combine(day, RTH_START, tzinfo=CT)
+    end_dt = datetime.combine(day, RTH_END, tzinfo=CT)
+    while t <= end_dt:
+        slots.append(t)
+        t += timedelta(minutes=30)
+    return slots
+
+def floor_to_30min(dt_ct: datetime) -> datetime:
+    return dt_ct.replace(minute=(dt_ct.minute // 30) * 30, second=0, microsecond=0)
+
+# -----------------------------
+# Data fetchers (yfinance)
+# -----------------------------
+def _yf_download(symbol: str, start_dt_utc: datetime, end_dt_utc: datetime, interval: str = "30m") -> pd.DataFrame:
+    if not HAS_YF:
+        return pd.DataFrame()
+    df = yf.download(
+        symbol,
+        interval=interval,
+        start=start_dt_utc.replace(tzinfo=None),
+        end=end_dt_utc.replace(tzinfo=None),
+        progress=False,
+        auto_adjust=True,
+        prepost=False,
+        threads=True,
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+    # Ensure DatetimeIndex -> UTC
+    df.index = pd.to_datetime(df.index)
+    df = ensure_dtindex_utc(df)
+    return df
+
+def fetch_es_30m_for_prev_day_window(prev_day: date) -> pd.DataFrame:
+    """
+    Fetch ES futures (ES=F) for the previous trading day's Asian window 17:00–19:30 CT.
+    We pull a 2-day buffer and then filter in CT.
+    """
+    # Pull from prev_day 00:00 CT to (prev_day+1) 23:59 CT to be safe
+    start_ct = datetime.combine(prev_day, time(0, 0), tzinfo=CT)
+    end_ct   = datetime.combine(prev_day + timedelta(days=1), time(23, 59), tzinfo=CT)
+
+    start_utc = to_utc(start_ct)
+    end_utc   = to_utc(end_ct)
+
+    df = _yf_download("ES=F", start_utc, end_utc, interval="30m")
+    if df.empty:
+        return df
+
+    # Convert to CT for time filtering
+    df_ct = df.tz_convert(CT)
+
+    # Filter the 17:00–19:30 window on prev_day
+    win_start = datetime.combine(prev_day, time(17, 0), tzinfo=CT)
+    win_end   = datetime.combine(prev_day, time(19, 30), tzinfo=CT)
+    df_ct = df_ct.loc[(df_ct.index >= win_start) & (df_ct.index <= win_end)].copy()
+
+    # Keep essentials
+    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df_ct.columns]
+    return df_ct[cols]
+
+# -----------------------------
+# Anchor selection (swing highs/lows by CLOSE)
+# -----------------------------
+def kth_extreme_by_close(df_ct: pd.DataFrame, k: int = 1):
+    """
+    Return (kth_high_close_price, timestamp), (kth_low_close_price, timestamp) within df.
+    k=1 -> highest/lowest, k=2 -> second highest/lowest, etc.
+    """
+    if df_ct.empty or "Close" not in df_ct.columns:
+        return (None, None), (None, None)
+
+    # Sort by Close desc for highs; asc for lows
+    highs = df_ct.sort_values("Close", ascending=False).iloc[:k]
+    lows  = df_ct.sort_values("Close", ascending=True).iloc[:k]
+
+    if len(highs) < k or len(lows) < k:
+        return (None, None), (None, None)
+
+    kth_high_row = highs.iloc[-1]
+    kth_low_row  = lows.iloc[-1]
+
+    kth_high_price = float(kth_high_row["Close"])
+    kth_high_time  = highs.index[-1]
+
+    kth_low_price = float(kth_low_row["Close"])
+    kth_low_time  = lows.index[-1]
+
+    return (kth_high_price, kth_high_time), (kth_low_price, kth_low_time)
+
+# -----------------------------
+# Projection builder
+# -----------------------------
+def build_projection_table(anchor_price: float, anchor_time_ct: datetime, slope_per_block: float, slots_ct: list[datetime]) -> pd.DataFrame:
+    """
+    Slope units = price change per 30-min block.
+    Price(t) = anchor_price + slope * blocks_since_anchor
+    blocks_since_anchor = floor((t - anchor_time) / 30min)
+    """
+    rows = []
+    for t in slots_ct:
+        # compute 30-min blocks since anchor (can be negative if anchor after slot)
+        delta_minutes = (t - anchor_time_ct).total_seconds() / 60.0
+        blocks = int(np.floor(delta_minutes / 30.0))
+        price = anchor_price + slope_per_block * blocks
+        rows.append({"Time_CT": t.strftime("%Y-%m-%d %H:%M"), "Price": round(price, 4)})
+    df = pd.DataFrame(rows)
+    return df
+
+# -----------------------------
+# UI: SPX Skyline upgraded page
+# -----------------------------
+def page_spx_skyline_v2():
+    st.markdown("### SPX Skyline")
+
+    # Controls
+    colA, colB, colC, colD = st.columns([1.2, 1, 1, 1.2])
+    with colA:
+        prev_day_default = prev_trading_day_base(now_ct())
+        prev_day_input = st.date_input(
+            "Previous trading day (for ES window)",
+            value=prev_day_default,
+            help="We use ES=F 30m candles in the 17:00–19:30 CT window of this day."
+        )
+    with colB:
+        k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0, help="k=1 highest/lowest close; k=2 second; k=3 third")
+    with colC:
+        es_to_spx_offset = st.number_input(
+            "ES→SPX offset",
+            value=0.0,
+            step=0.5,
+            help="Manual adjustment to convert ES close to an SPX anchor (points)."
+        )
+    with colD:
+        projection_day = st.date_input(
+            "Projection day",
+            value=projection_day_default(now_ct()),
+            help="Projections are generated for 08:30–14:30 CT of this day."
+        )
+
+    # Fetch ES window
+    df_es_win = fetch_es_30m_for_prev_day_window(prev_day_input)
+    if df_es_win.empty:
+        st.error("No ES data returned for the selected previous day. Try another date or check your connection.")
+        return
+
+    # Compute kth extremes by CLOSE
+    (hi_price, hi_time), (lo_price, lo_time) = kth_extreme_by_close(df_es_win, k=k)
+
+    if hi_price is None or lo_price is None:
+        st.error("Could not compute kth extremes from ES window.")
+        return
+
+    # Convert ES anchors to SPX anchors via offset; keep CT times
+    hi_price_adj = hi_price + es_to_spx_offset
+    lo_price_adj = lo_price + es_to_spx_offset
+    hi_time_ct = hi_time if getattr(hi_time, "tzinfo", None) else CT.localize(hi_time)
+    lo_time_ct = lo_time if getattr(lo_time, "tzinfo", None) else CT.localize(lo_time)
+
+    # Build projection slots (RTH of projection_day)
+    slots_ct = generate_rth_times_ct(projection_day)
+
+    # Use your hidden slopes from session_state
+    spx_skyline_slope = st.session_state["spx_slopes"]["skyline"]
+    spx_baseline_slope = st.session_state["spx_slopes"]["baseline"]
+
+    # Projections:
+    # Convention:
+    # - Skyline: project from kth HIGH close
+    # - Baseline: project from kth LOW close
+    sky_df = build_projection_table(hi_price_adj, hi_time_ct, spx_skyline_slope, slots_ct)
+    base_df = build_projection_table(lo_price_adj, lo_time_ct, spx_baseline_slope, slots_ct)
+
+    # Store in session for later tabs
+    st.session_state["spx_anchors"] = {
+        "previous_day": prev_day_input,
+        "projection_day": projection_day,
+        "skyline": {"price": hi_price_adj, "time": hi_time_ct},
+        "baseline": {"price": lo_price_adj, "time": lo_time_ct},
+        "k": k,
+        "offset": es_to_spx_offset,
+    }
+
+    # Display
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Skyline anchor** (k-th high close)")
+        st.caption(f"Time: {hi_time_ct.strftime('%Y-%m-%d %H:%M CT')} • Price (ES+offset): {hi_price_adj:.4f} • k={k}")
+        st.dataframe(sky_df, hide_index=True, use_container_width=True)
+        st.download_button(
+            "📥 Download Skyline CSV",
+            data=sky_df.to_csv(index=False),
+            file_name=f"SPX_Skyline_{projection_day}.csv",
+            mime="text/csv",
+            key="dl_skyline_csv_p2",
+        )
+    with c2:
+        st.markdown("**Baseline anchor** (k-th low close)")
+        st.caption(f"Time: {lo_time_ct.strftime('%Y-%m-%d %H:%M CT')} • Price (ES+offset): {lo_price_adj:.4f} • k={k}")
+        st.dataframe(base_df, hide_index=True, use_container_width=True)
+        st.download_button(
+            "📥 Download Baseline CSV",
+            data=base_df.to_csv(index=False),
+            file_name=f"SPX_Baseline_{projection_day}.csv",
+            mime="text/csv",
+            key="dl_baseline_csv_p2",
+        )
+
+    with st.expander("ES 30m window (prev day 17:00–19:30 CT)", expanded=False):
+        # show the raw ES window used for anchors (converted to CT for readability)
+        df_show = df_es_win.copy()
+        df_show.index = df_show.index.tz_convert(CT)
+        st.dataframe(df_show, use_container_width=True)
+
+    st.success("SPX Skyline/Baseline projections generated.")
+
+# Upgrade router to new Skyline page without touching earlier code
+PAGES["SPX • Skyline"] = page_spx_skyline_v2
+
