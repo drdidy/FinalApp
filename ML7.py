@@ -386,43 +386,59 @@ with col3:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def calculate_entry_exit_table(projection_df: pd.DataFrame, anchor_type: str) -> pd.DataFrame:
-    """Calculate entry/exit probabilities and targets for each time slot"""
+    """Calculate entry/exit probabilities and targets based on anchor bounce strategy"""
     if projection_df.empty:
         return pd.DataFrame()
     
     analysis_rows = []
     
+    # Determine if this is skyline or baseline for TP calculations
+    is_skyline = anchor_type.upper() in ['SKYLINE', 'HIGH']
+    
     for idx, row in projection_df.iterrows():
         time_slot = row['Time']
-        price = row['Price']
+        anchor_price = row['Price']
         
-        # Calculate dynamic stops based on recent range
-        stop_distance = price * 0.008  # 0.8% dynamic stop
-        
-        # TP1 and TP2 calculations
-        tp1_distance = stop_distance * 1.5  # 1.5R
-        tp2_distance = stop_distance * 2.5  # 2.5R
-        
-        # Direction bias based on anchor type
-        is_bullish_bias = anchor_type in ['SKYLINE', 'HIGH'] and st.session_state.spx_slopes.get(anchor_type.lower(), 0) > 0
-        
-        if is_bullish_bias:
-            entry_price = price
-            stop_price = price - stop_distance
-            tp1_price = price + tp1_distance
-            tp2_price = price + tp2_distance
-            direction = "LONG"
+        # TP1: 30-40% move toward opposite anchor
+        # TP2: 70-80% move toward opposite anchor  
+        if is_skyline:
+            # From skyline, expect move toward baseline
+            estimated_baseline = anchor_price - (anchor_price * 0.02)  # Estimate baseline 2% below
+            tp1_distance = abs(anchor_price - estimated_baseline) * 0.35
+            tp2_distance = abs(anchor_price - estimated_baseline) * 0.75
+            
+            # For skyline touches - expect BUY after bearish touch closes above
+            entry_price = anchor_price
+            tp1_price = anchor_price - tp1_distance
+            tp2_price = anchor_price - tp2_distance
+            direction = "BUY"
+            
         else:
-            entry_price = price  
-            stop_price = price + stop_distance
-            tp1_price = price - tp1_distance
-            tp2_price = price - tp2_distance
-            direction = "SHORT"
+            # From baseline, expect move toward skyline
+            estimated_skyline = anchor_price + (anchor_price * 0.02)  # Estimate skyline 2% above
+            tp1_distance = abs(estimated_skyline - anchor_price) * 0.35
+            tp2_distance = abs(estimated_skyline - anchor_price) * 0.75
+            
+            # For baseline touches - expect BUY after bearish touch closes above
+            entry_price = anchor_price
+            tp1_price = anchor_price + tp1_distance
+            tp2_price = anchor_price + tp2_distance
+            direction = "BUY"
         
-        # Calculate probabilities based on anchor line interaction
-        entry_prob = calculate_entry_probability(price, anchor_type)
-        tp1_prob = calculate_target_probability(tp1_distance, stop_distance, 1)
-        tp2_prob = calculate_target_probability(tp2_distance, stop_distance, 2)
+        # Dynamic stop with retest buffer
+        volatility_buffer = anchor_price * 0.005  # 0.5% buffer for retests
+        
+        if is_skyline:
+            stop_price = anchor_price + volatility_buffer  # Stop above skyline
+        else:
+            stop_price = max(0.01, anchor_price - volatility_buffer)  # Stop below baseline
+            
+        stop_distance = abs(entry_price - stop_price)
+        
+        # Calculate probabilities based on anchor strength
+        entry_prob = calculate_anchor_entry_probability(anchor_type)
+        tp1_prob = calculate_anchor_target_probability(1)
+        tp2_prob = calculate_anchor_target_probability(2)
         
         analysis_rows.append({
             'Time': time_slot,
@@ -432,38 +448,27 @@ def calculate_entry_exit_table(projection_df: pd.DataFrame, anchor_type: str) ->
             'TP1': round(tp1_price, 2),
             'TP2': round(tp2_price, 2),
             'Risk': round(stop_distance, 2),
-            'Entry_Prob': f"{entry_prob:.1f}%",
-            'TP1_Prob': f"{tp1_prob:.1f}%", 
-            'TP2_Prob': f"{tp2_prob:.1f}%"
+            'Entry_Prob': f"{entry_prob:.0f}%",
+            'TP1_Prob': f"{tp1_prob:.0f}%", 
+            'TP2_Prob': f"{tp2_prob:.0f}%",
+            'Pattern': f"{anchor_type} Touch"
         })
     
     return pd.DataFrame(analysis_rows)
 
-def calculate_entry_probability(price: float, anchor_type: str) -> float:
-    """Calculate entry probability based on anchor line strength"""
-    # Base probability varies by anchor type
-    base_probs = {
-        'HIGH': 65, 'CLOSE': 70, 'LOW': 65,
-        'SKYLINE': 75, 'BASELINE': 80
-    }
-    
-    base_prob = base_probs.get(anchor_type, 65)
-    
-    # Adjust for time of day (market open has higher volatility)
-    # This is a simplified model - you can enhance based on your experience
-    return min(95, max(45, base_prob))
+def calculate_anchor_entry_probability(anchor_type: str) -> float:
+    """Calculate entry probability based on anchor type - skyline/baseline have 90%+ edge"""
+    if anchor_type.upper() in ['SKYLINE', 'BASELINE']:
+        return 90.0  # Your stated 90% probability for main anchors
+    else:
+        return 75.0  # High/Close/Low anchors slightly lower
 
-def calculate_target_probability(target_distance: float, stop_distance: float, target_num: int) -> float:
-    """Calculate probability of reaching target based on risk-reward ratio"""
-    rr_ratio = target_distance / stop_distance
-    
-    # Probability decreases with higher R targets
-    if target_num == 1:  # TP1
-        base_prob = 70 - (rr_ratio - 1.5) * 10
-    else:  # TP2
-        base_prob = 45 - (rr_ratio - 2.5) * 8
-    
-    return min(85, max(25, base_prob))
+def calculate_anchor_target_probability(target_num: int) -> float:
+    """Calculate target probability based on your anchor strategy"""
+    if target_num == 1:  # TP1 - partial move
+        return 85.0
+    else:  # TP2 - full move to opposite anchor
+        return 65.0
 
 # Create main tabs
 tab1, tab2, tab3, tab4 = st.tabs(["📈 SPX Anchors", "📚 Stock Anchors", "✅ Signals & EMA", "🧮 Contract Tool"])
