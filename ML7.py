@@ -1838,16 +1838,12 @@ PAGES["Stocks • Skyline"]  = page_stocks_skyline_v2
 
 
 # ============================================================
-# MarketLens Pro v5 — FINAL PART
-# Boot the single-file app (call render_app() exactly once)
+# MarketLens Pro v5 — FINAL BOOT (call render_app exactly once)
 # ============================================================
-
-try:
-    # Ensure the renderer exists (defined in Part 1)
-    render_app  # type: ignore
-except NameError:
-    st.error("render_app() not found. Make sure Parts 1–6 are pasted above this block.")
-else:
+if "render_app" in globals():
     if not st.session_state.get("__MLP_BOOTED__", False):
         st.session_state["__MLP_BOOTED__"] = True
-        render_app()
+    render_app()
+else:
+    import streamlit as st  # safety in case top imports failed
+    st.error("render_app() not found. Make sure Parts 1–6 are pasted above this block.")
