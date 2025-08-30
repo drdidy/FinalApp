@@ -399,26 +399,27 @@ st.session_state.theme = theme
 
 st.sidebar.markdown("---")
 
-# SPX slope controls with colorful headers
-st.sidebar.markdown("### 📈 SPX Slopes (per 30-min)")
-st.sidebar.caption("🎯 Adjust projection slopes for each anchor type")
+# SPX slope controls
+st.sidebar.markdown("### SPX Slopes (per 30-min)")
+st.sidebar.caption("Adjust projection slopes for each anchor type")
 
-for slope_name, default_value in SPX_SLOPES.items():
-    icon_map = {
-        'high': '🔴', 'close': '🟡', 'low': '🟢', 
-        'skyline': '🔥', 'baseline': '🏔️'
-    }
-    
-    icon = icon_map.get(slope_name, '📊')
-    display_name = slope_name.title()
-    
-    slope_value = st.sidebar.number_input(
-        f"{icon} {display_name}",
-        value=st.session_state.spx_slopes[slope_name],
-        step=0.0001, format="%.4f",
-        key=f"sb_spx_{slope_name}"
-    )
-    st.session_state.spx_slopes[slope_name] = slope_value
+# Collapsible SPX controls
+with st.sidebar.expander("SPX Slope Settings", expanded=False):
+    for slope_name, default_value in SPX_SLOPES.items():
+        icon_map = {
+            'high': 'High', 'close': 'Close', 'low': 'Low', 
+            'skyline': 'Skyline', 'baseline': 'Baseline'
+        }
+        
+        display_name = icon_map.get(slope_name, slope_name.title())
+        
+        slope_value = st.number_input(
+            display_name,
+            value=st.session_state.spx_slopes[slope_name],
+            step=0.0001, format="%.4f",
+            key=f"sb_spx_{slope_name}"
+        )
+        st.session_state.spx_slopes[slope_name] = slope_value
 
 st.sidebar.markdown("---")
 
@@ -527,7 +528,6 @@ st.markdown("---")
 # ═══════════════════════════════════════════════════════════════════════════════
 # ✅ PART 1 COMPLETE - FOUNDATION
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 
 
@@ -733,7 +733,7 @@ def update_offset_for_date():
     if st.button("Generate SPX Anchors", key="spx_generate", type="primary"):
         with st.spinner("Analyzing market data..."):
             try:
-                # Auto-update offset for the specific historical date
+                # Get offset for the specific historical date
                 es_data_for_offset = fetch_live_data("ES=F", prev_day, prev_day)
                 spx_data_for_offset = fetch_live_data("^GSPC", prev_day, prev_day)
                 
