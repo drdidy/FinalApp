@@ -338,6 +338,22 @@ st.session_state.spx_slopes['baseline'] = baseline_slope
 
 st.sidebar.caption("Stock slopes use ± magnitudes")
 
+st.sidebar.markdown("---")
+
+# Stock slope controls
+st.sidebar.subheader("Stock Slopes (magnitude)")
+if 'stock_slopes' not in st.session_state:
+    st.session_state.stock_slopes = STOCK_SLOPES.copy()
+
+# Display core stock slopes
+for ticker, default_slope in STOCK_SLOPES.items():
+    current_slope = st.sidebar.number_input(
+        f"{ticker}", 
+        value=st.session_state.stock_slopes.get(ticker, default_slope),
+        step=0.0001, format="%.4f", key=f"sb_stk_{ticker}"
+    )
+    st.session_state.stock_slopes[ticker] = current_slope
+
 # ============================================================================
 # MAIN APP HEADER
 # ============================================================================
