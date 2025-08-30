@@ -565,12 +565,14 @@ def calculate_entry_exit_table(projection_df: pd.DataFrame, anchor_type: str) ->
         time_slot = row['Time']
         anchor_price = row['Price']
         
-        # Calculate targets based on anchor type
+        # Calculate targets based on realistic daily range
+        # Estimate daily range: SPX typically moves 30-60 points intraday
+        estimated_daily_range = anchor_price * 0.008  # Approximately 50 points at 6400 level
+        
         if is_skyline:
-            # Skyline bounce strategy
-            volatility_factor = anchor_price * 0.012
-            tp1_distance = volatility_factor * 0.8
-            tp2_distance = volatility_factor * 2.2
+            # TP1: 30% of daily range, TP2: 50% of daily range
+            tp1_distance = estimated_daily_range * 0.30
+            tp2_distance = estimated_daily_range * 0.50
             
             entry_price = anchor_price
             tp1_price = anchor_price + tp1_distance  # Bounce up from skyline
@@ -581,10 +583,9 @@ def calculate_entry_exit_table(projection_df: pd.DataFrame, anchor_type: str) ->
             stop_price = anchor_price + (anchor_price * 0.006)
             
         elif is_baseline:
-            # Baseline bounce strategy
-            volatility_factor = anchor_price * 0.012
-            tp1_distance = volatility_factor * 0.8
-            tp2_distance = volatility_factor * 2.2
+            # TP1: 30% of daily range, TP2: 50% of daily range
+            tp1_distance = estimated_daily_range * 0.30
+            tp2_distance = estimated_daily_range * 0.50
             
             entry_price = anchor_price
             tp1_price = anchor_price + tp1_distance  # Bounce up from baseline
@@ -595,10 +596,9 @@ def calculate_entry_exit_table(projection_df: pd.DataFrame, anchor_type: str) ->
             stop_price = max(0.01, anchor_price - (anchor_price * 0.006))
             
         else:
-            # High/Close/Low anchors 
-            volatility_factor = anchor_price * 0.010
-            tp1_distance = volatility_factor * 0.7
-            tp2_distance = volatility_factor * 1.8
+            # High/Close/Low anchors with same realistic targets
+            tp1_distance = estimated_daily_range * 0.30
+            tp2_distance = estimated_daily_range * 0.50
             
             if anchor_type.upper() == 'HIGH':
                 entry_price = anchor_price
@@ -946,7 +946,6 @@ with tab1:
 # ═══════════════════════════════════════════════════════════════════════════════
 # END OF SPX ANCHORS TAB
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
