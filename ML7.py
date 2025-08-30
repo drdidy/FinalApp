@@ -1153,7 +1153,7 @@ with tab3:
         vwap = calculate_vwap(signal_data)
         
         # Create analysis tabs
-        signal_tabs = st.tabs(["Reference Line", "BUY Signals", "SELL Signals", "EMA Analysis"])
+        signal_tabs = st.tabs(["Reference Line", "Skyline Patterns", "Baseline Patterns", "EMA Analysis"])
         
         with signal_tabs[0]:  # Reference Line
             st.write("Reference Line Projection")
@@ -1164,21 +1164,21 @@ with tab3:
             st.write("Anchor Line Statistics")
             st.dataframe(line_stats, use_container_width=True)
         
-        with signal_tabs[1]:  # BUY Signals
-            buy_signals = detect_entry_signals(signal_data, ref_line_proj, "BUY")
-            if not buy_signals.empty:
-                st.write("BUY Signal Opportunities")
-                st.dataframe(buy_signals, use_container_width=True)
+        with signal_tabs[1]:  # Skyline Signals
+            skyline_signals = detect_entry_signals(signal_data, ref_line_proj, "SKYLINE")
+            if not skyline_signals.empty:
+                st.write("Skyline Touch Patterns")
+                st.dataframe(skyline_signals, use_container_width=True)
             else:
-                st.info("No BUY signals detected for this day")
+                st.info("No skyline touch patterns detected")
         
-        with signal_tabs[2]:  # SELL Signals
-            sell_signals = detect_entry_signals(signal_data, ref_line_proj, "SELL")
-            if not sell_signals.empty:
-                st.write("SELL Signal Opportunities")
-                st.dataframe(sell_signals, use_container_width=True)
+        with signal_tabs[2]:  # Baseline Signals
+            baseline_signals = detect_entry_signals(signal_data, ref_line_proj, "BASELINE")
+            if not baseline_signals.empty:
+                st.write("Baseline Touch Patterns")
+                st.dataframe(baseline_signals, use_container_width=True)
             else:
-                st.info("No SELL signals detected for this day")
+                st.info("No baseline touch patterns detected")
         
         with signal_tabs[3]:  # EMA Analysis
             ema_analysis = calculate_ema_crossover_analysis(signal_data, ema8, ema21)
@@ -1195,7 +1195,7 @@ with tab3:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def detect_entry_signals(price_data: pd.DataFrame, ref_line: pd.DataFrame, signal_type: str) -> pd.DataFrame:
-    """Detect BUY/SELL signals based on anchor line interaction rules"""
+    """Detect BUY/SELL signals based on your specific anchor touch strategy"""
     if price_data.empty or ref_line.empty:
         return pd.DataFrame()
     
@@ -1212,55 +1212,160 @@ def detect_entry_signals(price_data: pd.DataFrame, ref_line: pd.DataFrame, signa
         if bar_time not in ref_dict:
             continue
             
-        ref_price = ref_dict[bar_time]
-        close_price = bar['Close']
+        anchor_price = ref_dict[bar_time]
         open_price = bar['Open']
+        high_price = bar['High']
+        low_price = bar['Low']
+        close_price = bar['Close']
         
-        # Determine if candle is bullish or bearish
-        is_bullish_candle = close_price > open_price
-        is_bearish_candle = close_price < open_price
+        # Determine candle type
+        is_bearish = close_price < open_price  # Red candle
+        is_bullish = close_price > open_price  # Green candle
         
-        # Check for line touches (within 0.1% tolerance)
-        tolerance = ref_price * 0.001
-        high_touches = abs(bar['High'] - ref_price) <= tolerance
-        low_touches = abs(bar['Low'] - ref_price) <= tolerance
+        # Check for anchor touches (within small tolerance)
+        tolerance = anchor_price * 0.001  # 0.1% tolerance
+        touches_anchor = (low_price <= anchor_price + tolerance and 
+                         high_price >= anchor_price - tolerance)
         
+        if not touches_anchor:
+            continue
+            
         signal_detected = False
         signal_reason = ""
+        entry_direction = ""
         
-        if signal_type == "BUY":
-            # BUY: Bearish candle touches from above AND closes above line
-            if (is_bearish_candle and 
-                (high_touches or bar['High'] > ref_price) and 
-                close_price > ref_price):
+        # Your specific strategy patterns
+        if signal_type == "SKYLINE":
+            # Red candle touches skyline from above (low touches) and closes above
+            if (is_bearish and low_price <= anchor_price + tolerance and 
+                close_price > anchor_price):
                 signal_detected = True
-                signal_reason = "Bearish candle touched from above, closed above line"
+                signal_reason = "Bearish candle touched skyline from above, closed above - BUY signal"
+                entry_direction = "BUY"
+            
+            # Red candle touches skyline from above and closes below  
+            elif (is_bearish and low_price <= anchor_price + tolerance and 
+                  close_price < anchor_price):
+                signal_detected = True
+                signal_reason = "Bearish candle touched skyline, closed below - SELL signal"
+                entry_direction = "SELL"
+            
+            # Green candle touches skyline from above - expect drop to baseline
+            elif (is_bullish and low_price <= anchor_price + tolerance):
+                signal_detected = True
+                signal_reason = "Bullish candle touched skyline - expect drop to baseline"
+                entry_direction = "SELL"
         
-        elif signal_type == "SELL":
-            # SELL: Bullish candle touches from below AND closes below line
-            if (is_bullish_candle and 
-                (low_touches or bar['Low'] < ref_price) and 
-                close_price < ref_price):
+        elif signal_type == "BASELINE":
+            # Red candle touches baseline from above and closes above
+            if (is_bearish and low_price <= anchor_price + tolerance and 
+                close_price > anchor_price):
                 signal_detected = True
-                signal_reason = "Bullish candle touched from below, closed below line"
+                signal_reason = "Bearish candle touched baseline from above, closed above - BUY signal"
+                entry_direction = "BUY"
+            
+            # Red candle touches baseline from above and closes below
+            elif (is_bearish and low_price <= anchor_price + tolerance and 
+                  close_price < anchor_price):
+                signal_detected = True
+                signal_reason = "Bearish candle touched baseline, closed below - SELL signal" 
+                entry_direction = "SELL"
+            
+            # Green candle touches baseline from below and closes below
+            elif (is_bullish and high_price >= anchor_price - tolerance and 
+                  close_price < anchor_price):
+                signal_detected = True
+                signal_reason = "Bullish candle touched baseline from below, closed below - SELL signal"
+                entry_direction = "SELL"
+            
+            # Green candle touches baseline from below and closes above  
+            elif (is_bullish and high_price >= anchor_price - tolerance and 
+                  close_price > anchor_price):
+                signal_detected = True
+                signal_reason = "Bullish candle touched baseline from below, closed above - BUY signal"
+                entry_direction = "BUY"
+            
+            # Red candle touches baseline from below - expect rise to skyline
+            elif (is_bearish and high_price >= anchor_price - tolerance):
+                signal_detected = True
+                signal_reason = "Bearish candle touched baseline from below - expect rise to skyline"
+                entry_direction = "BUY"
         
         if signal_detected:
-            # Calculate signal quality metrics
-            touch_quality = calculate_touch_quality(bar, ref_price)
-            volume_quality = calculate_volume_quality(bar, price_data)
+            # Calculate signal strength based on clean touch
+            touch_precision = calculate_touch_precision(bar, anchor_price)
+            volume_confirmation = calculate_volume_confirmation(bar, price_data)
+            
+            # Entry at close of touching candle
+            entry_price = close_price
             
             signals.append({
                 'Time': bar_time,
-                'Signal': signal_type,
-                'Entry_Price': close_price,
-                'Ref_Price': round(ref_price, 2),
-                'Touch_Quality': f"{touch_quality:.1f}%",
-                'Volume_Quality': f"{volume_quality:.1f}%",
+                'Signal_Type': signal_type,
+                'Direction': entry_direction,
+                'Entry_Price': entry_price,
+                'Anchor_Price': round(anchor_price, 2),
+                'Candle_Type': 'Bearish' if is_bearish else 'Bullish',
+                'Touch_Precision': f"{touch_precision:.1f}%",
+                'Volume_Conf': f"{volume_confirmation:.1f}%",
                 'Reason': signal_reason,
-                'Probability': f"{calculate_signal_probability(touch_quality, volume_quality):.1f}%"
+                'Probability': f"{calculate_pattern_probability(touch_precision, volume_confirmation, signal_type):.0f}%"
             })
     
     return pd.DataFrame(signals)
+
+def calculate_touch_precision(bar: pd.Series, anchor_price: float) -> float:
+    """Calculate how precisely the candle touched the anchor"""
+    # For skyline touches from above - check how close low got to anchor
+    # For baseline touches from below - check how close high got to anchor
+    
+    low_distance = abs(bar['Low'] - anchor_price) / anchor_price
+    high_distance = abs(bar['High'] - anchor_price) / anchor_price
+    
+    # Use the closer touch
+    closest_distance = min(low_distance, high_distance)
+    
+    # Convert to precision score (closer = higher score)
+    precision = max(0, 100 - (closest_distance * 1000))  # Scale appropriately
+    return min(100, precision)
+
+def calculate_volume_confirmation(bar: pd.Series, data: pd.DataFrame) -> float:
+    """Calculate volume confirmation for the touch"""
+    if 'Volume' not in data.columns:
+        return 70.0  # Default if no volume data
+    
+    recent_avg_volume = data['Volume'].tail(20).mean()
+    current_volume = bar['Volume']
+    
+    if recent_avg_volume == 0:
+        return 70.0
+    
+    volume_ratio = current_volume / recent_avg_volume
+    
+    # Higher volume on touches = better confirmation
+    if volume_ratio >= 1.5:
+        return 95.0
+    elif volume_ratio >= 1.2:
+        return 85.0
+    elif volume_ratio >= 0.8:
+        return 70.0
+    else:
+        return 50.0
+
+def calculate_pattern_probability(touch_precision: float, volume_conf: float, signal_type: str) -> float:
+    """Calculate probability based on your anchor strategy"""
+    # Base probability for skyline/baseline touches (your 90% edge)
+    if signal_type in ['SKYLINE', 'BASELINE']:
+        base_prob = 90.0
+    else:
+        base_prob = 75.0
+    
+    # Adjust based on touch quality
+    precision_bonus = (touch_precision - 50) * 0.2  # Bonus for precise touches
+    volume_bonus = (volume_conf - 50) * 0.1        # Bonus for volume confirmation
+    
+    final_prob = base_prob + precision_bonus + volume_bonus
+    return max(70, min(95, final_prob))  # Keep within reasonable bounds
 
 def calculate_touch_quality(bar: pd.Series, ref_price: float) -> float:
     """Calculate quality of anchor line touch"""
