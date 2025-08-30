@@ -417,6 +417,7 @@ with tab1:
             value=st.session_state.current_offset,
             step=0.1, format="%.1f", key="spx_offset_manual"
         )
+        st.session_state.current_offset = manual_offset
     
     with offset_col2:
         if st.button("🔄 Update Offset from Live Data", key="spx_update_offset"):
@@ -454,11 +455,23 @@ with tab1:
                     # Get last close for High/Close/Low anchors
                     spx_data = fetch_live_data("^GSPC", prev_day, prev_day)
                     if not spx_data.empty:
-                        last_close = spx_data.iloc[-1]
+                        last_bar = spx_data.iloc[-1]
                         st.session_state.spx_manual_anchors = {
-                            'high': (last_close['High'], last_close.name),
-                            'close': (last_close['Close'], last_close.name), 
-                            'low': (last_close['Low'], last_close.name)
+                            'high': (last_bar['High'], last_bar.name),
+                            'close': (last_bar['Close'], last_bar.name), 
+                            'low': (last_bar['Low'], last_bar.name)
+                        }
+                    else:
+                        # Use ES data if SPX not available
+                        last_es_bar = anchor_window.iloc[-1]
+                        spx_equivalent_high = last_es_bar['High'] + manual_offset
+                        spx_equivalent_close = last_es_bar['Close'] + manual_offset
+                        spx_equivalent_low = last_es_bar['Low'] + manual_offset
+                        
+                        st.session_state.spx_manual_anchors = {
+                            'high': (spx_equivalent_high, last_es_bar.name),
+                            'close': (spx_equivalent_close, last_es_bar.name),
+                            'low': (spx_equivalent_low, last_es_bar.name)
                         }
     
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -539,7 +552,7 @@ with tab1:
         with projection_tabs[3]:  # Skyline
             if skyline_anchor:
                 sky_price, sky_time = skyline_anchor
-                spx_sky_price = sky_price + manual_offset
+                spx_sky_price = sky_price + st.session_state.current_offset
                 sky_time_ct = sky_time.astimezone(CT_TZ)
                 
                 skyline_proj = project_anchor_line(
@@ -559,7 +572,7 @@ with tab1:
         with projection_tabs[4]:  # Baseline
             if baseline_anchor:
                 base_price, base_time = baseline_anchor
-                spx_base_price = base_price + manual_offset
+                spx_base_price = base_price + st.session_state.current_offset
                 base_time_ct = base_time.astimezone(CT_TZ)
                 
                 baseline_proj = project_anchor_line(
@@ -659,10 +672,6 @@ def calculate_target_probability(target_distance: float, stop_distance: float, t
         base_prob = 45 - (rr_ratio - 2.5) * 8
     
     return min(85, max(25, base_prob))
-
-
-
-
 
 
 
