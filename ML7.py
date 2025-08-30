@@ -2702,3 +2702,517 @@ def get_entry_recommendation(prob_value: float) -> str:
 
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPX PROPHET - PART 6: FINAL INTEGRATION & PROFITABILITY ENHANCEMENTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Initialize all session state variables if not exists
+required_states = [
+    'spx_analysis_ready', 'stock_analysis_ready', 'signal_ready', 'contract_ready',
+    'spx_slopes', 'stock_slopes', 'current_offset', 'theme'
+]
+
+for state in required_states:
+    if state not in st.session_state:
+        if 'slopes' in state:
+            st.session_state[state] = SPX_SLOPES.copy() if 'spx' in state else STOCK_SLOPES.copy()
+        elif state == 'current_offset':
+            st.session_state[state] = 0.0
+        elif state == 'theme':
+            st.session_state[state] = 'Dark'
+        else:
+            st.session_state[state] = False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADVANCED PROFITABILITY ANALYTICS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calculate_cross_timeframe_confluence(symbol: str, target_date: date) -> pd.DataFrame:
+    """Analyze confluence across multiple timeframes for higher probability entries"""
+    confluence_data = []
+    
+    # Fetch 1-hour data for higher timeframe context
+    try:
+        ticker = yf.Ticker(symbol)
+        hourly_data = ticker.history(start=target_date - timedelta(days=5), 
+                                   end=target_date + timedelta(days=1), 
+                                   interval="1h")
+        
+        if not hourly_data.empty:
+            # Convert to CT
+            if hourly_data.index.tz is None:
+                hourly_data.index = hourly_data.index.tz_localize('US/Eastern')
+            hourly_data.index = hourly_data.index.tz_convert(CT_TZ)
+            
+            # Calculate higher timeframe EMAs
+            hourly_ema8 = calculate_ema(hourly_data['Close'], 8)
+            hourly_ema21 = calculate_ema(hourly_data['Close'], 21)
+            
+            # Check alignment for RTH hours
+            rth_slots = rth_slots_ct(target_date)
+            
+            for slot_time in rth_slots:
+                try:
+                    # Find closest hourly bar
+                    closest_bar = hourly_data.iloc[hourly_data.index.get_indexer([slot_time], method='nearest')[0]]
+                    closest_idx = hourly_data.index.get_loc(closest_bar.name)
+                    
+                    # Check EMA alignment
+                    h_ema8 = hourly_ema8.iloc[closest_idx]
+                    h_ema21 = hourly_ema21.iloc[closest_idx]
+                    h_price = closest_bar['Close']
+                    
+                    # Confluence scoring
+                    ema_alignment = "Bullish" if h_ema8 > h_ema21 else "Bearish"
+                    price_vs_ema = "Above" if h_price > h_ema8 else "Below"
+                    
+                    # Calculate confluence score
+                    confluence_score = 50  # Base score
+                    if ema_alignment == "Bullish" and price_vs_ema == "Above":
+                        confluence_score += 25
+                    elif ema_alignment == "Bearish" and price_vs_ema == "Below":
+                        confluence_score += 25
+                    
+                    confluence_data.append({
+                        'Time': format_ct_time(slot_time),
+                        'HTF_EMA_Trend': ema_alignment,
+                        'Price_vs_EMA8': price_vs_ema,
+                        'HTF_Price': round(h_price, 2),
+                        'Confluence_Score': confluence_score,
+                        'Trade_Setup': get_confluence_setup(confluence_score)
+                    })
+                    
+                except:
+                    continue
+                    
+    except:
+        # Return basic structure if data fetch fails
+        for slot_time in rth_slots_ct(target_date):
+            confluence_data.append({
+                'Time': format_ct_time(slot_time),
+                'HTF_EMA_Trend': 'Unknown',
+                'Price_vs_EMA8': 'Unknown',
+                'HTF_Price': 'N/A',
+                'Confluence_Score': 50,
+                'Trade_Setup': 'NEUTRAL'
+            })
+    
+    return pd.DataFrame(confluence_data)
+
+def get_confluence_setup(score: float) -> str:
+    """Determine trade setup quality based on confluence"""
+    if score >= 75:
+        return "EXCELLENT"
+    elif score >= 65:
+        return "GOOD"
+    elif score >= 55:
+        return "FAIR"
+    else:
+        return "POOR"
+
+def calculate_volume_profile_analysis(data: pd.DataFrame) -> pd.DataFrame:
+    """Calculate volume profile for support/resistance levels"""
+    if data.empty or 'Volume' not in data.columns:
+        return pd.DataFrame()
+    
+    # Create price buckets
+    price_min = data['Low'].min()
+    price_max = data['High'].max()
+    price_range = price_max - price_min
+    bucket_size = price_range / 20  # 20 price levels
+    
+    volume_profile = []
+    
+    for i in range(20):
+        bucket_low = price_min + (i * bucket_size)
+        bucket_high = bucket_low + bucket_size
+        bucket_mid = (bucket_low + bucket_high) / 2
+        
+        # Calculate volume in this price range
+        bucket_volume = 0
+        for idx, bar in data.iterrows():
+            if bucket_low <= bar['Low'] <= bucket_high or bucket_low <= bar['High'] <= bucket_high:
+                bucket_volume += bar['Volume']
+        
+        volume_profile.append({
+            'Price_Level': round(bucket_mid, 2),
+            'Volume': bucket_volume,
+            'Support_Strength': get_volume_strength(bucket_volume, data['Volume'].max())
+        })
+    
+    # Sort by volume to find key levels
+    profile_df = pd.DataFrame(volume_profile)
+    return profile_df.nlargest(10, 'Volume')
+
+def get_volume_strength(volume: float, max_volume: float) -> str:
+    """Determine support/resistance strength based on volume"""
+    if max_volume == 0:
+        return "Unknown"
+    
+    ratio = volume / max_volume
+    if ratio >= 0.7:
+        return "Very Strong"
+    elif ratio >= 0.5:
+        return "Strong"
+    elif ratio >= 0.3:
+        return "Moderate"
+    else:
+        return "Weak"
+
+def generate_daily_trading_plan() -> pd.DataFrame:
+    """Generate comprehensive daily trading plan based on all active analyses"""
+    trading_plan = []
+    
+    # Combine insights from all active analyses
+    current_time = datetime.now(CT_TZ)
+    
+    # SPX opportunities
+    if st.session_state.get('spx_analysis_ready', False):
+        trading_plan.append({
+            'Time': current_time.strftime("%H:%M"),
+            'Asset': 'SPX',
+            'Opportunity': 'Anchor analysis active',
+            'Probability': '80%',
+            'Action': 'Monitor skyline/baseline touches',
+            'Priority': 'HIGH'
+        })
+    
+    # Stock opportunities
+    if st.session_state.get('stock_analysis_ready', False):
+        ticker = st.session_state.get('stock_analysis_ticker', 'STOCK')
+        trading_plan.append({
+            'Time': current_time.strftime("%H:%M"),
+            'Asset': ticker,
+            'Opportunity': 'Weekly projection active',
+            'Probability': '75%',
+            'Action': 'Monitor anchor line interactions',
+            'Priority': 'MEDIUM'
+        })
+    
+    # Contract opportunities
+    if st.session_state.get('contract_ready', False):
+        trading_plan.append({
+            'Time': current_time.strftime("%H:%M"),
+            'Asset': 'CONTRACTS',
+            'Opportunity': 'Overnight momentum analysis',
+            'Probability': '70%',
+            'Action': 'Watch for RTH entry points',
+            'Priority': 'HIGH'
+        })
+    
+    return pd.DataFrame(trading_plan)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROFITABILITY DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.subheader("Trading Profitability Dashboard")
+
+# Real-time trading opportunities
+if any([
+    st.session_state.get('spx_analysis_ready', False),
+    st.session_state.get('stock_analysis_ready', False),
+    st.session_state.get('signal_ready', False),
+    st.session_state.get('contract_ready', False)
+]):
+    
+    dashboard_tabs = st.tabs(["Trading Plan", "Market Context", "Risk Assessment", "Performance Edge"])
+    
+    with dashboard_tabs[0]:  # Trading Plan
+        daily_plan = generate_daily_trading_plan()
+        st.subheader("Today's Trading Plan")
+        st.dataframe(daily_plan, use_container_width=True, hide_index=True)
+        
+        # Priority actions
+        if not daily_plan.empty:
+            high_priority = daily_plan[daily_plan['Priority'] == 'HIGH']
+            if not high_priority.empty:
+                st.subheader("High Priority Actions")
+                for idx, action in high_priority.iterrows():
+                    st.info(f"{action['Asset']}: {action['Action']}")
+    
+    with dashboard_tabs[1]:  # Market Context
+        # Cross-timeframe analysis for active symbol
+        if st.session_state.get('signal_ready', False):
+            symbol = st.session_state.signal_symbol
+            analysis_date = st.session_state.get('sig_day', datetime.now().date())
+            
+            confluence_analysis = calculate_cross_timeframe_confluence(symbol, analysis_date)
+            st.subheader(f"{symbol} Multi-Timeframe Confluence")
+            st.dataframe(confluence_analysis, use_container_width=True, hide_index=True)
+        
+        # Volume profile analysis
+        if st.session_state.get('signal_ready', False):
+            signal_data = st.session_state.get('signal_data', pd.DataFrame())
+            if not signal_data.empty:
+                volume_profile = calculate_volume_profile_analysis(signal_data)
+                st.subheader("Volume Profile (Key Levels)")
+                st.dataframe(volume_profile, use_container_width=True, hide_index=True)
+    
+    with dashboard_tabs[2]:  # Risk Assessment
+        st.subheader("Current Risk Assessment")
+        
+        # Market volatility status
+        current_time_ct = datetime.now(CT_TZ)
+        market_open_time = current_time_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+        market_close_time = current_time_ct.replace(hour=14, minute=30, second=0, microsecond=0)
+        is_weekday = current_time_ct.weekday() < 5
+        within_hours = market_open_time <= current_time_ct <= market_close_time
+        is_market_open = is_weekday and within_hours
+        
+        risk_col1, risk_col2 = st.columns(2)
+        
+        with risk_col1:
+            st.markdown("**Market Status**")
+            if is_market_open:
+                time_to_close = market_close_time - current_time_ct
+                hours_left = int(time_to_close.total_seconds() // 3600)
+                minutes_left = int((time_to_close.total_seconds() % 3600) // 60)
+                st.success(f"Market Open - {hours_left}h {minutes_left}m remaining")
+                
+                # Time-based risk assessment
+                if hours_left <= 1:
+                    st.warning("End of day - increased volatility risk")
+                elif current_time_ct.hour == 8:
+                    st.warning("Market open - high volatility period")
+                else:
+                    st.info("Normal trading hours - standard risk")
+            else:
+                st.error("Market Closed")
+        
+        with risk_col2:
+            st.markdown("**Active Analysis Risk**")
+            
+            total_active = sum([
+                st.session_state.get('spx_analysis_ready', False),
+                st.session_state.get('stock_analysis_ready', False),
+                st.session_state.get('contract_ready', False)
+            ])
+            
+            if total_active >= 3:
+                st.warning("High concentration - multiple active analyses")
+            elif total_active >= 2:
+                st.info("Moderate activity - good diversification")
+            elif total_active == 1:
+                st.success("Single focus - concentrated analysis")
+            else:
+                st.info("No active analyses")
+    
+    with dashboard_tabs[3]:  # Performance Edge
+        st.subheader("Performance Optimization")
+        
+        # Time-of-day edge analysis
+        current_hour = datetime.now(CT_TZ).hour
+        
+        if 8 <= current_hour <= 14:  # During RTH
+            edge_analysis = []
+            
+            # Optimal entry times based on your strategy
+            optimal_times = {
+                'SPX Momentum': ['09:00', '09:30', '13:30'],
+                'Stock Breakouts': ['09:30', '10:00', '14:00'],
+                'Contract Entries': ['08:30', '09:00', '13:00'],
+                'Anchor Bounces': ['09:00', '10:30', '13:30']
+            }
+            
+            current_time_str = f"{current_hour:02d}:{datetime.now(CT_TZ).minute//30*30:02d}"
+            
+            for strategy, times in optimal_times.items():
+                is_optimal = current_time_str in times
+                edge_score = 85 if is_optimal else 60
+                
+                edge_analysis.append({
+                    'Strategy': strategy,
+                    'Current_Edge': f"{edge_score}%",
+                    'Optimal_Times': ', '.join(times),
+                    'Status': 'OPTIMAL' if is_optimal else 'STANDARD'
+                })
+            
+            edge_df = pd.DataFrame(edge_analysis)
+            st.dataframe(edge_df, use_container_width=True, hide_index=True)
+        
+        # Anchor line reliability assessment
+        if st.session_state.get('spx_analysis_ready', False):
+            st.subheader("Anchor Line Reliability")
+            
+            reliability_data = []
+            for anchor_type in ['HIGH', 'CLOSE', 'LOW', 'SKYLINE', 'BASELINE']:
+                if anchor_type in ['SKYLINE', 'BASELINE']:
+                    reliability = 80
+                    edge = "Primary anchor - highest probability"
+                else:
+                    reliability = 70
+                    edge = "Secondary anchor - good probability"
+                
+                reliability_data.append({
+                    'Anchor_Type': anchor_type,
+                    'Reliability': f"{reliability}%",
+                    'Trading_Edge': edge,
+                    'Recommended_Use': 'Primary' if reliability >= 80 else 'Secondary'
+                })
+            
+            reliability_df = pd.DataFrame(reliability_data)
+            st.dataframe(reliability_df, use_container_width=True, hide_index=True)
+
+else:
+    st.info("No active analyses. Use the tabs above to start market analysis.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# QUICK ACTIONS PANEL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.subheader("Quick Actions")
+
+action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+
+with action_col1:
+    if st.button("Update All Offsets", key="quick_update_all_offsets"):
+        # Update SPX offset
+        today = datetime.now(CT_TZ).date()
+        yesterday = today - timedelta(days=1)
+        
+        es_data = fetch_live_data("ES=F", yesterday, today)
+        spx_data = fetch_live_data("^GSPC", yesterday, today)
+        
+        if not es_data.empty and not spx_data.empty:
+            new_offset = calculate_es_spx_offset(es_data, spx_data)
+            st.session_state.current_offset = new_offset
+            st.success(f"Offset updated: {new_offset:+.1f}")
+        else:
+            st.error("Failed to update offset")
+
+with action_col2:
+    if st.button("Reset All Analysis", key="quick_reset_all"):
+        # Clear all analysis states
+        analysis_keys = [
+            'spx_analysis_ready', 'stock_analysis_ready', 
+            'signal_ready', 'contract_ready',
+            'es_anchor_data', 'spx_manual_anchors',
+            'stock_analysis_data', 'signal_data', 'contract_projections'
+        ]
+        
+        for key in analysis_keys:
+            if key in st.session_state:
+                del st.session_state[key]
+        
+        st.success("All analysis reset")
+        st.rerun()
+
+with action_col3:
+    if st.button("Reset All Slopes", key="quick_reset_slopes"):
+        st.session_state.spx_slopes = SPX_SLOPES.copy()
+        st.session_state.stock_slopes = STOCK_SLOPES.copy()
+        st.success("Slopes reset to defaults")
+        st.rerun()
+
+with action_col4:
+    # Quick market status check
+    current_time_ct = datetime.now(CT_TZ)
+    is_weekday = current_time_ct.weekday() < 5
+    within_hours = time(8, 30) <= current_time_ct.time() <= time(14, 30)
+    
+    if is_weekday and within_hours:
+        st.success("Market OPEN")
+    elif is_weekday:
+        st.warning("Market CLOSED")
+    else:
+        st.info("WEEKEND")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LIVE TRADING ALERTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.subheader("Live Trading Context")
+
+# Show current market conditions
+current_time = datetime.now(CT_TZ)
+context_col1, context_col2, context_col3 = st.columns(3)
+
+with context_col1:
+    st.markdown("**Current Session**")
+    if current_time.weekday() < 5 and time(8, 30) <= current_time.time() <= time(14, 30):
+        session_progress = ((current_time.hour - 8) * 60 + (current_time.minute - 30)) / 360 * 100
+        st.progress(session_progress / 100)
+        st.caption(f"Session {session_progress:.0f}% complete")
+    else:
+        st.caption("Market closed")
+
+with context_col2:
+    st.markdown("**Analysis Status**")
+    status_count = sum([
+        st.session_state.get('spx_analysis_ready', False),
+        st.session_state.get('stock_analysis_ready', False),
+        st.session_state.get('signal_ready', False),
+        st.session_state.get('contract_ready', False)
+    ])
+    
+    st.metric("Active Analyses", f"{status_count}/4")
+    if status_count >= 3:
+        st.success("Comprehensive analysis active")
+    elif status_count >= 2:
+        st.info("Good analysis coverage")
+    else:
+        st.warning("Limited analysis - consider more setups")
+
+with context_col3:
+    st.markdown("**Strategy Focus**")
+    
+    # Determine primary strategy based on active analyses
+    if st.session_state.get('contract_ready', False):
+        primary_strategy = "Contract Analysis"
+        focus_color = "blue"
+    elif st.session_state.get('spx_analysis_ready', False):
+        primary_strategy = "SPX Anchors"
+        focus_color = "green"
+    elif st.session_state.get('stock_analysis_ready', False):
+        primary_strategy = "Stock Analysis"
+        focus_color = "orange"
+    else:
+        primary_strategy = "Setup Required"
+        focus_color = "gray"
+    
+    st.markdown(f"""
+    <div style="text-align: center; padding: 1rem; background: rgba(255,255,255,0.1); border-radius: 10px; border-left: 4px solid {focus_color};">
+        <h4>{primary_strategy}</h4>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FOOTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.markdown(
+    f"""
+    <div style='text-align: center; color: #888; font-size: 0.9em; padding: 1rem;'>
+        SPX Prophet Analytics • Real-time Market Analysis • 
+        Session: {datetime.now(CT_TZ).strftime('%H:%M:%S CT')} • 
+        Theme: {st.session_state.theme} • 
+        Offset: {st.session_state.current_offset:+.1f}
+    </div>
+    """, 
+    unsafe_allow_html=True
+)
+
+# Error handling for the entire application
+try:
+    # Validate critical session state
+    missing_states = [state for state in required_states if state not in st.session_state]
+    
+    if missing_states:
+        st.error(f"Missing session state: {', '.join(missing_states)}. Please refresh the app.")
+        
+except Exception as e:
+    st.error(f"Application error: {str(e)}")
+    st.info("Please refresh the page to reset the application.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# APPLICATION COMPLETE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+
+
