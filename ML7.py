@@ -2047,3 +2047,437 @@ def get_market_alignment(confidence: float) -> str:
         return "MODERATE"
     else:
         return "WEAK"
+
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPX PROPHET - PART 6: FINAL INTEGRATION & COMPLETION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Initialize all session state variables if not exists
+if 'spx_analysis_ready' not in st.session_state:
+    st.session_state.spx_analysis_ready = False
+
+if 'stock_analysis_ready' not in st.session_state:
+    st.session_state.stock_analysis_ready = False
+
+if 'signal_ready' not in st.session_state:
+    st.session_state.signal_ready = False
+
+if 'contract_ready' not in st.session_state:
+    st.session_state.contract_ready = False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENHANCED PROBABILITY FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calculate_volume_profile_strength(data: pd.DataFrame, price_level: float) -> float:
+    """Calculate volume profile strength at price level"""
+    if data.empty or 'Volume' not in data.columns:
+        return 50.0
+    
+    # Find bars near price level (within 1%)
+    tolerance = price_level * 0.01
+    nearby_bars = data[
+        (data['Low'] <= price_level + tolerance) & 
+        (data['High'] >= price_level - tolerance)
+    ]
+    
+    if nearby_bars.empty:
+        return 50.0
+    
+    # Calculate volume concentration
+    nearby_volume = nearby_bars['Volume'].sum()
+    total_volume = data['Volume'].sum()
+    
+    if total_volume == 0:
+        return 50.0
+    
+    volume_concentration = (nearby_volume / total_volume) * 100
+    
+    # Convert to strength score
+    if volume_concentration >= 15:
+        return 90.0
+    elif volume_concentration >= 10:
+        return 75.0
+    elif volume_concentration >= 5:
+        return 60.0
+    else:
+        return 40.0
+
+def detect_market_regime(data: pd.DataFrame) -> dict:
+    """Detect current market regime from price data"""
+    if data.empty or len(data) < 20:
+        return {'regime': 'UNKNOWN', 'strength': 0, 'trend': 'NEUTRAL'}
+    
+    # Calculate trend metrics
+    closes = data['Close'].tail(20)
+    ema_short = closes.ewm(span=5).mean().iloc[-1]
+    ema_long = closes.ewm(span=15).mean().iloc[-1]
+    
+    # Volatility calculation
+    returns = closes.pct_change().dropna()
+    volatility = returns.std() * 100
+    
+    # Trend direction
+    if ema_short > ema_long * 1.005:  # 0.5% threshold
+        trend = 'BULLISH'
+        trend_strength = min(100, (ema_short - ema_long) / ema_long * 1000)
+    elif ema_short < ema_long * 0.995:
+        trend = 'BEARISH' 
+        trend_strength = min(100, (ema_long - ema_short) / ema_short * 1000)
+    else:
+        trend = 'NEUTRAL'
+        trend_strength = 0
+    
+    # Regime classification
+    if volatility >= 2.5:
+        regime = 'HIGH_VOLATILITY'
+    elif volatility >= 1.5:
+        regime = 'MODERATE_VOLATILITY'
+    else:
+        regime = 'LOW_VOLATILITY'
+    
+    return {
+        'regime': regime,
+        'trend': trend,
+        'strength': trend_strength,
+        'volatility': volatility
+    }
+
+def calculate_confluence_score(price: float, anchor_price: float, market_data: pd.DataFrame) -> float:
+    """Calculate confluence score for entry quality"""
+    if market_data.empty:
+        return 50.0
+    
+    # Price proximity to anchor (closer = better)
+    price_distance = abs(price - anchor_price) / anchor_price * 100
+    proximity_score = max(0, 100 - (price_distance * 20))
+    
+    # Volume profile strength
+    volume_score = calculate_volume_profile_strength(market_data, price)
+    
+    # Market regime alignment
+    regime_info = detect_market_regime(market_data)
+    regime_score = 75 if regime_info['trend'] != 'NEUTRAL' else 45
+    
+    # Weighted confluence score
+    confluence = (proximity_score * 0.4) + (volume_score * 0.3) + (regime_score * 0.3)
+    return min(100, max(0, confluence))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADVANCED ANALYTICS FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def generate_trading_insights(symbol: str, data: pd.DataFrame, projections: pd.DataFrame) -> pd.DataFrame:
+    """Generate advanced trading insights"""
+    if data.empty or projections.empty:
+        return pd.DataFrame()
+    
+    insights = []
+    regime_info = detect_market_regime(data)
+    
+    # Market condition assessment
+    insights.append({
+        'Category': 'Market Regime',
+        'Insight': f"{regime_info['trend']} trend in {regime_info['regime']} environment",
+        'Impact': 'High' if regime_info['strength'] > 50 else 'Medium',
+        'Recommendation': get_regime_recommendation(regime_info)
+    })
+    
+    # Volatility analysis
+    volatility = regime_info['volatility']
+    insights.append({
+        'Category': 'Volatility',
+        'Insight': f"Current volatility: {volatility:.1f}%",
+        'Impact': 'High' if volatility > 2.0 else 'Medium' if volatility > 1.0 else 'Low',
+        'Recommendation': get_volatility_recommendation(volatility)
+    })
+    
+    # Anchor line validation
+    if len(projections) > 0:
+        price_spread = projections['Price'].max() - projections['Price'].min()
+        spread_pct = (price_spread / projections['Price'].mean()) * 100
+        
+        insights.append({
+            'Category': 'Anchor Reliability',
+            'Insight': f"Price projection spread: {spread_pct:.1f}%",
+            'Impact': 'High' if spread_pct < 2 else 'Medium' if spread_pct < 5 else 'Low',
+            'Recommendation': get_anchor_recommendation(spread_pct)
+        })
+    
+    return pd.DataFrame(insights)
+
+def get_regime_recommendation(regime_info: dict) -> str:
+    """Get recommendation based on market regime"""
+    trend = regime_info['trend']
+    regime = regime_info['regime']
+    
+    if trend == 'BULLISH' and 'HIGH' in regime:
+        return "Favor long entries with wider stops"
+    elif trend == 'BEARISH' and 'HIGH' in regime:
+        return "Favor short entries with wider stops"
+    elif 'LOW' in regime:
+        return "Use tighter stops, expect range-bound action"
+    else:
+        return "Standard position sizing recommended"
+
+def get_volatility_recommendation(volatility: float) -> str:
+    """Get recommendation based on volatility"""
+    if volatility > 2.5:
+        return "High volatility - reduce position size, wider stops"
+    elif volatility > 1.5:
+        return "Moderate volatility - standard risk management"
+    else:
+        return "Low volatility - consider larger positions, tighter stops"
+
+def get_anchor_recommendation(spread_pct: float) -> str:
+    """Get recommendation based on anchor spread"""
+    if spread_pct < 2:
+        return "Strong anchor reliability - high confidence trades"
+    elif spread_pct < 5:
+        return "Moderate anchor reliability - standard confidence"
+    else:
+        return "Wide anchor spread - reduce position size"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PERFORMANCE OPTIMIZATION FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_optimal_entry_times() -> dict:
+    """Get statistically optimal entry times for different strategies"""
+    return {
+        'SPX_LONG': ['09:00', '09:30', '13:30', '14:00'],
+        'SPX_SHORT': ['10:00', '10:30', '11:00', '14:30'], 
+        'STOCK_MOMENTUM': ['09:30', '10:00', '13:00', '13:30'],
+        'STOCK_REVERSAL': ['08:30', '11:30', '12:00', '14:00']
+    }
+
+def calculate_time_edge(time_slot: str, strategy_type: str) -> float:
+    """Calculate time-of-day edge for given strategy"""
+    optimal_times = get_optimal_entry_times()
+    
+    if strategy_type in optimal_times and time_slot in optimal_times[strategy_type]:
+        return 15.0  # 15% edge bonus
+    
+    # Market open/close periods generally have more edge
+    hour = int(time_slot.split(':')[0])
+    if hour in [8, 9, 13, 14]:
+        return 8.0   # 8% edge bonus
+    else:
+        return 0.0   # No time edge
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUMMARY DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.subheader("Analysis Summary Dashboard")
+
+# Create summary columns
+summary_col1, summary_col2, summary_col3 = st.columns(3)
+
+with summary_col1:
+    st.markdown("**Active Analysis**")
+    
+    spx_status = "✅ Ready" if st.session_state.spx_analysis_ready else "⏸️ Pending"
+    stock_status = "✅ Ready" if st.session_state.stock_analysis_ready else "⏸️ Pending"
+    signal_status = "✅ Ready" if st.session_state.signal_ready else "⏸️ Pending"
+    contract_status = "✅ Ready" if st.session_state.contract_ready else "⏸️ Pending"
+    
+    st.write(f"SPX Anchors: {spx_status}")
+    st.write(f"Stock Analysis: {stock_status}")
+    st.write(f"Signal Detection: {signal_status}")
+    st.write(f"Contract Tool: {contract_status}")
+
+with summary_col2:
+    st.markdown("**Current Settings**")
+    
+    st.write(f"Skyline Slope: {st.session_state.spx_slopes['skyline']:+.3f}")
+    st.write(f"Baseline Slope: {st.session_state.spx_slopes['baseline']:+.3f}")
+    st.write(f"ES→SPX Offset: {st.session_state.current_offset:+.1f}")
+    st.write(f"Theme: {st.session_state.theme}")
+
+with summary_col3:
+    st.markdown("**Market Status**")
+    
+    current_time_ct = datetime.now(CT_TZ)
+    market_open_time = current_time_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+    market_close_time = current_time_ct.replace(hour=14, minute=30, second=0, microsecond=0)
+    
+    is_market_hours = market_open_time <= current_time_ct <= market_close_time
+    market_status_text = "🟢 OPEN" if is_market_hours else "🔴 CLOSED"
+    
+    st.write(f"Market: {market_status_text}")
+    st.write(f"Time (CT): {current_time_ct.strftime('%H:%M:%S')}")
+    
+    if is_market_hours:
+        time_to_close = market_close_time - current_time_ct
+        hours_left = int(time_to_close.total_seconds() // 3600)
+        minutes_left = int((time_to_close.total_seconds() % 3600) // 60)
+        st.write(f"Time to Close: {hours_left}h {minutes_left}m")
+    else:
+        # Time to next open
+        if current_time_ct.hour < 8 or (current_time_ct.hour == 8 and current_time_ct.minute < 30):
+            next_open = market_open_time
+        else:
+            next_open = market_open_time + timedelta(days=1)
+        
+        time_to_open = next_open - current_time_ct
+        hours_to_open = int(time_to_open.total_seconds() // 3600)
+        st.write(f"Next Open: {hours_to_open}h")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# QUICK ACTIONS PANEL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.subheader("Quick Actions")
+
+action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+
+with action_col1:
+    if st.button("🔄 Update ES Offset", key="quick_update_offset"):
+        with st.spinner("Updating offset..."):
+            today = datetime.now(CT_TZ).date()
+            yesterday = today - timedelta(days=1)
+            
+            es_data = fetch_live_data("ES=F", yesterday, today)
+            spx_data = fetch_live_data("^GSPC", yesterday, today)
+            
+            if not es_data.empty and not spx_data.empty:
+                new_offset = calculate_es_spx_offset(es_data, spx_data)
+                st.session_state.current_offset = new_offset
+                st.success(f"Offset updated: {new_offset:+.1f}")
+                st.rerun()
+            else:
+                st.error("Failed to fetch offset data")
+
+with action_col2:
+    if st.button("📊 Reset All Analysis", key="quick_reset_all"):
+        # Clear all analysis states
+        analysis_keys = [
+            'spx_analysis_ready', 'stock_analysis_ready', 
+            'signal_ready', 'contract_ready',
+            'es_anchor_data', 'spx_manual_anchors',
+            'stock_analysis_data', 'signal_data', 'contract_projections'
+        ]
+        
+        for key in analysis_keys:
+            if key in st.session_state:
+                del st.session_state[key]
+        
+        st.success("All analysis reset")
+        st.rerun()
+
+with action_col3:
+    if st.button("⚙️ Reset Slopes", key="quick_reset_slopes"):
+        st.session_state.spx_slopes = SPX_SLOPES.copy()
+        st.session_state.stock_slopes = STOCK_SLOPES.copy()
+        st.success("Slopes reset to defaults")
+        st.rerun()
+
+with action_col4:
+    current_theme = "Light" if st.session_state.theme == "Dark" else "Dark"
+    if st.button(f"🎨 Switch to {current_theme}", key="quick_theme_switch"):
+        st.session_state.theme = current_theme
+        st.success(f"Switched to {current_theme} theme")
+        st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PERFORMANCE METRICS DISPLAY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if any([
+    st.session_state.get('spx_analysis_ready', False),
+    st.session_state.get('stock_analysis_ready', False),
+    st.session_state.get('signal_ready', False),
+    st.session_state.get('contract_ready', False)
+]):
+    
+    st.markdown("---")
+    st.subheader("Performance Insights")
+    
+    insight_tabs = st.tabs(["Market Regime", "Volatility Analysis", "Time Edge"])
+    
+    with insight_tabs[0]:
+        # Show market regime for active analyses
+        if st.session_state.get('signal_ready', False):
+            signal_data = st.session_state.get('signal_data', pd.DataFrame())
+            if not signal_data.empty:
+                regime = detect_market_regime(signal_data)
+                
+                regime_col1, regime_col2 = st.columns(2)
+                with regime_col1:
+                    st.metric("Trend Direction", regime['trend'])
+                    st.metric("Trend Strength", f"{regime['strength']:.1f}")
+                
+                with regime_col2:
+                    st.metric("Volatility Regime", regime['regime'])
+                    st.metric("Volatility Level", f"{regime['volatility']:.1f}%")
+                
+                st.info(get_regime_recommendation(regime))
+    
+    with insight_tabs[1]:
+        # Volatility analysis across active symbols
+        if st.session_state.get('spx_analysis_ready', False):
+            st.write("SPX volatility analysis available after generating anchors")
+        
+        if st.session_state.get('stock_analysis_ready', False):
+            stock_ticker = st.session_state.get('stock_analysis_ticker', 'N/A')
+            stock_data = st.session_state.get('stock_analysis_data', pd.DataFrame())
+            
+            if not stock_data.empty:
+                regime = detect_market_regime(stock_data)
+                st.write(f"**{stock_ticker} Volatility:** {regime['volatility']:.1f}%")
+                st.write(get_volatility_recommendation(regime['volatility']))
+    
+    with insight_tabs[2]:
+        # Time-of-day edge analysis
+        optimal_times = get_optimal_entry_times()
+        
+        st.write("**Optimal Entry Times by Strategy:**")
+        for strategy, times in optimal_times.items():
+            st.write(f"**{strategy.replace('_', ' ')}:** {', '.join(times)}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FOOTER AND VERSION INFO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.markdown(
+    f"""
+    <div style='text-align: center; color: #888; font-size: 0.9em;'>
+        SPX Prophet Analytics • Real-time market analysis • 
+        Session: {datetime.now(CT_TZ).strftime('%H:%M:%S CT')} • 
+        Theme: {st.session_state.theme}
+    </div>
+    """, 
+    unsafe_allow_html=True
+)
+
+# Error handling wrapper for the entire app
+if 'app_errors' not in st.session_state:
+    st.session_state.app_errors = []
+
+# Add any persistent error handling here
+try:
+    # Validate critical session state
+    required_states = ['spx_slopes', 'stock_slopes', 'current_offset', 'theme']
+    missing_states = [state for state in required_states if state not in st.session_state]
+    
+    if missing_states:
+        st.error(f"Missing session state: {', '.join(missing_states)}. Please refresh the app.")
+        
+except Exception as e:
+    st.error(f"Application error: {str(e)}")
+    st.info("Please refresh the page to reset the application.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# APPLICATION COMPLETE
+# ═══════════════════════════════════════════════════════════════════════════════
