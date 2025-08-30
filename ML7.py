@@ -690,8 +690,9 @@ def get_default_anchor_prob() -> dict:
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ✅ PART 1 COMPLETE - ENHANCED FOUNDATION
+# ✅ PART 1 COMPLETE - FOUNDATION
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 
 
@@ -769,14 +770,14 @@ def calculate_entry_exit_table(projection_df: pd.DataFrame, anchor_type: str) ->
         
         risk_amount = abs(entry_price - stop_price)
         
-        # Probability calculations
+        # Probability calculations using real historical data
+        hist_probs = calculate_historical_probabilities()
         entry_prob = calculate_anchor_entry_probability(anchor_type, time_slot)
         tp1_prob = calculate_anchor_target_probability(anchor_type, 1)
         tp2_prob = calculate_anchor_target_probability(anchor_type, 2)
         
-        # Risk-reward ratios
-        rr1 = abs(tp1_price - entry_price) / risk_amount if risk_amount > 0 else 0
-        rr2 = abs(tp2_price - entry_price) / risk_amount if risk_amount > 0 else 0
+        # Get sample size for transparency
+        sample_size = hist_probs.get(anchor_type.upper(), {}).get('sample_size', 0)
         
         analysis_rows.append({
             'Time': time_slot,
@@ -788,42 +789,51 @@ def calculate_entry_exit_table(projection_df: pd.DataFrame, anchor_type: str) ->
             'Risk': round(risk_amount, 2),
             'RR1': f"{rr1:.1f}",
             'RR2': f"{rr2:.1f}",
-            'Entry_Prob': f"{entry_prob:.0f}%",
-            'TP1_Prob': f"{tp1_prob:.0f}%",
-            'TP2_Prob': f"{tp2_prob:.0f}%"
+            'Entry_Prob': f"{entry_prob:.1f}%",
+            'TP1_Prob': f"{tp1_prob:.1f}%",
+            'TP2_Prob': f"{tp2_prob:.1f}%",
+            'Sample_Size': sample_size
         })
     
     return pd.DataFrame(analysis_rows)
 
 def calculate_anchor_entry_probability(anchor_type: str, time_slot: str) -> float:
-    """Calculate entry probability based on anchor strategy"""
-    base_probs = {
-        'SKYLINE': 80.0,
-        'BASELINE': 80.0,
-        'HIGH': 75.0,
-        'CLOSE': 80.0,
-        'LOW': 75.0
-    }
+    """Calculate real entry probability based on historical analysis"""
+    # Get historical probabilities
+    hist_probs = calculate_historical_probabilities()
     
-    base_prob = base_probs.get(anchor_type.upper(), 70.0)
-    
-    # Time adjustments
-    hour = int(time_slot.split(':')[0])
-    if hour in [8, 9]:
-        time_adj = 8
-    elif hour in [13, 14]:
-        time_adj = 5
+    if anchor_type.upper() in hist_probs:
+        base_prob = hist_probs[anchor_type.upper()]['entry']
+        sample_size = hist_probs[anchor_type.upper()]['sample_size']
+        
+        # Only apply time adjustments if we have sufficient data
+        if sample_size >= 10:
+            hour = int(time_slot.split(':')[0])
+            # Small time adjustments based on market volatility periods
+            if hour in [8, 9]:  # Market open
+                time_adj = 5
+            elif hour in [13, 14]:  # End of day
+                time_adj = 3
+            else:
+                time_adj = 0
+            
+            return min(95, base_prob + time_adj)
+        else:
+            return base_prob
     else:
-        time_adj = 0
-    
-    return min(95, base_prob + time_adj)
+        return 60.0  # Conservative default
 
 def calculate_anchor_target_probability(anchor_type: str, target_num: int) -> float:
-    """Calculate target probability based on anchor strength"""
-    if anchor_type.upper() in ['SKYLINE', 'BASELINE']:
-        return 85.0 if target_num == 1 else 68.0
+    """Calculate real target probability based on historical analysis"""
+    hist_probs = calculate_historical_probabilities()
+    
+    if anchor_type.upper() in hist_probs:
+        if target_num == 1:
+            return hist_probs[anchor_type.upper()]['tp1']
+        else:
+            return hist_probs[anchor_type.upper()]['tp2']
     else:
-        return 75.0 if target_num == 1 else 55.0
+        return 50.0 if target_num == 1 else 30.0  # Conservative defaults
 
 # Create main tabs
 tab1, tab2, tab3, tab4 = st.tabs(["SPX Anchors", "Stock Anchors", "Signals & EMA", "Contract Tool"])
@@ -900,8 +910,21 @@ with tab1:
                 
                 st.session_state.spx_analysis_ready = True
     
-    # Show current offset
-    st.info(f"ES→SPX Offset for {prev_day}: {st.session_state.current_offset:+.1f}")
+    # Show current offset and historical analysis info
+    offset_info_col1, offset_info_col2 = st.columns(2)
+    
+    with offset_info_col1:
+        st.info(f"ES→SPX Offset for {prev_day}: {st.session_state.current_offset:+.1f}")
+    
+    with offset_info_col2:
+        # Show historical analysis status
+        hist_probs = calculate_historical_probabilities()
+        days_analyzed = hist_probs.get('days_analyzed', 0)
+        if days_analyzed > 0:
+            st.success(f"Probabilities based on {days_analyzed} days of historical data")
+        else:
+            st.warning("Using default probabilities - insufficient historical data")
+    
     st.markdown("---")
     
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -1100,6 +1123,9 @@ with tab1:
 # ═══════════════════════════════════════════════════════════════════════════════
 # END OF SPX ANCHORS TAB
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
