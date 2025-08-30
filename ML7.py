@@ -1463,3 +1463,587 @@ def analyze_ema_regime(ema8: pd.Series, ema21: pd.Series, vwap: pd.Series) -> pd
     }]
     
     return pd.DataFrame(regime_data)
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPX PROPHET - PART 5: CONTRACT TOOL TAB
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab4:
+    st.subheader("Contract Tool")
+    st.caption("Overnight contract price analysis for RTH entry optimization")
+    
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # TWO-POINT INPUT SYSTEM
+    # ═══════════════════════════════════════════════════════════════════════════════
+    
+    st.write("Overnight Contract Price Points")
+    
+    point_col1, point_col2 = st.columns(2)
+    
+    with point_col1:
+        st.markdown("**Point 1 (Earlier)**")
+        
+        p1_date = st.date_input(
+            "Point 1 Date",
+            value=datetime.now(CT_TZ).date() - timedelta(days=1),
+            key="ct_p1_date"
+        )
+        
+        p1_time = st.time_input(
+            "Point 1 Time (CT)",
+            value=time(20, 0),
+            key="ct_p1_time",
+            help="Between 20:00 prev day and 10:00 current day"
+        )
+        
+        p1_price = st.number_input(
+            "Point 1 Contract Price",
+            value=10.0,
+            min_value=0.01,
+            step=0.01, format="%.2f",
+            key="ct_p1_price"
+        )
+    
+    with point_col2:
+        st.markdown("**Point 2 (Later)**")
+        
+        p2_date = st.date_input(
+            "Point 2 Date", 
+            value=datetime.now(CT_TZ).date(),
+            key="ct_p2_date"
+        )
+        
+        p2_time = st.time_input(
+            "Point 2 Time (CT)",
+            value=time(8, 0),
+            key="ct_p2_time",
+            help="Between 20:00 prev day and 10:00 current day"
+        )
+        
+        p2_price = st.number_input(
+            "Point 2 Contract Price",
+            value=12.0,
+            min_value=0.01,
+            step=0.01, format="%.2f",
+            key="ct_p2_price"
+        )
+    
+    # Projection day
+    projection_day = st.date_input(
+        "RTH Projection Day",
+        value=datetime.now(CT_TZ).date(),
+        key="ct_proj_day"
+    )
+    
+    # Validate time range
+    p1_datetime = datetime.combine(p1_date, p1_time)
+    p2_datetime = datetime.combine(p2_date, p2_time)
+    
+    if p2_datetime <= p1_datetime:
+        st.error("Point 2 must be after Point 1")
+    else:
+        # Calculate slope
+        time_diff_minutes = (p2_datetime - p1_datetime).total_seconds() / 60
+        blocks_between = time_diff_minutes / 30  # 30-min blocks
+        
+        if blocks_between > 0:
+            contract_slope = (p2_price - p1_price) / blocks_between
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Time Span", f"{time_diff_minutes/60:.1f} hours")
+            with col2:
+                st.metric("30-min Blocks", f"{blocks_between:.1f}")
+            with col3:
+                st.metric("Slope per Block", f"{contract_slope:+.3f}")
+    
+    st.markdown("---")
+    
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # CONTRACT ANALYSIS EXECUTION
+    # ═══════════════════════════════════════════════════════════════════════════════
+    
+    if st.button("Generate Contract Analysis", key="ct_generate", type="primary"):
+        if p2_datetime <= p1_datetime:
+            st.error("Please ensure Point 2 is after Point 1")
+        else:
+            with st.spinner("Analyzing contract projections..."):
+                
+                # Calculate contract projections
+                p1_ct = CT_TZ.localize(p1_datetime)
+                contract_projections = project_contract_line(
+                    p1_price, p1_ct, contract_slope, projection_day
+                )
+                
+                # Fetch SPX data for baseline analysis
+                spx_data = fetch_live_data("^GSPC", projection_day - timedelta(days=1), projection_day)
+                
+                # Store results
+                st.session_state.contract_projections = contract_projections
+                st.session_state.contract_config = {
+                    'p1_price': p1_price,
+                    'p1_time': p1_ct,
+                    'p2_price': p2_price, 
+                    'p2_time': CT_TZ.localize(p2_datetime),
+                    'slope': contract_slope
+                }
+                st.session_state.contract_spx_data = spx_data
+                st.session_state.contract_ready = True
+    
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # RESULTS DISPLAY
+    # ═══════════════════════════════════════════════════════════════════════════════
+    
+    if st.session_state.get('contract_ready', False):
+        st.subheader("Contract Analysis Results")
+        
+        projections = st.session_state.contract_projections
+        config = st.session_state.contract_config
+        spx_data = st.session_state.contract_spx_data
+        
+        # Create analysis tabs
+        contract_tabs = st.tabs(["RTH Projections", "Bounce Analysis", "Risk Management"])
+        
+        with contract_tabs[0]:  # RTH Projections
+            st.write("RTH Contract Price Projections")
+            
+            # Enhance projections with probability scores
+            enhanced_projections = calculate_contract_probabilities(projections, config)
+            st.dataframe(enhanced_projections, use_container_width=True)
+            
+            # Key levels analysis
+            key_levels = identify_key_contract_levels(enhanced_projections)
+            st.write("Key Entry Levels")
+            st.dataframe(key_levels, use_container_width=True)
+        
+        with contract_tabs[1]:  # Bounce Analysis
+            if not spx_data.empty:
+                bounce_analysis = analyze_spx_baseline_bounces(spx_data, projections, config)
+                st.write("SPX Baseline Touch Analysis")
+                st.dataframe(bounce_analysis, use_container_width=True)
+                
+                # Skyline drop analysis
+                drop_analysis = analyze_spx_skyline_drops(spx_data, projections, config)
+                st.write("SPX Skyline Drop Analysis (Put Opportunities)")
+                st.dataframe(drop_analysis, use_container_width=True)
+            else:
+                st.warning("No SPX data available for bounce analysis")
+        
+        with contract_tabs[2]:  # Risk Management
+            risk_analysis = calculate_contract_risk_management(projections, config)
+            st.write("Contract Risk Management")
+            st.dataframe(risk_analysis, use_container_width=True)
+            
+            # Market-based risk recommendations
+            market_risk_analysis = calculate_market_based_risk(projections, config, spx_data)
+            st.write("Market-Based Risk Analysis")
+            st.dataframe(market_risk_analysis, use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONTRACT PROJECTION FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def project_contract_line(anchor_price: float, anchor_time: datetime, 
+                         slope: float, target_date: date) -> pd.DataFrame:
+    """Project contract line across RTH using overnight slope"""
+    rth_slots = rth_slots_ct(target_date)
+    projections = []
+    
+    for slot_time in rth_slots:
+        # Calculate 30-min blocks from anchor to slot
+        time_diff = slot_time - anchor_time
+        blocks = time_diff.total_seconds() / 1800  # 30 minutes = 1800 seconds
+        
+        projected_price = anchor_price + (slope * blocks)
+        
+        projections.append({
+            'Time': format_ct_time(slot_time),
+            'Contract_Price': round(projected_price, 2),
+            'Blocks_from_Anchor': round(blocks, 1),
+            'Price_Change': round(projected_price - anchor_price, 2)
+        })
+    
+    return pd.DataFrame(projections)
+
+def calculate_contract_probabilities(projections: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Add probability scores to contract projections"""
+    if projections.empty:
+        return projections
+    
+    enhanced = projections.copy()
+    prob_scores = []
+    
+    for idx, row in projections.iterrows():
+        time_slot = row['Time']
+        price = row['Contract_Price']
+        
+        # Calculate entry probability based on price momentum
+        momentum_score = calculate_contract_momentum_score(config['slope'])
+        time_score = calculate_time_of_day_score(time_slot)
+        volatility_score = calculate_contract_volatility_score(price, config)
+        
+        # Combined probability
+        entry_prob = (momentum_score * 0.4) + (time_score * 0.3) + (volatility_score * 0.3)
+        prob_scores.append(f"{entry_prob:.1f}%")
+    
+    enhanced['Entry_Probability'] = prob_scores
+    return enhanced
+
+def calculate_contract_momentum_score(slope: float) -> float:
+    """Score based on overnight momentum"""
+    abs_slope = abs(slope)
+    if abs_slope >= 0.5:
+        return 85
+    elif abs_slope >= 0.2:
+        return 70
+    elif abs_slope >= 0.1:
+        return 55
+    else:
+        return 40
+
+def calculate_time_of_day_score(time_slot: str) -> float:
+    """Score based on optimal entry times"""
+    hour = int(time_slot.split(':')[0])
+    minute = int(time_slot.split(':')[1])
+    
+    # Market open has higher volatility
+    if hour == 8 and minute >= 30:
+        return 90
+    elif hour == 9:
+        return 85
+    elif hour in [13, 14]:  # End of day momentum
+        return 75
+    else:
+        return 60
+
+def calculate_contract_volatility_score(price: float, config: dict) -> float:
+    """Score based on price volatility"""
+    price_range = abs(config['p2_price'] - config['p1_price'])
+    volatility_pct = (price_range / config['p1_price']) * 100
+    
+    if volatility_pct >= 20:
+        return 90
+    elif volatility_pct >= 10:
+        return 75
+    elif volatility_pct >= 5:
+        return 60
+    else:
+        return 45
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KEY LEVELS ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def identify_key_contract_levels(projections: pd.DataFrame) -> pd.DataFrame:
+    """Identify key entry levels with highest probability"""
+    if projections.empty:
+        return pd.DataFrame()
+    
+    # Extract probability values
+    prob_values = []
+    for prob_str in projections['Entry_Probability']:
+        prob_values.append(float(prob_str.replace('%', '')))
+    
+    projections_with_prob = projections.copy()
+    projections_with_prob['Prob_Value'] = prob_values
+    
+    # Get top 5 levels
+    top_levels = projections_with_prob.nlargest(5, 'Prob_Value')
+    
+    key_levels = []
+    for idx, row in top_levels.iterrows():
+        key_levels.append({
+            'Time': row['Time'],
+            'Contract_Price': row['Contract_Price'],
+            'Entry_Probability': row['Entry_Probability'],
+            'Recommendation': get_entry_recommendation(row['Prob_Value'])
+        })
+    
+    return pd.DataFrame(key_levels)
+
+def get_entry_recommendation(prob_value: float) -> str:
+    """Get entry recommendation based on probability"""
+    if prob_value >= 80:
+        return "STRONG BUY"
+    elif prob_value >= 70:
+        return "BUY"
+    elif prob_value >= 60:
+        return "MODERATE"
+    else:
+        return "WEAK"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPX BASELINE/SKYLINE ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def analyze_spx_baseline_bounces(spx_data: pd.DataFrame, contract_proj: pd.DataFrame, 
+                                config: dict) -> pd.DataFrame:
+    """Analyze where SPX touches baseline = call contract bounce zones"""
+    if spx_data.empty or contract_proj.empty:
+        return pd.DataFrame()
+    
+    # Simulate baseline detection from SPX data
+    spx_swings = detect_swings(spx_data, SWING_K)
+    _, baseline_anchor = get_anchor_points(spx_swings)
+    
+    if not baseline_anchor:
+        return pd.DataFrame([{'Analysis': 'No baseline anchor detected', 'Recommendation': 'N/A'}])
+    
+    baseline_price, baseline_time = baseline_anchor
+    
+    bounce_analysis = []
+    
+    # Check each contract projection time
+    for idx, row in contract_proj.iterrows():
+        time_slot = row['Time']
+        contract_price = row['Contract_Price']
+        
+        # Calculate distance to baseline
+        current_spx = get_spx_price_at_time(spx_data, time_slot)
+        if current_spx:
+            distance_to_baseline = abs(current_spx - baseline_price)
+            distance_pct = (distance_to_baseline / baseline_price) * 100
+            
+            bounce_prob = calculate_bounce_probability(distance_pct)
+            
+            bounce_analysis.append({
+                'Time': time_slot,
+                'SPX_Price': round(current_spx, 2),
+                'Baseline_Price': round(baseline_price, 2),
+                'Distance': round(distance_to_baseline, 2),
+                'Distance_Pct': f"{distance_pct:.2f}%",
+                'Contract_Price': contract_price,
+                'Bounce_Probability': f"{bounce_prob:.1f}%",
+                'Action': get_bounce_action(bounce_prob)
+            })
+    
+    return pd.DataFrame(bounce_analysis)
+
+def analyze_spx_skyline_drops(spx_data: pd.DataFrame, contract_proj: pd.DataFrame,
+                             config: dict) -> pd.DataFrame:
+    """Analyze skyline drops for put entry opportunities"""
+    if spx_data.empty or contract_proj.empty:
+        return pd.DataFrame()
+    
+    # Simulate skyline detection
+    spx_swings = detect_swings(spx_data, SWING_K)
+    skyline_anchor, _ = get_anchor_points(spx_swings)
+    
+    if not skyline_anchor:
+        return pd.DataFrame([{'Analysis': 'No skyline anchor detected', 'Recommendation': 'N/A'}])
+    
+    skyline_price, skyline_time = skyline_anchor
+    
+    drop_analysis = []
+    
+    for idx, row in contract_proj.iterrows():
+        time_slot = row['Time']
+        contract_price = row['Contract_Price']
+        
+        current_spx = get_spx_price_at_time(spx_data, time_slot)
+        if current_spx:
+            # Check if price dropped from skyline
+            drop_from_skyline = skyline_price - current_spx
+            drop_pct = (drop_from_skyline / skyline_price) * 100 if skyline_price > 0 else 0
+            
+            put_entry_prob = calculate_put_entry_probability(drop_pct)
+            
+            drop_analysis.append({
+                'Time': time_slot,
+                'SPX_Price': round(current_spx, 2),
+                'Skyline_Price': round(skyline_price, 2),
+                'Drop_Amount': round(drop_from_skyline, 2),
+                'Drop_Pct': f"{drop_pct:.2f}%",
+                'Put_Entry_Prob': f"{put_entry_prob:.1f}%",
+                'Put_Recommendation': get_put_recommendation(put_entry_prob)
+            })
+    
+    return pd.DataFrame(drop_analysis)
+
+def get_spx_price_at_time(spx_data: pd.DataFrame, time_slot: str) -> float:
+    """Get SPX price at specific time slot"""
+    try:
+        # Simple approximation - use closest available price
+        return spx_data.iloc[-1]['Close']  # Use last available close
+    except:
+        return 0.0
+
+def calculate_bounce_probability(distance_pct: float) -> float:
+    """Calculate bounce probability based on distance to baseline"""
+    if distance_pct <= 0.1:  # Very close to baseline
+        return 90
+    elif distance_pct <= 0.5:
+        return 75
+    elif distance_pct <= 1.0:
+        return 60
+    else:
+        return 35
+
+def calculate_put_entry_probability(drop_pct: float) -> float:
+    """Calculate put entry probability based on skyline drop"""
+    if drop_pct >= 2.0:  # Significant drop
+        return 85
+    elif drop_pct >= 1.0:
+        return 70
+    elif drop_pct >= 0.5:
+        return 55
+    else:
+        return 30
+
+def get_bounce_action(prob: float) -> str:
+    """Get action recommendation for baseline bounce"""
+    if prob >= 80:
+        return "STRONG CALL ENTRY"
+    elif prob >= 65:
+        return "CALL ENTRY"
+    else:
+        return "MONITOR"
+
+def get_put_recommendation(prob: float) -> str:
+    """Get put recommendation based on skyline drop"""
+    if prob >= 75:
+        return "STRONG PUT ENTRY"
+    elif prob >= 60:
+        return "PUT ENTRY"
+    else:
+        return "MONITOR"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RISK MANAGEMENT FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calculate_contract_risk_management(projections: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Calculate risk management for contract positions"""
+    if projections.empty:
+        return pd.DataFrame()
+    
+    risk_analysis = []
+    
+    for idx, row in projections.iterrows():
+        time_slot = row['Time']
+        entry_price = row['Contract_Price']
+        
+        # Dynamic stop based on contract volatility
+        volatility_factor = abs(config['slope']) * 2
+        stop_distance = max(entry_price * 0.15, volatility_factor)  # Minimum 15% stop
+        
+        # Calculate TP levels
+        tp1_price = entry_price + (stop_distance * 1.5)
+        tp2_price = entry_price + (stop_distance * 2.5)
+        stop_price = entry_price - stop_distance
+        
+        risk_analysis.append({
+            'Time': time_slot,
+            'Entry': round(entry_price, 2),
+            'Stop': round(max(0.01, stop_price), 2),  # Minimum 1 cent
+            'TP1': round(tp1_price, 2),
+            'TP2': round(tp2_price, 2),
+            'Risk_Amount': round(stop_distance, 2),
+            'RR1': f"{1.5:.1f}",
+            'RR2': f"{2.5:.1f}",
+            'Max_Loss_Pct': f"{(stop_distance/entry_price)*100:.1f}%"
+        })
+    
+    return pd.DataFrame(risk_analysis)
+
+def calculate_market_based_risk(projections: pd.DataFrame, config: dict, spx_data: pd.DataFrame) -> pd.DataFrame:
+    """Calculate risk analysis based on real market conditions"""
+    if projections.empty:
+        return pd.DataFrame()
+    
+    # Get current market volatility from SPX data
+    if not spx_data.empty:
+        recent_closes = spx_data['Close'].tail(20)
+        daily_returns = recent_closes.pct_change().dropna()
+        market_vol = daily_returns.std() * 100  # Convert to percentage
+        
+        # Average daily range
+        if 'High' in spx_data.columns and 'Low' in spx_data.columns:
+            daily_ranges = ((spx_data['High'] - spx_data['Low']) / spx_data['Close'] * 100).tail(10)
+            avg_daily_range = daily_ranges.mean()
+        else:
+            avg_daily_range = 2.0  # Default 2%
+    else:
+        market_vol = 1.5
+        avg_daily_range = 2.0
+    
+    # Contract-specific volatility
+    contract_vol = abs(config['slope']) * 10  # Convert slope to volatility estimate
+    
+    risk_data = []
+    
+    # Volatility regime assessment
+    if market_vol >= 2.0:
+        vol_regime = "HIGH"
+        risk_multiplier = 1.5
+    elif market_vol >= 1.0:
+        vol_regime = "MODERATE" 
+        risk_multiplier = 1.0
+    else:
+        vol_regime = "LOW"
+        risk_multiplier = 0.7
+    
+    # Time-based risk (market open vs close)
+    time_risk_factors = {
+        "08:30": 1.8, "09:00": 1.6, "09:30": 1.4, "10:00": 1.2,
+        "10:30": 1.0, "11:00": 1.0, "11:30": 1.0, "12:00": 1.0,
+        "12:30": 1.0, "13:00": 1.1, "13:30": 1.3, "14:00": 1.4, "14:30": 1.2
+    }
+    
+    for idx, row in projections.iterrows():
+        time_slot = row['Time']
+        entry_price = row['Contract_Price']
+        
+        time_risk = time_risk_factors.get(time_slot, 1.0)
+        
+        # Dynamic risk based on market conditions
+        base_risk = entry_price * 0.12  # 12% base risk
+        adjusted_risk = base_risk * risk_multiplier * time_risk
+        
+        # Confidence level based on market alignment
+        confidence = calculate_market_confidence(market_vol, contract_vol, time_risk)
+        
+        risk_data.append({
+            'Time': time_slot,
+            'Market_Vol': f"{market_vol:.1f}%",
+            'Vol_Regime': vol_regime,
+            'Time_Risk': f"{time_risk:.1f}x",
+            'Recommended_Risk': f"${adjusted_risk:.2f}",
+            'Confidence': f"{confidence:.0f}%",
+            'Market_Alignment': get_market_alignment(confidence)
+        })
+    
+    return pd.DataFrame(risk_data)
+
+def calculate_market_confidence(market_vol: float, contract_vol: float, time_risk: float) -> float:
+    """Calculate confidence based on market conditions"""
+    # Base confidence
+    base_confidence = 60
+    
+    # Volatility alignment bonus
+    if 0.8 <= contract_vol/market_vol <= 1.2:  # Contract vol matches market vol
+        vol_bonus = 20
+    else:
+        vol_bonus = 0
+    
+    # Time penalty for high-risk periods
+    time_penalty = (time_risk - 1) * 10
+    
+    confidence = base_confidence + vol_bonus - time_penalty
+    return max(20, min(95, confidence))
+
+def get_market_alignment(confidence: float) -> str:
+    """Get market alignment assessment"""
+    if confidence >= 80:
+        return "STRONG"
+    elif confidence >= 65:
+        return "GOOD"
+    elif confidence >= 50:
+        return "MODERATE"
+    else:
+        return "WEAK"
