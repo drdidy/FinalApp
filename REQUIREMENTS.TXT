@@ -1,0 +1,10 @@
+streamlit>=1.23
+pandas>=2.0
+yfinance>=0.2.40
+numpy>=1.26
+pytz>=2024.1
+
+# Optional for enhanced performance
+requests>=2.31.0
+urllib3>=2.0.0
+"""
