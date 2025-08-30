@@ -797,4 +797,141 @@ if not st.session_state.get("_mlp_rendered", False):
 
 
 
+# ======================================================================
+# Part 3 — SPX Baseline page:
+# - Reuses Part 2 helpers/fetchers
+# - Option to reuse Skyline settings from session
+# - Baseline projections 08:30–14:30 CT using your baseline slope
+# - Append-only: swaps router entry, then calls deferred render
+# ======================================================================
+
+def _anchor_summary_card(title: str, when_ct: datetime, price: float, extra: str = ""):
+    st.markdown(
+        f"""
+        <div class="ml-card">
+            <div style="font-size:0.9rem; opacity:.7; margin-bottom:.25rem;">{title}</div>
+            <div style="font-size:1.2rem; font-weight:700;">{price:.4f}</div>
+            <div class="muted" style="margin-top:.25rem;">
+                {when_ct.strftime('%Y-%m-%d %H:%M CT')} {extra}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def page_spx_baseline_v2():
+    st.markdown("### SPX Baseline")
+
+    if not HAS_YF:
+        st.warning("yfinance not available. Install it and rerun: `pip install yfinance`.")
+        return
+
+    # Try to reuse Skyline settings if available
+    reuse = False
+    if "spx_anchors" in st.session_state:
+        with st.expander("Reuse Skyline settings", expanded=True):
+            reuse = st.toggle(
+                "Use Skyline anchors/settings (k, previous day, projection day, ES→SPX offset)",
+                value=True
+            )
+
+    if reuse and "spx_anchors" in st.session_state:
+        sky = st.session_state["spx_anchors"]
+        prev_day_input  = sky["previous_day"]
+        projection_day  = sky["projection_day"]
+        k               = sky["k"]
+        es_to_spx_offset = sky["offset"]
+        st.caption("Using settings from Skyline.")
+    else:
+        # Independent controls
+        colA, colB, colC, colD = st.columns([1.2, 1, 1, 1.2])
+        with colA:
+            prev_day_input = st.date_input(
+                "Previous trading day (for ES window)",
+                value=prev_trading_day_base(now_ct()),
+                help="ES=F 30m candles, 17:00–19:30 CT window."
+            )
+        with colB:
+            k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0)
+        with colC:
+            es_to_spx_offset = st.number_input(
+                "ES→SPX offset",
+                value=0.0, step=0.5,
+                help="Adjustment to convert ES close to an SPX anchor (points)."
+            )
+        with colD:
+            projection_day = st.date_input(
+                "Projection day",
+                value=projection_day_default(now_ct()),
+                help="08:30–14:30 CT will be projected."
+            )
+
+    # Fetch ES window and compute k-th extremes
+    df_es_win = fetch_es_30m_for_prev_day_window(prev_day_input)
+    if df_es_win.empty:
+        st.error("No ES data returned for the selected previous day.")
+        return
+
+    (hi_price, hi_time), (lo_price, lo_time) = kth_extreme_by_close(df_es_win, k=k)
+    if hi_price is None or lo_price is None:
+        st.error("Could not compute k-th extremes from ES window.")
+        return
+
+    # Baseline uses LOW-side anchor; show HIGH for context
+    lo_price_adj = lo_price + es_to_spx_offset
+    lo_time_ct   = _as_ct(lo_time)
+
+    hi_price_adj = hi_price + es_to_spx_offset
+    hi_time_ct   = _as_ct(hi_time)
+
+    # Build projection for RTH
+    slots_ct = generate_rth_times_ct(projection_day)
+    spx_baseline_slope = st.session_state["spx_slopes"]["baseline"]
+    base_df = build_projection_table(lo_price_adj, lo_time_ct, spx_baseline_slope, slots_ct)
+
+    # Save/merge into session anchors
+    st.session_state.setdefault("spx_anchors", {})
+    st.session_state["spx_anchors"].update({
+        "previous_day": prev_day_input,
+        "projection_day": projection_day,
+        "k": k,
+        "offset": es_to_spx_offset,
+        "baseline": {"price": lo_price_adj, "time": lo_time_ct},
+        # keep skyline if already present; if not, store current hi for reference
+        "skyline": st.session_state["spx_anchors"].get("skyline", {"price": hi_price_adj, "time": hi_time_ct}),
+    })
+
+    # UI
+    cTop1, cTop2 = st.columns(2)
+    with cTop1:
+        _anchor_summary_card("Baseline anchor (k-th LOW close, ES+offset)", lo_time_ct, lo_price_adj, f"• k={k}")
+    with cTop2:
+        _anchor_summary_card("Skyline anchor (k-th HIGH close, ES+offset)", hi_time_ct, hi_price_adj, f"• k={k}")
+
+    st.markdown("#### Baseline Projection (08:30–14:30 CT)")
+    st.dataframe(base_df, hide_index=True, use_container_width=True)
+    st.download_button(
+        "📥 Download Baseline CSV",
+        data=base_df.to_csv(index=False),
+        file_name=f"SPX_Baseline_{projection_day}.csv",
+        mime="text/csv",
+        key="dl_baseline_csv_p3",
+    )
+
+    with st.expander("ES 30m window (prev day 17:00–19:30 CT)", expanded=False):
+        df_show = df_es_win.copy()
+        df_show.index = df_show.index.tz_convert(CT)
+        st.dataframe(df_show, use_container_width=True)
+
+    st.success("SPX Baseline projection generated.")
+
+# Upgrade router entry (append-only)
+PAGES["SPX • Baseline"] = page_spx_baseline_v2
+
+# -----------------------------
+# Auto-render footer (call once)
+# -----------------------------
+if not st.session_state.get("_mlp_rendered", False):
+    st.session_state["_mlp_rendered"] = True
+    __MLP_RENDER__()
 
