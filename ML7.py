@@ -659,3 +659,360 @@ def calculate_target_probability(target_distance: float, stop_distance: float, t
         base_prob = 45 - (rr_ratio - 2.5) * 8
     
     return min(85, max(25, base_prob))
+
+
+
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPX PROPHET - PART 3: STOCK ANCHORS TAB
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab2:
+    st.subheader("Stock Anchor Analysis")
+    st.caption("Mon/Tue combined session analysis for individual stocks")
+    
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # TICKER SELECTION
+    # ═══════════════════════════════════════════════════════════════════════════════
+    
+    # Quick ticker buttons
+    st.write("Core Tickers:")
+    ticker_cols = st.columns(4)
+    selected_ticker = None
+    
+    core_tickers = ['TSLA', 'NVDA', 'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'META', 'NFLX']
+    for i, ticker in enumerate(core_tickers):
+        with ticker_cols[i % 4]:
+            if st.button(f"{ticker}", key=f"stk_btn_{ticker}"):
+                selected_ticker = ticker
+                st.session_state.selected_stock = ticker
+    
+    # Custom ticker input
+    st.markdown("---")
+    custom_ticker = st.text_input(
+        "Custom Symbol", 
+        placeholder="Enter any ticker symbol",
+        key="stk_custom_input"
+    )
+    
+    if custom_ticker:
+        selected_ticker = custom_ticker.upper()
+        st.session_state.selected_stock = selected_ticker
+    
+    # Use session state ticker if available
+    if not selected_ticker and 'selected_stock' in st.session_state:
+        selected_ticker = st.session_state.selected_stock
+    
+    if selected_ticker:
+        st.info(f"Selected: {selected_ticker}")
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # SLOPE MANAGEMENT
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        # Auto-fill slope or use default
+        default_slope = STOCK_SLOPES.get(selected_ticker, 0.0150)
+        current_slope = st.session_state.stock_slopes.get(selected_ticker, default_slope)
+        
+        slope_magnitude = st.number_input(
+            f"{selected_ticker} Slope Magnitude",
+            value=current_slope,
+            step=0.0001, format="%.4f",
+            key=f"stk_slope_{selected_ticker}",
+            help="Used as +magnitude for Skyline, -magnitude for Baseline"
+        )
+        st.session_state.stock_slopes[selected_ticker] = slope_magnitude
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # DATE INPUTS
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            monday_date = st.date_input(
+                "Monday Date",
+                value=datetime.now(CT_TZ).date() - timedelta(days=2),
+                key=f"stk_mon_{selected_ticker}"
+            )
+        
+        with col2:
+            tuesday_date = st.date_input(
+                "Tuesday Date", 
+                value=monday_date + timedelta(days=1),
+                key=f"stk_tue_{selected_ticker}"
+            )
+        
+        with col3:
+            # Project for rest of week
+            st.write("Project for remaining week:")
+            wed_date = tuesday_date + timedelta(days=1)
+            thu_date = tuesday_date + timedelta(days=2) 
+            fri_date = tuesday_date + timedelta(days=3)
+            st.caption(f"Wed: {wed_date}, Thu: {thu_date}, Fri: {fri_date}")
+        
+        st.markdown("---")
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # ANALYSIS EXECUTION
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        if st.button(f"Analyze {selected_ticker}", key=f"stk_analyze_{selected_ticker}", type="primary"):
+            with st.spinner(f"Analyzing {selected_ticker} Mon/Tue sessions..."):
+                
+                # Fetch Monday and Tuesday data
+                mon_data = fetch_live_data(selected_ticker, monday_date, monday_date)
+                tue_data = fetch_live_data(selected_ticker, tuesday_date, tuesday_date)
+                
+                if mon_data.empty and tue_data.empty:
+                    st.error(f"No data available for {selected_ticker} on selected dates")
+                elif mon_data.empty:
+                    st.warning("No Monday data, using Tuesday only")
+                    combined_data = tue_data
+                elif tue_data.empty:
+                    st.warning("No Tuesday data, using Monday only")
+                    combined_data = mon_data
+                else:
+                    # Combine Monday and Tuesday data
+                    combined_data = pd.concat([mon_data, tue_data]).sort_index()
+                
+                if not combined_data.empty:
+                    # Store analysis results
+                    st.session_state.stock_analysis_data = combined_data
+                    st.session_state.stock_analysis_ticker = selected_ticker
+                    st.session_state.stock_analysis_ready = True
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # RESULTS DISPLAY
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        if (st.session_state.get('stock_analysis_ready', False) and 
+            st.session_state.get('stock_analysis_ticker') == selected_ticker):
+            
+            st.subheader(f"{selected_ticker} Anchor Analysis")
+            
+            # Process swing detection on combined Mon/Tue data
+            stock_data = st.session_state.stock_analysis_data
+            stock_swings = detect_swings(stock_data, SWING_K)
+            
+            # Get absolute highest and lowest across both days
+            skyline_anchor, baseline_anchor = get_anchor_points(stock_swings)
+            
+            # Get manual High/Close/Low from last available data (using CLOSE only)
+            last_bar = stock_data.iloc[-1]
+            manual_anchors = {
+                'high': (last_bar['Close'], last_bar.name),  # Use close price from high time
+                'close': (last_bar['Close'], last_bar.name),
+                'low': (last_bar['Close'], last_bar.name)   # Use close price from low time
+            }
+            
+            # Create weekly projection tables
+            st.subheader(f"{selected_ticker} Weekly Projections")
+            
+            # Project for Wed, Thu, Fri
+            projection_dates = [
+                ("Wednesday", tuesday_date + timedelta(days=1)),
+                ("Thursday", tuesday_date + timedelta(days=2)), 
+                ("Friday", tuesday_date + timedelta(days=3))
+            ]
+            
+            weekly_tabs = st.tabs(["Wed", "Thu", "Fri"])
+            
+            for day_idx, (day_name, proj_date) in enumerate(projection_dates):
+                with weekly_tabs[day_idx]:
+                    st.write(f"{day_name} - {proj_date}")
+                    
+                    # Create anchor sub-tabs for each day
+                    anchor_subtabs = st.tabs(["High", "Close", "Low", "Skyline", "Baseline"])
+                    
+                    # Manual anchors
+                    with anchor_subtabs[0]:  # High
+                        price, timestamp = manual_anchors['high']
+                        anchor_time_ct = timestamp.astimezone(CT_TZ)
+                        
+                        high_proj = project_anchor_line(
+                            price, anchor_time_ct, slope_magnitude, proj_date
+                        )
+                        
+                        st.dataframe(high_proj, use_container_width=True)
+                        
+                        high_analysis = calculate_weekly_entry_exit_table(high_proj, selected_ticker, "HIGH", day_name)
+                        st.write("Entry/Exit Analysis")
+                        st.dataframe(high_analysis, use_container_width=True)
+                    
+                    with anchor_subtabs[1]:  # Close
+                        price, timestamp = manual_anchors['close']
+                        anchor_time_ct = timestamp.astimezone(CT_TZ)
+                        
+                        close_proj = project_anchor_line(
+                            price, anchor_time_ct, slope_magnitude, proj_date
+                        )
+                        
+                        st.dataframe(close_proj, use_container_width=True)
+                        
+                        close_analysis = calculate_weekly_entry_exit_table(close_proj, selected_ticker, "CLOSE", day_name)
+                        st.write("Entry/Exit Analysis")
+                        st.dataframe(close_analysis, use_container_width=True)
+                    
+                    with anchor_subtabs[2]:  # Low
+                        price, timestamp = manual_anchors['low']
+                        anchor_time_ct = timestamp.astimezone(CT_TZ)
+                        
+                        low_proj = project_anchor_line(
+                            price, anchor_time_ct, slope_magnitude, proj_date
+                        )
+                        
+                        st.dataframe(low_proj, use_container_width=True)
+                        
+                        low_analysis = calculate_weekly_entry_exit_table(low_proj, selected_ticker, "LOW", day_name)
+                        st.write("Entry/Exit Analysis")
+                        st.dataframe(low_analysis, use_container_width=True)
+                    
+                    # Swing anchors
+                    with anchor_subtabs[3]:  # Skyline
+                        if skyline_anchor:
+                            sky_price, sky_time = skyline_anchor
+                            sky_time_ct = sky_time.astimezone(CT_TZ)
+                            
+                            skyline_proj = project_anchor_line(
+                                sky_price, sky_time_ct, slope_magnitude, proj_date
+                            )
+                            
+                            st.dataframe(skyline_proj, use_container_width=True)
+                            
+                            sky_analysis = calculate_weekly_entry_exit_table(skyline_proj, selected_ticker, "SKYLINE", day_name)
+                            st.write("Entry/Exit Analysis")
+                            st.dataframe(sky_analysis, use_container_width=True)
+                        else:
+                            st.warning("No skyline anchor detected")
+                    
+                    with anchor_subtabs[4]:  # Baseline
+                        if baseline_anchor:
+                            base_price, base_time = baseline_anchor
+                            base_time_ct = base_time.astimezone(CT_TZ)
+                            
+                            baseline_proj = project_anchor_line(
+                                base_price, base_time_ct, -slope_magnitude, proj_date
+                            )
+                            
+                            st.dataframe(baseline_proj, use_container_width=True)
+                            
+                            base_analysis = calculate_weekly_entry_exit_table(baseline_proj, selected_ticker, "BASELINE", day_name)
+                            st.write("Entry/Exit Analysis")
+                            st.dataframe(base_analysis, use_container_width=True)
+                        else:
+                            st.warning("No baseline anchor detected")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STOCK-SPECIFIC ENTRY/EXIT FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calculate_weekly_entry_exit_table(projection_df: pd.DataFrame, ticker: str, anchor_type: str, day_name: str) -> pd.DataFrame:
+    """Calculate weekly stock entry/exit analysis with day-specific adjustments"""
+    if projection_df.empty:
+        return pd.DataFrame()
+    
+    analysis_rows = []
+    stock_volatility = get_stock_volatility_factor(ticker)
+    
+    # Day-specific multipliers for probability
+    day_multipliers = {"Wednesday": 1.1, "Thursday": 1.0, "Friday": 0.9}
+    day_mult = day_multipliers.get(day_name, 1.0)
+    
+    for idx, row in projection_df.iterrows():
+        time_slot = row['Time']
+        price = row['Price']
+        
+        # Dynamic stop based on stock volatility
+        stop_distance = price * stock_volatility * 0.012
+        
+        # TP calculations
+        tp1_distance = stop_distance * 1.5
+        tp2_distance = stop_distance * 2.5
+        
+        # Direction based on slope sign
+        slope_sign = 1 if anchor_type in ['SKYLINE', 'HIGH'] else -1
+        
+        entry_price = price
+        stop_price = price - (stop_distance * slope_sign)
+        tp1_price = price + (tp1_distance * slope_sign)
+        tp2_price = price + (tp2_distance * slope_sign)
+        direction = "LONG" if slope_sign > 0 else "SHORT"
+        
+        # Enhanced probability calculations with day adjustment
+        entry_prob = calculate_stock_entry_probability(ticker, anchor_type, time_slot) * day_mult
+        tp1_prob = calculate_stock_target_probability(ticker, tp1_distance, stop_distance, 1) * day_mult
+        tp2_prob = calculate_stock_target_probability(ticker, tp2_distance, stop_distance, 2) * day_mult
+        
+        analysis_rows.append({
+            'Time': time_slot,
+            'Direction': direction,
+            'Entry': round(entry_price, 2),
+            'Stop': round(stop_price, 2),
+            'TP1': round(tp1_price, 2),
+            'TP2': round(tp2_price, 2),
+            'Risk': round(stop_distance, 2),
+            'Entry_Prob': f"{min(95, entry_prob):.1f}%",
+            'TP1_Prob': f"{min(85, tp1_prob):.1f}%",
+            'TP2_Prob': f"{min(75, tp2_prob):.1f}%",
+            'Day': day_name
+        })
+    
+    return pd.DataFrame(analysis_rows)
+
+def get_stock_volatility_factor(ticker: str) -> float:
+    """Get volatility factor for different stocks"""
+    volatility_factors = {
+        'TSLA': 1.8, 'NVDA': 1.6, 'META': 1.4, 'NFLX': 1.3,
+        'AMZN': 1.2, 'GOOGL': 1.1, 'MSFT': 1.0, 'AAPL': 0.9
+    }
+    return volatility_factors.get(ticker, 1.2)  # Default for custom tickers
+
+def calculate_stock_entry_probability(ticker: str, anchor_type: str, time_slot: str) -> float:
+    """Calculate stock entry probability with time-of-day and ticker adjustments"""
+    # Base probabilities by anchor type
+    base_probs = {
+        'HIGH': 60, 'CLOSE': 65, 'LOW': 60,
+        'SKYLINE': 70, 'BASELINE': 75
+    }
+    
+    base_prob = base_probs.get(anchor_type, 60)
+    
+    # Time-of-day adjustments
+    hour = int(time_slot.split(':')[0])
+    if hour in [9, 10]:  # Market open volatility
+        time_adj = 10
+    elif hour in [13, 14]:  # End of day momentum
+        time_adj = 5
+    else:
+        time_adj = 0
+    
+    # Ticker-specific adjustments
+    ticker_adj = 0
+    if ticker in ['TSLA', 'NVDA', 'META']:  # High momentum stocks
+        ticker_adj = 5
+    elif ticker in ['AAPL', 'MSFT']:  # Stable stocks
+        ticker_adj = -5
+    
+    final_prob = base_prob + time_adj + ticker_adj
+    return min(90, max(40, final_prob))
+
+def calculate_stock_target_probability(ticker: str, target_distance: float, stop_distance: float, target_num: int) -> float:
+    """Calculate target probability adjusted for stock characteristics"""
+    rr_ratio = target_distance / stop_distance
+    volatility_factor = get_stock_volatility_factor(ticker)
+    
+    if target_num == 1:  # TP1
+        base_prob = 65 - (rr_ratio - 1.5) * 8
+        # Higher volatility = higher target probability
+        vol_adj = (volatility_factor - 1) * 10
+    else:  # TP2
+        base_prob = 40 - (rr_ratio - 2.5) * 6
+        vol_adj = (volatility_factor - 1) * 8
+    
+    final_prob = base_prob + vol_adj
+    return min(80, max(20, final_prob))
