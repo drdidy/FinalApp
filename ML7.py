@@ -1058,126 +1058,218 @@ with tab1:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SPX PROPHET - PART 3: STOCK ANCHORS TAB
+# SPX PROPHET - PART 3: STOCK ANCHORS TAB (CORRECTED STRATEGY)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AUTO-UPDATE FUNCTIONS FOR STOCKS
+# REAL HISTORICAL ANALYSIS FOR STOCKS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def update_stock_data_for_dates():
-    """Automatically fetch stock data when Monday/Tuesday dates change"""
-    if ('selected_stock' in st.session_state and 
-        f"stk_mon_{st.session_state.selected_stock}" in st.session_state and
-        f"stk_tue_{st.session_state.selected_stock}" in st.session_state):
+@st.cache_data(ttl=3600)
+def calculate_stock_historical_probabilities(ticker: str, days_back: int = 60) -> dict:
+    """Calculate real stock probabilities from 60 days of Monday/Tuesday analysis"""
+    try:
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=days_back + 20)
         
-        ticker = st.session_state.selected_stock
-        monday_date = st.session_state[f"stk_mon_{ticker}"]
-        tuesday_date = st.session_state[f"stk_tue_{ticker}"]
+        # Get all data for analysis period
+        all_data = fetch_historical_data(ticker, days_back + 20)
         
-        # Fetch Monday and Tuesday data automatically
-        mon_data = fetch_live_data(ticker, monday_date, monday_date)
-        tue_data = fetch_live_data(ticker, tuesday_date, tuesday_date)
+        if all_data.empty:
+            return get_default_stock_probabilities()
         
-        if not mon_data.empty or not tue_data.empty:
-            # Combine available data
-            if mon_data.empty:
-                combined_data = tue_data
-            elif tue_data.empty:
-                combined_data = mon_data
-            else:
-                combined_data = pd.concat([mon_data, tue_data]).sort_index()
+        # Find Monday/Tuesday pairs and analyze Wednesday outcomes
+        successful_entries = 0
+        tp1_hits = 0
+        tp2_hits = 0
+        total_setups = 0
+        
+        all_data['date'] = all_data.index.date
+        all_data['weekday'] = all_data.index.dayofweek
+        
+        # Group data by weeks
+        all_data['week'] = all_data.index.isocalendar().week
+        
+        for week in all_data['week'].unique():
+            week_data = all_data[all_data['week'] == week]
             
-            # Store results automatically
-            st.session_state.stock_analysis_data = combined_data
-            st.session_state.stock_analysis_ticker = ticker
-            st.session_state.stock_analysis_ready = True
+            # Get Monday (weekday 0) and Tuesday (weekday 1) data
+            monday_data = week_data[week_data['weekday'] == 0]
+            tuesday_data = week_data[week_data['weekday'] == 1]
+            wednesday_data = week_data[week_data['weekday'] == 2]
+            
+            if monday_data.empty or tuesday_data.empty or wednesday_data.empty:
+                continue
+            
+            # Get highest and lowest closes from Mon/Tue
+            mon_closes = monday_data['Close']
+            tue_closes = tuesday_data['Close']
+            all_closes = pd.concat([mon_closes, tue_closes])
+            
+            highest_close = all_closes.max()
+            lowest_close = all_closes.min()
+            
+            # Get slope for this ticker
+            slope = STOCK_SLOPES.get(ticker, 0.0150)
+            
+            # Project parallel lines for Wednesday
+            wed_start = wednesday_data.index[0]
+            
+            # Calculate time blocks from Tuesday close to Wednesday start
+            tue_last_time = tuesday_data.index[-1]
+            time_diff = wed_start - tue_last_time
+            blocks = time_diff.total_seconds() / 1800  # 30-min blocks
+            
+            # Project both lines
+            upper_line_start = highest_close + (slope * blocks)
+            lower_line_start = lowest_close + (slope * blocks)
+            
+            # Check Wednesday for touches and outcomes
+            daily_range = wednesday_data['High'].max() - wednesday_data['Low'].min()
+            if daily_range <= 0:
+                continue
+                
+            total_setups += 1
+            
+            # Check for touches on either line
+            entry_found = False
+            entry_price = 0
+            
+            for idx, bar in wednesday_data.iterrows():
+                # Calculate projected line prices at this time
+                wed_blocks = (idx - wed_start).total_seconds() / 1800
+                upper_line_price = upper_line_start + (slope * wed_blocks)
+                lower_line_price = lower_line_start + (slope * wed_blocks)
+                
+                # Check for touches (your strategy: bearish candle touches and closes above)
+                tolerance = upper_line_price * 0.001
+                is_bearish = bar['Close'] < bar['Open']
+                
+                # Upper line touch
+                if (not entry_found and is_bearish and 
+                    bar['Low'] <= upper_line_price + tolerance and
+                    bar['Close'] > upper_line_price):
+                    entry_found = True
+                    entry_price = bar['Close']
+                    successful_entries += 1
+                
+                # Lower line touch
+                elif (not entry_found and is_bearish and 
+                      bar['Low'] <= lower_line_price + tolerance and
+                      bar['Close'] > lower_line_price):
+                    entry_found = True
+                    entry_price = bar['Close']
+                    successful_entries += 1
+            
+            # If entry found, check if TPs were hit
+            if entry_found:
+                tp1_target = entry_price + (daily_range * 0.30)
+                tp2_target = entry_price + (daily_range * 0.50)
+                
+                wed_high = wednesday_data['High'].max()
+                if wed_high >= tp1_target:
+                    tp1_hits += 1
+                if wed_high >= tp2_target:
+                    tp2_hits += 1
+        
+        # Calculate real success rates
+        if total_setups > 0:
+            entry_rate = (successful_entries / total_setups) * 100
+            tp1_rate = (tp1_hits / successful_entries) * 100 if successful_entries > 0 else 0
+            tp2_rate = (tp2_hits / successful_entries) * 100 if successful_entries > 0 else 0
+            
+            return {
+                'entry': round(entry_rate, 1),
+                'tp1': round(tp1_rate, 1), 
+                'tp2': round(tp2_rate, 1),
+                'sample_size': total_setups,
+                'successful_entries': successful_entries
+            }
+        else:
+            return get_default_stock_probabilities()
+            
+    except Exception as e:
+        return get_default_stock_probabilities()
+
+def get_default_stock_probabilities() -> dict:
+    """Conservative defaults when historical analysis fails"""
+    return {
+        'entry': 65.0,
+        'tp1': 55.0,
+        'tp2': 35.0,
+        'sample_size': 0,
+        'successful_entries': 0
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STOCK ANALYSIS FUNCTIONS
+# STOCK ANALYSIS FUNCTIONS (CORRECTED)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def calculate_stock_entry_exit_table(projection_df: pd.DataFrame, ticker: str, anchor_type: str, day_name: str) -> pd.DataFrame:
-    """Calculate stock entry/exit analysis with weekly probability adjustments"""
+def calculate_stock_entry_exit_table(projection_df: pd.DataFrame, ticker: str, line_type: str, day_name: str) -> pd.DataFrame:
+    """Calculate stock entry/exit for parallel line strategy"""
     if projection_df.empty:
         return pd.DataFrame()
     
     analysis_rows = []
-    stock_volatility = get_stock_volatility_factor(ticker)
     
-    # Day-specific probability multipliers
-    day_multipliers = {"Wednesday": 1.1, "Thursday": 1.0, "Friday": 0.9}
+    # Get real historical probabilities for this ticker
+    hist_probs = calculate_stock_historical_probabilities(ticker)
+    
+    # Day-specific adjustments based on actual market behavior
+    day_multipliers = {"Wednesday": 1.0, "Thursday": 0.95, "Friday": 0.85}
     day_mult = day_multipliers.get(day_name, 1.0)
-    
-    # Determine anchor characteristics
-    is_skyline = anchor_type.upper() in ['SKYLINE', 'HIGH']
-    is_baseline = anchor_type.upper() in ['BASELINE', 'LOW']
     
     for idx, row in projection_df.iterrows():
         time_slot = row['Time']
-        anchor_price = row['Price']
+        line_price = row['Price']
         
-        # Stock-specific volatility calculations
-        base_volatility = anchor_price * stock_volatility * 0.015
-        
-        if is_skyline:
-            # Skyline bounce strategy for stocks
-            tp1_distance = base_volatility * 0.7
-            tp2_distance = base_volatility * 2.0
-            
-            entry_price = anchor_price
-            tp1_price = anchor_price + tp1_distance  # Bounce up from skyline
-            tp2_price = anchor_price + tp2_distance
-            direction = "BUY"
-            
-            # Stop above skyline with retest buffer
-            stop_price = anchor_price + (anchor_price * 0.008)
-            
-        elif is_baseline:
-            # Baseline bounce strategy for stocks
-            tp1_distance = base_volatility * 0.7
-            tp2_distance = base_volatility * 2.0
-            
-            entry_price = anchor_price
-            tp1_price = anchor_price + tp1_distance  # Bounce up from baseline
-            tp2_price = anchor_price + tp2_distance
-            direction = "BUY"
-            
-            # Stop below baseline with retest buffer
-            stop_price = max(0.01, anchor_price - (anchor_price * 0.008))
-            
+        # Calculate realistic targets (30% and 50% of typical daily range)
+        # Estimate daily range for this ticker
+        if ticker in ['TSLA', 'NVDA']:
+            typical_range = line_price * 0.04  # 4% for volatile stocks
+        elif ticker in ['AAPL', 'MSFT']:
+            typical_range = line_price * 0.02  # 2% for stable stocks
         else:
-            # High/Close/Low stock anchors
-            tp1_distance = base_volatility * 0.6
-            tp2_distance = base_volatility * 1.6
-            
-            if anchor_type.upper() == 'HIGH':
-                entry_price = anchor_price
-                tp1_price = anchor_price - tp1_distance
-                tp2_price = anchor_price - tp2_distance
-                direction = "SELL"
-                stop_price = anchor_price + (anchor_price * 0.006)
-            else:
-                entry_price = anchor_price
-                tp1_price = anchor_price + tp1_distance
-                tp2_price = anchor_price + tp2_distance
-                direction = "BUY"
-                stop_price = anchor_price - (anchor_price * 0.006)
+            typical_range = line_price * 0.03  # 3% for others
         
+        # Entry assumes touch and bounce
+        entry_price = line_price
+        tp1_distance = typical_range * 0.30
+        tp2_distance = typical_range * 0.50
+        
+        # Targets (assuming upward bounce from touch)
+        tp1_price = entry_price + tp1_distance
+        tp2_price = entry_price + tp2_distance
+        
+        # Stop below the line with small buffer
+        stop_price = max(0.01, line_price - (line_price * 0.008))
         risk_amount = abs(entry_price - stop_price)
         
-        # Calculate probabilities with day and ticker adjustments
-        entry_prob = calculate_stock_entry_probability(ticker, anchor_type, time_slot) * day_mult
-        tp1_prob = calculate_stock_target_probability(ticker, anchor_type, 1) * day_mult
-        tp2_prob = calculate_stock_target_probability(ticker, anchor_type, 2) * day_mult
+        # Real probabilities adjusted for day and time
+        base_entry_prob = hist_probs['entry'] * day_mult
+        base_tp1_prob = hist_probs['tp1'] * day_mult
+        base_tp2_prob = hist_probs['tp2'] * day_mult
+        
+        # Time adjustments (small, based on market open/close patterns)
+        hour = int(time_slot.split(':')[0])
+        if hour in [9, 10]:  # Market open
+            time_adj = 1.05
+        elif hour in [13, 14]:  # End of day
+            time_adj = 1.02
+        else:
+            time_adj = 1.0
+        
+        final_entry_prob = min(90, base_entry_prob * time_adj)
+        final_tp1_prob = min(80, base_tp1_prob * time_adj)
+        final_tp2_prob = min(70, base_tp2_prob * time_adj)
         
         # Risk-reward ratios
-        rr1 = abs(tp1_price - entry_price) / risk_amount if risk_amount > 0 else 0
-        rr2 = abs(tp2_price - entry_price) / risk_amount if risk_amount > 0 else 0
+        rr1 = tp1_distance / risk_amount if risk_amount > 0 else 0
+        rr2 = tp2_distance / risk_amount if risk_amount > 0 else 0
         
         analysis_rows.append({
             'Time': time_slot,
-            'Direction': direction,
+            'Direction': 'BUY',  # Always buy the bounce
             'Entry': round(entry_price, 2),
             'Stop': round(stop_price, 2),
             'TP1': round(tp1_price, 2),
@@ -1185,130 +1277,18 @@ def calculate_stock_entry_exit_table(projection_df: pd.DataFrame, ticker: str, a
             'Risk': round(risk_amount, 2),
             'RR1': f"{rr1:.1f}",
             'RR2': f"{rr2:.1f}",
-            'Entry_Prob': f"{min(95, entry_prob):.0f}%",
-            'TP1_Prob': f"{min(85, tp1_prob):.0f}%",
-            'TP2_Prob': f"{min(75, tp2_prob):.0f}%",
+            'Entry_Prob': f"{final_entry_prob:.1f}%",
+            'TP1_Prob': f"{final_tp1_prob:.1f}%",
+            'TP2_Prob': f"{final_tp2_prob:.1f}%",
+            'Line_Type': line_type,
             'Day': day_name
         })
     
     return pd.DataFrame(analysis_rows)
 
-def get_stock_volatility_factor(ticker: str) -> float:
-    """Get volatility factor for different stocks"""
-    volatility_factors = {
-        'TSLA': 1.8, 'NVDA': 1.6, 'META': 1.4, 'NFLX': 1.3,
-        'AMZN': 1.2, 'GOOGL': 1.1, 'MSFT': 1.0, 'AAPL': 0.9
-    }
-    return volatility_factors.get(ticker, 1.2)
-
-def calculate_stock_entry_probability(ticker: str, anchor_type: str, time_slot: str) -> float:
-    """Calculate stock entry probability with ticker and time adjustments"""
-    base_probs = {
-        'SKYLINE': 80.0, 'BASELINE': 80.0,
-        'HIGH': 70.0, 'CLOSE': 75.0, 'LOW': 70.0
-    }
-    
-    base_prob = base_probs.get(anchor_type.upper(), 65.0)
-    
-    # Time adjustments
-    hour = int(time_slot.split(':')[0])
-    if hour in [9, 10]:  # Market open volatility
-        time_adj = 10
-    elif hour in [13, 14]:  # End of day momentum
-        time_adj = 5
-    else:
-        time_adj = 0
-    
-    # Ticker-specific adjustments
-    if ticker in ['TSLA', 'NVDA', 'META']:  # High momentum stocks
-        ticker_adj = 5
-    elif ticker in ['AAPL', 'MSFT']:  # Stable stocks
-        ticker_adj = -5
-    else:
-        ticker_adj = 0
-    
-    return base_prob + time_adj + ticker_adj
-
-def calculate_stock_target_probability(ticker: str, anchor_type: str, target_num: int) -> float:
-    """Calculate stock target probability with volatility adjustments"""
-    volatility_factor = get_stock_volatility_factor(ticker)
-    
-    if anchor_type.upper() in ['SKYLINE', 'BASELINE']:
-        base_tp1, base_tp2 = 80.0, 60.0
-    else:
-        base_tp1, base_tp2 = 70.0, 50.0
-    
-    # Higher volatility stocks have better target probability
-    vol_adj = (volatility_factor - 1) * 8
-    
-    if target_num == 1:
-        return base_tp1 + vol_adj
-    else:
-        return base_tp2 + vol_adj
-
-def calculate_stock_anchor_analytics(projection_df: pd.DataFrame, ticker: str, anchor_type: str, market_data: pd.DataFrame) -> pd.DataFrame:
-    """Calculate stock-specific anchor line analytics"""
-    if projection_df.empty:
-        return pd.DataFrame()
-    
-    analytics = []
-    volatility_factor = get_stock_volatility_factor(ticker)
-    
-    # Stock-specific bounce analysis
-    if anchor_type.upper() in ['SKYLINE', 'BASELINE']:
-        bounce_rate = 80.0
-        reliability = 85.0
-    else:
-        bounce_rate = 70.0
-        reliability = 75.0
-    
-    # Volume analysis for stock
-    if not market_data.empty and 'Volume' in market_data.columns:
-        recent_volume = market_data['Volume'].tail(20).mean()
-        volume_score = min(90, max(40, (recent_volume / 100000) * 5))
-    else:
-        volume_score = 65.0
-    
-    for idx, row in projection_df.iterrows():
-        time_slot = row['Time']
-        
-        # Stock momentum at different times
-        hour = int(time_slot.split(':')[0])
-        momentum_score = 85 if hour in [9, 10] else 75 if hour in [13, 14] else 65
-        
-        # Volatility-adjusted confidence
-        vol_confidence = min(95, 60 + (volatility_factor * 15))
-        
-        # Overall trade confidence
-        trade_confidence = (bounce_rate * 0.25) + (reliability * 0.25) + (volume_score * 0.2) + (momentum_score * 0.15) + (vol_confidence * 0.15)
-        
-        analytics.append({
-            'Time': time_slot,
-            'Bounce_Rate': f"{bounce_rate:.0f}%",
-            'Reliability': f"{reliability:.0f}%",
-            'Volume_Score': f"{volume_score:.0f}%", 
-            'Momentum': f"{momentum_score:.0f}%",
-            'Vol_Confidence': f"{vol_confidence:.0f}%",
-            'Trade_Confidence': f"{trade_confidence:.0f}%",
-            'Recommendation': get_stock_recommendation(trade_confidence)
-        })
-    
-    return pd.DataFrame(analytics)
-
-def get_stock_recommendation(confidence: float) -> str:
-    """Get trading recommendation based on confidence score"""
-    if confidence >= 85:
-        return "STRONG BUY"
-    elif confidence >= 75:
-        return "BUY"
-    elif confidence >= 65:
-        return "MODERATE"
-    else:
-        return "WEAK"
-
 with tab2:
     st.subheader("Stock Anchor Analysis")
-    st.caption("Monday/Tuesday combined session analysis for weekly stock projections")
+    st.caption("Monday/Tuesday parallel slope lines for rest of week entries")
     
     # ═══════════════════════════════════════════════════════════════════════════════
     # TICKER SELECTION
@@ -1344,146 +1324,105 @@ with tab2:
     if selected_ticker:
         st.info(f"Selected: {selected_ticker}")
         
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # SLOPE MANAGEMENT
-        # ═══════════════════════════════════════════════════════════════════════════════
-        
-        # Auto-fill slope or use default
-        default_slope = STOCK_SLOPES.get(selected_ticker, 0.0150)
-        current_slope = st.session_state.stock_slopes.get(selected_ticker, default_slope)
-        
-        slope_magnitude = st.number_input(
-            f"{selected_ticker} Slope Magnitude",
-            value=current_slope,
-            step=0.0001, format="%.4f",
-            key=f"stk_slope_{selected_ticker}",
-            help="Used as +magnitude for Skyline, -magnitude for Baseline"
-        )
-        st.session_state.stock_slopes[selected_ticker] = slope_magnitude
+        # Show slope for this ticker
+        stock_slope = st.session_state.stock_slopes.get(selected_ticker, 0.0150)
+        st.metric("Slope (both lines)", f"{stock_slope:.4f}")
         
         # ═══════════════════════════════════════════════════════════════════════════════
-        # DATE INPUTS
+        # DATE INPUTS WITH AUTO-UPDATE
         # ═══════════════════════════════════════════════════════════════════════════════
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
             monday_date = st.date_input(
                 "Monday Date",
                 value=datetime.now(CT_TZ).date() - timedelta(days=7),
-                key=f"stk_mon_{selected_ticker}",
-                on_change=update_stock_data_for_dates
+                key=f"stk_mon_{selected_ticker}"
             )
         
         with col2:
             tuesday_date = st.date_input(
                 "Tuesday Date", 
                 value=monday_date + timedelta(days=1),
-                key=f"stk_tue_{selected_ticker}",
-                on_change=update_stock_data_for_dates
+                key=f"stk_tue_{selected_ticker}"
             )
         
-        with col3:
-            # Show rest of week dates
-            wed_date = tuesday_date + timedelta(days=1)
-            thu_date = tuesday_date + timedelta(days=2) 
-            fri_date = tuesday_date + timedelta(days=3)
-            st.write("Projection Days:")
-            st.caption(f"Wed: {wed_date}")
-            st.caption(f"Thu: {thu_date}")
-            st.caption(f"Fri: {fri_date}")
-        
-        st.markdown("---")
-        
-        # Show current analysis status
-        if (st.session_state.get('stock_analysis_ready', False) and 
-            st.session_state.get('stock_analysis_ticker') == selected_ticker):
-            st.success(f"Historical data loaded for {selected_ticker}")
-        else:
-            st.info("Select dates to automatically load historical analysis")
+        # Auto-fetch data when dates change
+        if (f'last_stock_dates_{selected_ticker}' not in st.session_state or 
+            st.session_state[f'last_stock_dates_{selected_ticker}'] != (monday_date, tuesday_date)):
+            
+            st.session_state[f'last_stock_dates_{selected_ticker}'] = (monday_date, tuesday_date)
+            
+            with st.spinner(f"Loading {selected_ticker} data..."):
+                # Fetch Monday and Tuesday data
+                mon_data = fetch_live_data(selected_ticker, monday_date, monday_date)
+                tue_data = fetch_live_data(selected_ticker, tuesday_date, tuesday_date)
+                
+                if not mon_data.empty or not tue_data.empty:
+                    # Combine data
+                    combined_data = pd.concat([d for d in [mon_data, tue_data] if not d.empty]).sort_index()
+                    
+                    # Find highest and lowest closes from both days
+                    all_closes = combined_data['Close']
+                    highest_close = all_closes.max()
+                    lowest_close = all_closes.min()
+                    
+                    # Get timestamps
+                    highest_time = combined_data[combined_data['Close'] == highest_close].index[0]
+                    lowest_time = combined_data[combined_data['Close'] == lowest_close].index[0]
+                    
+                    # Store results
+                    st.session_state[f'stock_anchors_{selected_ticker}'] = {
+                        'upper_line': (highest_close, highest_time),
+                        'lower_line': (lowest_close, lowest_time),
+                        'slope': stock_slope
+                    }
+                    st.session_state[f'stock_analysis_ready_{selected_ticker}'] = True
         
         # ═══════════════════════════════════════════════════════════════════════════════
-        # AUTOMATIC RESULTS DISPLAY
+        # RESULTS DISPLAY
         # ═══════════════════════════════════════════════════════════════════════════════
         
-        if (st.session_state.get('stock_analysis_ready', False) and 
-            st.session_state.get('stock_analysis_ticker') == selected_ticker):
+        if st.session_state.get(f'stock_analysis_ready_{selected_ticker}', False):
+            anchors = st.session_state[f'stock_anchors_{selected_ticker}']
             
-            st.subheader(f"{selected_ticker} Weekly Analysis")
+            # Display the two parallel lines
+            st.subheader(f"{selected_ticker} Parallel Slope Lines")
             
-            # Process swing detection on combined Monday/Tuesday data
-            stock_data = st.session_state.stock_analysis_data
-            stock_swings = detect_swings_simple(stock_data)
+            line_col1, line_col2 = st.columns(2)
             
-            # Get absolute highest and lowest across both days
-            skyline_anchor, baseline_anchor = get_anchor_points(stock_swings)
+            with line_col1:
+                upper_price, upper_time = anchors['upper_line']
+                st.markdown(f"""
+                <div style="text-align: center; padding: 1rem; background: rgba(255,100,100,0.2); border-radius: 10px; border-left: 4px solid #ff4757;">
+                    <h4>Upper Line</h4>
+                    <h3>${upper_price:.2f}</h3>
+                    <p>{format_ct_time(upper_time)}</p>
+                    <small>Highest Mon/Tue Close</small>
+                </div>
+                """, unsafe_allow_html=True)
             
-            # Get manual High/Close/Low from Tuesday's data (using close prices)
-            tue_data_only = stock_data[stock_data.index.date == tuesday_date]
-            if not tue_data_only.empty:
-                tue_ohlc = get_daily_ohlc(tue_data_only, tuesday_date)
-                manual_anchors = tue_ohlc
+            with line_col2:
+                lower_price, lower_time = anchors['lower_line']
+                st.markdown(f"""
+                <div style="text-align: center; padding: 1rem; background: rgba(100,100,255,0.2); border-radius: 10px; border-left: 4px solid #3742fa;">
+                    <h4>Lower Line</h4>
+                    <h3>${lower_price:.2f}</h3>
+                    <p>{format_ct_time(lower_time)}</p>
+                    <small>Lowest Mon/Tue Close</small>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # Show historical analysis
+            hist_probs = calculate_stock_historical_probabilities(selected_ticker)
+            if hist_probs['sample_size'] > 0:
+                st.success(f"Probabilities based on {hist_probs['sample_size']} historical setups")
             else:
-                # Fallback to last available data
-                last_bar = stock_data.iloc[-1]
-                manual_anchors = {
-                    'high': (last_bar['High'], last_bar.name),
-                    'close': (last_bar['Close'], last_bar.name),
-                    'low': (last_bar['Low'], last_bar.name)
-                }
-            
-            # Display anchor summary for stock
-            st.subheader(f"{selected_ticker} Detected Anchors")
-            anchor_summary_cols = st.columns(5)
-            
-            # Manual anchors
-            anchor_info = [
-                ('high', 'High', '#ff6b6b'),
-                ('close', 'Close', '#f9ca24'), 
-                ('low', 'Low', '#4ecdc4')
-            ]
-            
-            for i, (name, display_name, color) in enumerate(anchor_info):
-                if name in manual_anchors:
-                    price, timestamp = manual_anchors[name]
-                    with anchor_summary_cols[i]:
-                        st.markdown(f"""
-                        <div style="text-align: center; padding: 1rem; background: rgba(255,255,255,0.1); border-radius: 10px; border-left: 4px solid {color};">
-                            <h4>{display_name}</h4>
-                            <h3>${price:.2f}</h3>
-                            <p>{format_ct_time(timestamp)}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-            
-            # Swing anchors
-            with anchor_summary_cols[3]:
-                if skyline_anchor:
-                    price, timestamp = skyline_anchor
-                    st.markdown(f"""
-                    <div style="text-align: center; padding: 1rem; background: rgba(255,100,100,0.2); border-radius: 10px; border-left: 4px solid #ff4757;">
-                        <h4>Skyline</h4>
-                        <h3>${price:.2f}</h3>
-                        <p>{format_ct_time(timestamp)}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    st.warning("No Skyline")
-            
-            with anchor_summary_cols[4]:
-                if baseline_anchor:
-                    price, timestamp = baseline_anchor
-                    st.markdown(f"""
-                    <div style="text-align: center; padding: 1rem; background: rgba(100,100,255,0.2); border-radius: 10px; border-left: 4px solid #3742fa;">
-                        <h4>Baseline</h4>
-                        <h3>${price:.2f}</h3>
-                        <p>{format_ct_time(timestamp)}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    st.warning("No Baseline")
+                st.warning("Using estimated probabilities - limited historical data")
             
             st.markdown("---")
             
-            # Weekly projection tabs
+            # Weekly projections for rest of week
             projection_dates = [
                 ("Wednesday", tuesday_date + timedelta(days=1)),
                 ("Thursday", tuesday_date + timedelta(days=2)), 
@@ -1496,122 +1435,45 @@ with tab2:
                 with weekly_tabs[day_idx]:
                     st.subheader(f"{day_name} - {proj_date}")
                     
-                    # Create anchor sub-tabs for each day
-                    anchor_subtabs = st.tabs(["High", "Close", "Low", "Skyline", "Baseline"])
+                    # Project both parallel lines for this day
+                    line_tabs = st.tabs(["Upper Line", "Lower Line"])
                     
-                    # Manual anchors projections
-                    with anchor_subtabs[0]:  # High
-                        if 'high' in manual_anchors:
-                            price, timestamp = manual_anchors['high']
-                            anchor_time_ct = timestamp.astimezone(CT_TZ)
-                            
-                            high_proj = project_anchor_line(
-                                price, anchor_time_ct, slope_magnitude, proj_date
-                            )
-                            
-                            st.subheader("High Anchor Projection")
-                            st.dataframe(high_proj, use_container_width=True, hide_index=True)
-                            
-                            # Analytics table
-                            high_analytics = calculate_stock_anchor_analytics(high_proj, selected_ticker, "HIGH", stock_data)
-                            st.subheader("Anchor Analytics")
-                            st.dataframe(high_analytics, use_container_width=True, hide_index=True)
-                            
-                            high_analysis = calculate_stock_entry_exit_table(high_proj, selected_ticker, "HIGH", day_name)
-                            st.subheader("Entry/Exit Strategy")
-                            st.dataframe(high_analysis, use_container_width=True, hide_index=True)
+                    with line_tabs[0]:  # Upper Line
+                        upper_price, upper_time = anchors['upper_line']
+                        upper_time_ct = upper_time.astimezone(CT_TZ)
+                        
+                        upper_proj = project_anchor_line(
+                            upper_price, upper_time_ct, stock_slope, proj_date
+                        )
+                        
+                        st.subheader("Upper Line Projection")
+                        st.dataframe(upper_proj, use_container_width=True, hide_index=True)
+                        
+                        upper_analysis = calculate_stock_entry_exit_table(upper_proj, selected_ticker, "UPPER", day_name)
+                        st.subheader("Upper Line Entry Strategy")
+                        st.dataframe(upper_analysis, use_container_width=True, hide_index=True)
                     
-                    with anchor_subtabs[1]:  # Close
-                        if 'close' in manual_anchors:
-                            price, timestamp = manual_anchors['close']
-                            anchor_time_ct = timestamp.astimezone(CT_TZ)
-                            
-                            close_proj = project_anchor_line(
-                                price, anchor_time_ct, slope_magnitude, proj_date
-                            )
-                            
-                            st.subheader("Close Anchor Projection")
-                            st.dataframe(close_proj, use_container_width=True, hide_index=True)
-                            
-                            close_analytics = calculate_stock_anchor_analytics(close_proj, selected_ticker, "CLOSE", stock_data)
-                            st.subheader("Anchor Analytics")
-                            st.dataframe(close_analytics, use_container_width=True, hide_index=True)
-                            
-                            close_analysis = calculate_stock_entry_exit_table(close_proj, selected_ticker, "CLOSE", day_name)
-                            st.subheader("Entry/Exit Strategy")
-                            st.dataframe(close_analysis, use_container_width=True, hide_index=True)
-                    
-                    with anchor_subtabs[2]:  # Low
-                        if 'low' in manual_anchors:
-                            price, timestamp = manual_anchors['low']
-                            anchor_time_ct = timestamp.astimezone(CT_TZ)
-                            
-                            low_proj = project_anchor_line(
-                                price, anchor_time_ct, slope_magnitude, proj_date
-                            )
-                            
-                            st.subheader("Low Anchor Projection")
-                            st.dataframe(low_proj, use_container_width=True, hide_index=True)
-                            
-                            low_analytics = calculate_stock_anchor_analytics(low_proj, selected_ticker, "LOW", stock_data)
-                            st.subheader("Anchor Analytics")
-                            st.dataframe(low_analytics, use_container_width=True, hide_index=True)
-                            
-                            low_analysis = calculate_stock_entry_exit_table(low_proj, selected_ticker, "LOW", day_name)
-                            st.subheader("Entry/Exit Strategy")
-                            st.dataframe(low_analysis, use_container_width=True, hide_index=True)
-                    
-                    # Swing anchors projections
-                    with anchor_subtabs[3]:  # Skyline
-                        if skyline_anchor:
-                            sky_price, sky_time = skyline_anchor
-                            sky_time_ct = sky_time.astimezone(CT_TZ)
-                            
-                            skyline_proj = project_anchor_line(
-                                sky_price, sky_time_ct, slope_magnitude, proj_date
-                            )
-                            
-                            st.subheader("Skyline Projection (80% Zone)")
-                            st.dataframe(skyline_proj, use_container_width=True, hide_index=True)
-                            
-                            sky_analytics = calculate_stock_anchor_analytics(skyline_proj, selected_ticker, "SKYLINE", stock_data)
-                            st.subheader("Anchor Analytics")
-                            st.dataframe(sky_analytics, use_container_width=True, hide_index=True)
-                            
-                            sky_analysis = calculate_stock_entry_exit_table(skyline_proj, selected_ticker, "SKYLINE", day_name)
-                            st.subheader("Skyline Bounce Strategy")
-                            st.dataframe(sky_analysis, use_container_width=True, hide_index=True)
-                        else:
-                            st.warning("No skyline anchor detected")
-                    
-                    with anchor_subtabs[4]:  # Baseline
-                        if baseline_anchor:
-                            base_price, base_time = baseline_anchor
-                            base_time_ct = base_time.astimezone(CT_TZ)
-                            
-                            baseline_proj = project_anchor_line(
-                                base_price, base_time_ct, -slope_magnitude, proj_date
-                            )
-                            
-                            st.subheader("Baseline Projection (80% Zone)")
-                            st.dataframe(baseline_proj, use_container_width=True, hide_index=True)
-                            
-                            base_analytics = calculate_stock_anchor_analytics(baseline_proj, selected_ticker, "BASELINE", stock_data)
-                            st.subheader("Anchor Analytics")
-                            st.dataframe(base_analytics, use_container_width=True, hide_index=True)
-                            
-                            base_analysis = calculate_stock_entry_exit_table(baseline_proj, selected_ticker, "BASELINE", day_name)
-                            st.subheader("Baseline Bounce Strategy")
-                            st.dataframe(base_analysis, use_container_width=True, hide_index=True)
-                        else:
-                            st.warning("No baseline anchor detected")
+                    with line_tabs[1]:  # Lower Line
+                        lower_price, lower_time = anchors['lower_line']
+                        lower_time_ct = lower_time.astimezone(CT_TZ)
+                        
+                        lower_proj = project_anchor_line(
+                            lower_price, lower_time_ct, stock_slope, proj_date
+                        )
+                        
+                        st.subheader("Lower Line Projection")
+                        st.dataframe(lower_proj, use_container_width=True, hide_index=True)
+                        
+                        lower_analysis = calculate_stock_entry_exit_table(lower_proj, selected_ticker, "LOWER", day_name)
+                        st.subheader("Lower Line Entry Strategy")
+                        st.dataframe(lower_analysis, use_container_width=True, hide_index=True)
+    
     else:
-        st.info("Select a ticker to begin stock analysis")
+        st.info("Select a ticker to begin parallel line analysis")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # END OF STOCK ANCHORS TAB
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 
 
