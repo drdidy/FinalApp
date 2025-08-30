@@ -1,6 +1,7 @@
 # ============================================================
-# MarketLens Pro v5 — Part 1 of N (Revised with your slopes)
+# MarketLens Pro v5 — Part 1 of N
 # Core bootstrap: layout, theming, router, safe utilities
+# Append-only build: later parts are pasted BELOW this block.
 # ============================================================
 
 # (optional) pip:
@@ -8,14 +9,14 @@
 
 from __future__ import annotations
 import os
-from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from datetime import datetime
+from typing import Dict
 
 import pandas as pd
 import numpy as np
+import streamlit as st
 
-# Timezones (prefer zoneinfo; falls back to pytz if needed)
+# ---- Timezones (prefer zoneinfo; fallback to pytz) ----
 try:
     from zoneinfo import ZoneInfo
     CT = ZoneInfo("America/Chicago")
@@ -25,14 +26,12 @@ except Exception:
     CT = pytz.timezone("America/Chicago")
     UTC = pytz.UTC
 
-# Optional data providers
+# ---- Optional provider check (no calls yet in Part 1) ----
 try:
     import yfinance as yf  # noqa: F401
     HAS_YF = True
 except Exception:
     HAS_YF = False
-
-import streamlit as st
 
 
 # -----------------------------
@@ -40,10 +39,10 @@ import streamlit as st
 # -----------------------------
 APP_NAME = "MarketLens Pro v5"
 APP_TAGLINE = "Professional SPX & Equities Analysis"
-APP_VERSION = "5.0.0-part1r1"
+APP_VERSION = "5.0.0-P1"
 
 st.set_page_config(
-    page_title=f"{APP_NAME}",
+    page_title=APP_NAME,
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -51,55 +50,7 @@ st.set_page_config(
 
 
 # -----------------------------
-# Utilities
-# -----------------------------
-def now_ct() -> datetime:
-    """Current time in America/Chicago (handles DST)."""
-    return datetime.now(tz=CT)
-
-
-def to_ct(dt: datetime) -> datetime:
-    """Convert any aware/naive datetime to CT."""
-    if getattr(dt, "tzinfo", None) is None:
-        return dt.replace(tzinfo=CT)  # assume CT if naive
-    try:
-        return dt.astimezone(CT)
-    except Exception:
-        return dt.astimezone(CT)
-
-
-def to_utc(dt: datetime) -> datetime:
-    if getattr(dt, "tzinfo", None) is None:
-        return dt.replace(tzinfo=UTC)
-    try:
-        return dt.astimezone(UTC)
-    except Exception:
-        return dt.astimezone(UTC)
-
-
-def ensure_dtindex_utc(df: pd.DataFrame) -> pd.DataFrame:
-    """Safely ensure index is a UTC DatetimeIndex."""
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise TypeError("DataFrame index must be a DatetimeIndex")
-    tz = getattr(df.index, "tz", None)
-    if tz is None:
-        df.index = df.index.tz_localize(UTC)
-    elif tz != UTC:
-        df.index = df.index.tz_convert(UTC)
-    return df
-
-
-def get_env_flag(name: str, default: bool = False) -> bool:
-    v = str(os.environ.get(name, "")).strip().lower()
-    if v in ("1", "true", "yes", "y", "on"):
-        return True
-    if v in ("0", "false", "no", "n", "off"):
-        return False
-    return default
-
-
-# -----------------------------
-# Hidden model constants (your latest)
+# Hidden model constants (YOUR LATEST)
 # -----------------------------
 # Default Slopes per 30-minute block (SPX)
 SPX_SLOPES = {
@@ -119,17 +70,71 @@ STOCK_SLOPES = {
     "NFLX": 0.0230,
 }
 
+# Core symbols list (used later)
+CORE_SYMBOLS = list(STOCK_SLOPES.keys())
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def get_env_flag(name: str, default: bool = False) -> bool:
+    v = str(os.environ.get(name, "")).strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def now_ct() -> datetime:
+    """Current time in America/Chicago (DST-aware)."""
+    return datetime.now(tz=CT)
+
+
+def to_ct(dt: datetime) -> datetime:
+    """Convert any aware/naive datetime to CT."""
+    if getattr(dt, "tzinfo", None) is None:
+        return dt.replace(tzinfo=CT)  # assume CT if naive
+    try:
+        return dt.astimezone(CT)
+    except Exception:
+        return dt.astimezone(CT)
+
+
+def to_utc(dt: datetime) -> datetime:
+    """Convert any aware/naive datetime to UTC."""
+    if getattr(dt, "tzinfo", None) is None:
+        return dt.replace(tzinfo=UTC)
+    try:
+        return dt.astimezone(UTC)
+    except Exception:
+        return dt.astimezone(UTC)
+
+
+def ensure_dtindex_utc(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure a UTC DatetimeIndex (robust across pandas versions)."""
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError("DataFrame index must be a pandas.DatetimeIndex")
+    tz = getattr(df.index, "tz", None)
+    if tz is None:
+        df.index = df.index.tz_localize(UTC)
+    elif tz != UTC:
+        df.index = df.index.tz_convert(UTC)
+    return df
+
 
 # -----------------------------
 # Session state initialization
 # -----------------------------
 DEFAULT_THEME = {
-    "bg_gradient": "radial-gradient(1200px 800px at 10% -10%, rgba(255,255,255,0.06), transparent), "
-                   "linear-gradient(135deg, #0e0f13 0%, #0a0b10 40%, #0b111b 100%)",
+    "bg_gradient": (
+        "radial-gradient(1200px 800px at 10% -10%, rgba(255,255,255,0.06), transparent), "
+        "linear-gradient(135deg, #0e0f13 0%, #0a0b10 40%, #0b111b 100%)"
+    ),
     "card_bg": "rgba(255,255,255,0.06)",
     "card_border": "rgba(255,255,255,0.10)",
-    "accent": "#7dd3fc",
-    "accent_hi": "#22d3ee",
+    "accent": "#7dd3fc",      # sky-300
+    "accent_hi": "#22d3ee",   # cyan-400
     "text": "rgba(255,255,255,0.92)",
     "muted": "rgba(255,255,255,0.65)",
     "danger": "#ef4444",
@@ -137,23 +142,16 @@ DEFAULT_THEME = {
     "warning": "#f59e0b",
 }
 
-
 def init_state() -> None:
-    if "theme" not in st.session_state:
-        st.session_state["theme"] = DEFAULT_THEME.copy()
-    # store your latest constants, hidden from UI
-    if "spx_slopes" not in st.session_state:
-        st.session_state["spx_slopes"] = SPX_SLOPES.copy()
-    if "stock_slopes" not in st.session_state:
-        st.session_state["stock_slopes"] = STOCK_SLOPES.copy()
-    if "settings" not in st.session_state:
-        st.session_state["settings"] = {
-            "timezone": "America/Chicago",
-            "debug": get_env_flag("MLPRO_DEBUG", False),
-        }
-    if "nav" not in st.session_state:
-        st.session_state["nav"] = "Dashboard"
-
+    ss = st.session_state
+    ss.setdefault("theme", DEFAULT_THEME.copy())
+    ss.setdefault("spx_slopes", SPX_SLOPES.copy())     # hidden
+    ss.setdefault("stock_slopes", STOCK_SLOPES.copy()) # hidden
+    ss.setdefault("settings", {
+        "timezone": "America/Chicago",
+        "debug": get_env_flag("MLPRO_DEBUG", False),
+    })
+    ss.setdefault("nav", "Dashboard")
 
 init_state()
 
@@ -176,28 +174,24 @@ def inject_css(theme: Dict[str, str]) -> None:
         background: {bg};
       }}
 
-      /* Subtle moving stars (pure CSS) */
+      /* Subtle star sparkle */
       @keyframes floatSparkles {{
         0% {{ background-position: 0px 0px, 0px 0px; }}
         100% {{ background-position: 1000px 1000px, -800px 600px; }}
       }}
       [data-testid="stAppViewContainer"]::before {{
         content: "";
-        position: fixed;
-        inset: 0;
-        pointer-events: none;
+        position: fixed; inset: 0; pointer-events: none;
         background-image:
           radial-gradient(2px 2px at 20% 30%, rgba(255,255,255,0.12), transparent 40%),
           radial-gradient(1px 1px at 70% 10%, rgba(255,255,255,0.10), transparent 45%);
         animation: floatSparkles 60s linear infinite;
       }}
 
-      /* Global typography */
-      html, body, [data-testid="stAppViewContainer"] * {{
-        color: {text};
-      }}
+      /* Global type color */
+      html, body, [data-testid="stAppViewContainer"] * {{ color: {text}; }}
 
-      /* Sidebar (future-proof selector) */
+      /* Sidebar (future-proof) */
       section[data-testid="stSidebar"] > div {{
         background: {card};
         backdrop-filter: blur(22px);
@@ -205,9 +199,7 @@ def inject_css(theme: Dict[str, str]) -> None:
       }}
       section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
       section[data-testid="stSidebar"] label,
-      section[data-testid="stSidebar"] span {{
-        color: {muted};
-      }}
+      section[data-testid="stSidebar"] span {{ color: {muted}; }}
 
       /* Glass cards */
       .ml-card {{
@@ -224,49 +216,26 @@ def inject_css(theme: Dict[str, str]) -> None:
         border-color: {accent};
       }}
 
-      /* Pills */
       .pill {{
-        display: inline-block;
-        padding: 2px 10px;
-        border-radius: 999px;
-        border: 1px solid {border};
-        background: rgba(255,255,255,0.04);
-        color: {muted};
-        font-size: 12px;
+        display:inline-block; padding:2px 10px; border-radius:999px;
+        border:1px solid {border}; background: rgba(255,255,255,0.04);
+        color:{muted}; font-size:12px;
       }}
+      .brand-title {{ font-weight:700; letter-spacing:.3px; font-size:20px; }}
+      .muted {{ color:{muted}; }}
 
-      /* Headline */
-      .brand-title {{
-        font-weight: 700;
-        letter-spacing: 0.3px;
-        font-size: 20px;
-      }}
-      .muted {{
-        color: {muted};
-      }}
-
-      /* Buttons (slight glow on hover) */
       .stButton > button {{
-        border-radius: 12px;
-        border: 1px solid {border};
+        border-radius: 12px; border:1px solid {border};
         background: rgba(255,255,255,0.05);
         transition: box-shadow .2s ease, transform .2s ease, border-color .2s ease;
       }}
       .stButton > button:hover {{
-        border-color: {accent};
-        transform: translateY(-1px);
-        box-shadow: 0 10px 30px rgba(0,0,0,0.25);
-      }}
-
-      /* Tables */
-      .blank[data-testid="stTable"] table {{
-        border-radius: 12px;
-        overflow: hidden;
+        border-color:{accent}; transform: translateY(-1px);
+        box-shadow:0 10px 30px rgba(0,0,0,0.25);
       }}
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
-
 
 inject_css(st.session_state["theme"])
 
@@ -313,7 +282,9 @@ def topbar() -> None:
             f"""
             <div class="ml-card" style="text-align:center">
               <div class="muted">Mode</div>
-              <div style="font-size:18px; font-weight:600">{'Debug' if st.session_state['settings']['debug'] else 'Standard'}</div>
+              <div style="font-size:18px; font-weight:600">
+                {'Debug' if st.session_state['settings']['debug'] else 'Standard'}
+              </div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -321,7 +292,7 @@ def topbar() -> None:
 
 
 # -----------------------------
-# Pages (stubbed for Part 1)
+# Page stubs (real logic added later via append-only upgrades)
 # -----------------------------
 def page_dashboard():
     st.markdown("### Overview")
@@ -330,15 +301,14 @@ def page_dashboard():
         f"""
         <div class="ml-card">
           <div style="font-size:14px" class="muted">
-            Part 1 (layout, theme, router, utilities). Subsequent parts will add data fetchers,
-            SPX Skyline/Baseline, stock anchors, projections, and exports — while keeping model
-            constants (slopes) hidden from the UI.
+            Part 1 (layout, theme, router, utilities). Later parts will add data fetchers,
+            SPX Skyline/Baseline, Stock anchors, Signals/EMA, Analytics/Backtest, and Contract Tool —
+            while keeping slopes hidden from the UI.
           </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(
@@ -417,6 +387,7 @@ def page_about():
     )
 
 
+# Router map (we will update entries later in append-only Parts)
 PAGES = {
     "Dashboard": page_dashboard,
     "SPX • Skyline": page_spx_skyline,
