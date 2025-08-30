@@ -1,8 +1,12 @@
 # ============================================================
-# MarketLens Pro v5 — PART 1/?
-# Single-file app split across parts. Paste ALL parts into one file.
-# This part sets up: imports, constants, state, utils, theming, pages (stubs).
-# NOTE: Do NOT run yet. The final part will call render_app().
+# MarketLens Pro v5 — COMPLETE APP (single file)
+# Analytics-focused (no simulation). Advisory only.
+# - SPX Skyline/Baseline projections (08:30–14:30 CT)
+# - Stocks Skyline/Baseline (per-ticker, your STOCK_SLOPES)
+# - Contract Tool: entry/stop/target + probability overlay
+# - Signals & Probabilities engine (historical frequencies)
+# - yfinance normalizer (handles MultiIndex/duplicate columns)
+# - Brace-safe CSS (no f-string traps)
 # ============================================================
 
 from __future__ import annotations
@@ -17,7 +21,15 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 
-# Timezones: prefer zoneinfo; fall back to pytz
+# ---------- Streamlit page config (must be early) ----------
+st.set_page_config(
+    page_title="MarketLens Pro v5",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------- Timezones ----------
 try:
     from zoneinfo import ZoneInfo
     CT = ZoneInfo("America/Chicago")
@@ -29,17 +41,17 @@ except Exception:
     UTC = pytz.UTC
     _HAS_PYTZ = True
 
-# Optional data provider (used in later parts)
+# Optional data provider
 try:
     import yfinance as yf  # noqa: F401
     HAS_YF = True
 except Exception:
     HAS_YF = False
 
-# ---------- App meta (used later inside render_app) ----------
+# ---------- App meta ----------
 APP_NAME = "MarketLens Pro v5"
 APP_TAGLINE = "Analytics for SPX Entries (No Simulation • Advisory Only)"
-APP_VERSION = "6.0.0"
+APP_VERSION = "6.1.0"
 
 # ============================================================
 # HIDDEN MODEL CONSTANTS (your latest slopes)
@@ -64,7 +76,7 @@ STOCK_SLOPES = {
 CORE_SYMBOLS = list(STOCK_SLOPES.keys())
 
 # ============================================================
-# STRATEGY HYPOTHESES (scaffold; analytics only)
+# STRATEGY HYPOTHESES (analytics only)
 # ============================================================
 HYPOTHESES = {
     "H1_BASELINE_TOUCH_LONG": dict(
@@ -86,21 +98,19 @@ HYPOTHESES = {
 }
 
 PROB_KEYS = [
-    "direction_prob_up",     # P(up over next N blocks) given trigger
-    "direction_prob_down",   # P(down over next N blocks) given trigger
-    "entry_success_prob",    # P(target before stop) given trigger
-    "exit_success_prob",     # P(exit achieves chosen RR/time criteria)
+    "direction_prob_up",
+    "direction_prob_down",
+    "entry_success_prob",
+    "exit_success_prob",
 ]
 
 # ============================================================
-# UTILS (datetime, tz, small helpers)
+# UTILS
 # ============================================================
 def get_env_flag(name: str, default: bool = False) -> bool:
     v = str(os.environ.get(name, "")).strip().lower()
-    if v in ("1", "true", "yes", "y", "on"):
-        return True
-    if v in ("0", "false", "no", "n", "off"):
-        return False
+    if v in ("1", "true", "yes", "y", "on"): return True
+    if v in ("0", "false", "no", "n", "off"): return False
     return default
 
 def now_ct() -> datetime:
@@ -138,15 +148,54 @@ def ensure_dtindex_utc(df: pd.DataFrame) -> pd.DataFrame:
         df.index = df.index.tz_convert(UTC)
     return df
 
-# Trading day helpers (used later)
+def normalize_ohlcv(df: pd.DataFrame, symbol: str | None = None) -> pd.DataFrame:
+    """
+    Make yfinance output predictable:
+      - If MultiIndex columns, pick the given symbol or the only top level.
+      - Drop duplicate columns.
+      - Map 'Adj Close' -> 'Close' if 'Close' missing.
+      - Keep only ['Open','High','Low','Close','Volume'].
+      - Ensure numeric dtype for OHLCV.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # If MultiIndex (e.g., ('ES=F','Open')), reduce to one level
+    if isinstance(df.columns, pd.MultiIndex):
+        lv0 = df.columns.get_level_values(0)
+        if symbol is not None and symbol in set(lv0):
+            df = df.xs(symbol, axis=1, level=0, drop_level=True)
+        else:
+            uniq0 = list(dict.fromkeys(lv0))
+            if len(uniq0) == 1:
+                df = df.droplevel(0, axis=1)
+            else:
+                df = df.xs(uniq0[0], axis=1, level=0, drop_level=True)
+
+    # Remove duplicate column names
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()]
+
+    # Use Adj Close if Close missing
+    if "Close" not in df.columns and "Adj Close" in df.columns:
+        df = df.rename(columns={"Adj Close": "Close"})
+
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    if keep:
+        df = df[keep].copy()
+
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return df
+
+# Trading day helpers
 def previous_weekday(d: date) -> date:
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
+    while d.weekday() >= 5: d -= timedelta(days=1)
     return d
 
 def next_weekday(d: date) -> date:
-    while d.weekday() >= 5:
-        d += timedelta(days=1)
+    while d.weekday() >= 5: d += timedelta(days=1)
     return d
 
 # ============================================================
@@ -176,15 +225,16 @@ def init_state() -> None:
     ss.setdefault("spx_slopes", SPX_SLOPES.copy())
     ss.setdefault("stock_slopes", STOCK_SLOPES.copy())
 
-    # Analytics config (used by probability engine later)
+    # Analytics config
     ss.setdefault("analytics", {
         "lookahead_blocks": 4,  # N x 30-min blocks
-        "rr_target": 1.0,       # reward:risk for success calc
-        "stop_blocks": 2,       # stop horizon in blocks
-        "use_close_only": True, # close-to-close computations
+        "rr_target": 1.0,       # reward:risk
+        "stop_blocks": 2,       # not used directly (we use risk_points), kept for future
+        "use_close_only": True,
+        "risk_points": 5.0,     # default risk unit for entries
     })
 
-    # Contract tool (user will input overnight contract prices)
+    # Contract tool
     ss.setdefault("contracts", {
         "overnight_call_entry_price": None,  # call at swing low
         "overnight_put_entry_price": None,   # put at skyline touch
@@ -231,7 +281,7 @@ def inject_css(theme: Dict[str, str]) -> None:
       }
       /* Global type color */
       html, body, [data-testid="stAppViewContainer"] * { color: $text; }
-      /* Sidebar (future-proof) */
+      /* Sidebar */
       section[data-testid="stSidebar"] > div {
         background: $card;
         backdrop-filter: blur(22px);
@@ -326,149 +376,8 @@ def topbar():
         )
 
 # ============================================================
-# PAGE STUBS (real logic added in later parts)
+# RTH & session windows
 # ============================================================
-def page_dashboard():
-    st.markdown("### Overview")
-    n_consts = len(st.session_state["spx_slopes"]) + len(st.session_state["stock_slopes"])
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown(
-            """
-            <div class="ml-card">
-              <div class="muted">Strategy Focus</div>
-              <div style="font-size:20px; font-weight:700;">Analytics, not Simulation</div>
-              <div class="muted" style="margin-top:6px;">
-                Probabilities for direction, entry success, and exit success — advisory only.
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
-    with c2:
-        st.markdown(
-            f"""
-            <div class="ml-card">
-              <div class="muted">Hidden Model Vars</div>
-              <div style="font-size:22px; font-weight:700;">{n_consts} constants</div>
-              <div class="muted" style="margin-top:6px;">Slopes kept out of UI</div>
-            </div>
-            """, unsafe_allow_html=True)
-    with c3:
-        st.markdown(
-            """
-            <div class="ml-card">
-              <div class="muted">Key Hypotheses</div>
-              <div style="font-size:14px; margin-top:6px;">
-                • Baseline touch → Call bounce<br/>
-                • Skyline touch + overnight drop → Put follow-through
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-def page_spx_skyline():  # upgraded in later part
-    st.markdown("### SPX Skyline (placeholder)")
-    st.info("Will compute Skyline projections and support probability triggers in later parts.")
-
-def page_spx_baseline():  # upgraded in later part
-    st.markdown("### SPX Baseline (placeholder)")
-    st.info("Will compute Baseline projections and support probability triggers in later parts.")
-
-def page_signals_probabilities():  # added in later part
-    st.markdown("### Signals & Probabilities (placeholder)")
-    st.caption("Direction/Entry/Exit probabilities — computed from historical analytics (no simulation).")
-
-def page_contract_tool():  # added in later part
-    st.markdown("### Contract Tool (placeholder)")
-    st.caption("Input contract prices at swing lows/highs (overnight) to analyze RTH entries — advisory only.")
-
-def page_stocks_skyline():  # added in later part
-    st.markdown("### Stocks • Skyline (placeholder)")
-
-def page_stocks_baseline():  # added in later part
-    st.markdown("### Stocks • Baseline (placeholder)")
-
-def page_settings():
-    st.markdown("### Settings")
-    st.caption("Non-sensitive preferences only; model constants remain internal.")
-    cols = st.columns(3)
-    with cols[0]:
-        la = st.number_input("Lookahead blocks (30-min each)", min_value=1, max_value=16, value=4, step=1)
-    with cols[1]:
-        rr = st.number_input("Reward:Risk target", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-    with cols[2]:
-        sb = st.number_input("Stop horizon (blocks)", min_value=1, max_value=16, value=2, step=1)
-    st.session_state.setdefault("analytics", {})
-    st.session_state["analytics"].update({"lookahead_blocks": int(la), "rr_target": float(rr), "stop_blocks": int(sb)})
-
-def page_about():
-    st.markdown("### About")
-    st.write(
-        f"""**{APP_NAME}** — {APP_TAGLINE}
-- Version: {APP_VERSION}
-- Timezone: America/Chicago (CT)
-- Data: yfinance {'available' if HAS_YF else 'not detected'}
-- UI: Dark glassmorphism
-- Mode: Analytics only (no simulation). Not a trading app."""
-    )
-
-# Router (entries may be replaced/extended by later parts)
-PAGES = {
-    "Dashboard": page_dashboard,
-    "SPX • Skyline": page_spx_skyline,
-    "SPX • Baseline": page_spx_baseline,
-    "Signals • Probabilities": page_signals_probabilities,
-    "Contract • Tool": page_contract_tool,
-    "Stocks • Skyline": page_stocks_skyline,
-    "Stocks • Baseline": page_stocks_baseline,
-    "Settings": page_settings,
-    "About": page_about,
-}
-
-# ============================================================
-# APP RENDERER (called ONLY in the final part)
-# ============================================================
-def render_app() -> None:
-    # Must be called before any other Streamlit UI calls in a real run,
-    # but we purposely delay calling this until the final part.
-    st.set_page_config(
-        page_title=APP_NAME,
-        page_icon="📈",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-
-    # Initialize state and theming
-    init_state()
-    inject_css(st.session_state["theme"])
-
-    # Sidebar nav
-    with st.sidebar:
-        st.markdown("#### Navigation")
-        choice = st.radio(
-            "Choose a section",
-            list(PAGES.keys()),
-            index=list(PAGES.keys()).index(st.session_state.get("nav", "Dashboard")),
-            label_visibility="collapsed",
-        )
-        st.session_state["nav"] = choice
-        st.divider()
-        st.markdown("#### Quick Info")
-        st.caption(f"Local time (CT): {now_ct():%Y-%m-%d %I:%M %p}")
-
-    # Top bar + page body
-    topbar()
-    PAGES[st.session_state["nav"]]()
-
-
-
-
-
-# ============================================================
-# MarketLens Pro v5 — PART 2/?
-# Data helpers, ES window fetch, anchor selection, Skyline page v2
-# (This file still won't run until the final part calls render_app().)
-# ============================================================
-
-# ---------- RTH & session windows ----------
 RTH_START = time(8, 30)   # 08:30 CT
 RTH_END   = time(14, 30)  # 14:30 CT
 
@@ -480,7 +389,6 @@ def projection_day_default(now_ct_val: datetime) -> date:
     return d if d.weekday() < 5 else next_weekday(d)
 
 def generate_rth_times_ct(day: date) -> List[datetime]:
-    """30-min grid from 08:30 to 14:30 inclusive, in CT."""
     slots: List[datetime] = []
     t = datetime.combine(day, RTH_START, tzinfo=CT)
     end_dt = datetime.combine(day, RTH_END, tzinfo=CT)
@@ -488,9 +396,6 @@ def generate_rth_times_ct(day: date) -> List[datetime]:
         slots.append(t)
         t += timedelta(minutes=30)
     return slots
-
-def floor_to_30min(dt_ct: datetime) -> datetime:
-    return dt_ct.replace(minute=(dt_ct.minute // 30) * 30, second=0, microsecond=0)
 
 def _as_ct(dt_like) -> datetime:
     """Ensure tz-aware CT datetime from pandas.Timestamp or datetime."""
@@ -505,13 +410,14 @@ def _as_ct(dt_like) -> datetime:
         return dt_like.astimezone(CT)
     except Exception:
         try:
-            return dt_like.tz_convert(CT)  # pandas Timestamp
+            return dt_like.tz_convert(CT)  # pandas
         except Exception:
             return dt_like
 
-# ---------- yfinance fetchers ----------
+# ============================================================
+# yfinance fetchers (normalized)
+# ============================================================
 def _yf_download(symbol: str, start_dt_utc: datetime, end_dt_utc: datetime, interval: str = "30m") -> pd.DataFrame:
-    """Download symbol at interval; return UTC-indexed DataFrame with OHLCV columns when available."""
     if not HAS_YF:
         return pd.DataFrame()
     df = yf.download(
@@ -523,16 +429,65 @@ def _yf_download(symbol: str, start_dt_utc: datetime, end_dt_utc: datetime, inte
         auto_adjust=True,
         prepost=False,
         threads=True,
+        group_by="column",
     )
     if df is None or df.empty:
         return pd.DataFrame()
     df.index = pd.to_datetime(df.index)
-    return ensure_dtindex_utc(df)
+    df = ensure_dtindex_utc(df)
+    df = normalize_ohlcv(df, symbol=symbol)
+    return df
 
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=64)
+def _yf_download_cached(symbol: str, start_dt_utc: datetime, end_dt_utc: datetime, interval: str = "30m") -> pd.DataFrame:
+    if not HAS_YF:
+        return pd.DataFrame()
+    df = yf.download(
+        symbol,
+        interval=interval,
+        start=start_dt_utc.replace(tzinfo=None),
+        end=end_dt_utc.replace(tzinfo=None),
+        progress=False,
+        auto_adjust=True,
+        prepost=False,
+        threads=True,
+        group_by="column",
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df.index = pd.to_datetime(df.index)
+    df = ensure_dtindex_utc(df)
+    df = normalize_ohlcv(df, symbol=symbol)
+    return df
+
+def _yf_download_ext(symbol: str, start_dt_utc: datetime, end_dt_utc: datetime,
+                     interval: str = "30m", prepost: bool = True) -> pd.DataFrame:
+    if not HAS_YF:
+        return pd.DataFrame()
+    df = yf.download(
+        symbol,
+        interval=interval,
+        start=start_dt_utc.replace(tzinfo=None),
+        end=end_dt_utc.replace(tzinfo=None),
+        progress=False,
+        auto_adjust=True,
+        prepost=prepost,
+        threads=True,
+        group_by="column",
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df.index = pd.to_datetime(df.index)
+    df = ensure_dtindex_utc(df)
+    df = normalize_ohlcv(df, symbol=symbol)
+    return df
+
+# ============================================================
+# Fetchers using the above
+# ============================================================
 def fetch_es_30m_for_prev_day_window(prev_day: date) -> pd.DataFrame:
     """
     Fetch ES futures (ES=F) for the previous trading day's 'Asian window' 17:00–19:30 CT.
-    We pull a full surrounding range in UTC, then convert to CT and filter.
     """
     start_ct = datetime.combine(prev_day, time(0, 0), tzinfo=CT)
     end_ct   = datetime.combine(prev_day + timedelta(days=1), time(23, 59), tzinfo=CT)
@@ -546,7 +501,41 @@ def fetch_es_30m_for_prev_day_window(prev_day: date) -> pd.DataFrame:
     cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df_ct.columns]
     return df_ct[cols] if cols else df_ct
 
-# ---------- Anchor selection (k-th extremes by CLOSE) ----------
+def _fetch_symbol_30m_ct_range(symbol: str, start_ct: datetime, end_ct: datetime) -> pd.DataFrame:
+    df = _yf_download_cached(symbol, to_utc(start_ct), to_utc(end_ct), interval="30m")
+    if df.empty:
+        return df
+    return df.tz_convert(CT)
+
+def fetch_rth_30m_for_day(symbol: str, day: date) -> pd.DataFrame:
+    """Fetch an entire calendar day and filter to 08:30–14:30 CT."""
+    start_ct = datetime.combine(day, time(0, 0), tzinfo=CT)
+    end_ct   = datetime.combine(day, time(23, 59), tzinfo=CT)
+    df_ct = _fetch_symbol_30m_ct_range(symbol, start_ct, end_ct)
+    if df_ct.empty:
+        return df_ct
+    rth_mask = (df_ct.index.time >= time(8,30)) & (df_ct.index.time <= time(14,30))
+    return df_ct.loc[rth_mask].copy()
+
+def fetch_equity_30m_for_prev_day_window(symbol: str, prev_day: date) -> pd.DataFrame:
+    """
+    For equities, use extended-hours to capture 17:00–19:30 CT.
+    """
+    start_ct = datetime.combine(prev_day, time(0, 0), tzinfo=CT)
+    end_ct   = datetime.combine(prev_day + timedelta(days=1), time(23, 59), tzinfo=CT)
+    df = _yf_download_ext(symbol, to_utc(start_ct), to_utc(end_ct), interval="30m", prepost=True)
+    if df.empty:
+        return df
+    df_ct = df.tz_convert(CT)
+    win_start = datetime.combine(prev_day, time(17, 0), tzinfo=CT)
+    win_end   = datetime.combine(prev_day, time(19, 30), tzinfo=CT)
+    df_ct = df_ct.loc[(df_ct.index >= win_start) & (df_ct.index <= win_end)].copy()
+    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df_ct.columns]
+    return df_ct[cols] if cols else df_ct
+
+# ============================================================
+# Anchors, projections, analytics helpers
+# ============================================================
 def kth_extreme_by_close(df_ct: pd.DataFrame, k: int = 1) -> Tuple[Tuple[Optional[float], Optional[datetime]], Tuple[Optional[float], Optional[datetime]]]:
     """
     Return ((kth_high_close, t_high), (kth_low_close, t_low)) from df.
@@ -564,13 +553,10 @@ def kth_extreme_by_close(df_ct: pd.DataFrame, k: int = 1) -> Tuple[Tuple[Optiona
     kth_low_row  = lows.iloc[-1]
     kth_high_price = float(kth_high_row["Close"])
     kth_low_price  = float(kth_low_row["Close"])
-
-    # Use the last index from the slices (already aligned)
     kth_high_time = highs.index[-1]
     kth_low_time  = lows.index[-1]
     return (kth_high_price, kth_high_time), (kth_low_price, kth_low_time)
 
-# ---------- Projection builder ----------
 def build_projection_table(anchor_price: float, anchor_time_ct: datetime, slope_per_block: float, slots_ct: List[datetime]) -> pd.DataFrame:
     """
     Slope units = price change per 30-min block.
@@ -584,289 +570,6 @@ def build_projection_table(anchor_price: float, anchor_time_ct: datetime, slope_
         rows.append({"Time_CT": t.strftime("%Y-%m-%d %H:%M"), "Price": round(price, 4)})
     return pd.DataFrame(rows)
 
-# ---------- Skyline Page (v2) ----------
-def page_spx_skyline_v2():
-    st.markdown("### SPX Skyline")
-
-    if not HAS_YF:
-        st.warning("yfinance not available. Install it and rerun the full app: `pip install yfinance`.")
-        return
-
-    colA, colB, colC, colD = st.columns([1.2, 1, 1, 1.2])
-    with colA:
-        prev_day_default = prev_trading_day_base(now_ct())
-        prev_day_input = st.date_input(
-            "Previous trading day (for ES window)",
-            value=prev_day_default,
-            help="Uses ES=F 30m candles in the 17:00–19:30 CT window."
-        )
-    with colB:
-        k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0, help="k=1 highest/lowest close; k=2 second; k=3 third")
-    with colC:
-        es_to_spx_offset = st.number_input(
-            "ES→SPX offset",
-            value=0.0, step=0.5,
-            help="Manual adjustment to convert ES close to an SPX anchor (points)."
-        )
-    with colD:
-        projection_day = st.date_input(
-            "Projection day",
-            value=projection_day_default(now_ct()),
-            help="Projections are generated for 08:30–14:30 CT of this day."
-        )
-
-    df_es_win = fetch_es_30m_for_prev_day_window(prev_day_input)
-    if df_es_win.empty:
-        st.error("No ES data returned for the selected previous day. Try another date or check your connection.")
-        return
-
-    (hi_price, hi_time), (lo_price, lo_time) = kth_extreme_by_close(df_es_win, k=k)
-    if hi_price is None or lo_price is None:
-        st.error("Could not compute k-th extremes from ES window.")
-        return
-
-    # Adjust ES anchors → SPX anchors via offset; ensure CT-aware
-    hi_price_adj = hi_price + es_to_spx_offset
-    lo_price_adj = lo_price + es_to_spx_offset
-    hi_time_ct = _as_ct(hi_time)
-    lo_time_ct = _as_ct(lo_time)
-
-    slots_ct = generate_rth_times_ct(projection_day)
-    spx_skyline_slope  = st.session_state["spx_slopes"]["skyline"]
-    spx_baseline_slope = st.session_state["spx_slopes"]["baseline"]
-
-    # Convention:
-    # - Skyline projects from k-th HIGH close
-    # - Baseline projects from k-th LOW close (shown side-by-side for context)
-    sky_df  = build_projection_table(hi_price_adj, hi_time_ct, spx_skyline_slope,  slots_ct)
-    base_df = build_projection_table(lo_price_adj, lo_time_ct, spx_baseline_slope, slots_ct)
-
-    # Persist anchors for later tabs/analytics
-    st.session_state["spx_anchors"] = {
-        "previous_day": prev_day_input,
-        "projection_day": projection_day,
-        "skyline": {"price": hi_price_adj, "time": hi_time_ct},
-        "baseline": {"price": lo_price_adj, "time": lo_time_ct},
-        "k": k,
-        "offset": es_to_spx_offset,
-    }
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Skyline anchor** (k-th high close)")
-        st.caption(f"Time: {hi_time_ct.strftime('%Y-%m-%d %H:%M CT')} • Price (ES+offset): {hi_price_adj:.4f} • k={k}")
-        st.dataframe(sky_df, hide_index=True, use_container_width=True)
-        st.download_button(
-            "📥 Download Skyline CSV",
-            data=sky_df.to_csv(index=False),
-            file_name=f"SPX_Skyline_{projection_day}.csv",
-            mime="text/csv",
-            key="dl_skyline_csv_p2",
-        )
-    with c2:
-        st.markdown("**Baseline anchor** (k-th low close)")
-        st.caption(f"Time: {lo_time_ct.strftime('%Y-%m-%d %H:%M CT')} • Price (ES+offset): {lo_price_adj:.4f} • k={k}")
-        st.dataframe(base_df, hide_index=True, use_container_width=True)
-        st.download_button(
-            "📥 Download Baseline CSV",
-            data=base_df.to_csv(index=False),
-            file_name=f"SPX_Baseline_{projection_day}.csv",
-            mime="text/csv",
-            key="dl_baseline_csv_p2",
-        )
-
-    with st.expander("ES 30m window (prev day 17:00–19:30 CT)", expanded=False):
-        df_show = df_es_win.copy()
-        df_show.index = df_show.index.tz_convert(CT)
-        st.dataframe(df_show, use_container_width=True)
-
-    st.success("SPX Skyline/Baseline projections generated.")
-
-# ---------- Upgrade router entry (append-only) ----------
-PAGES["SPX • Skyline"] = page_spx_skyline_v2
-
-
-
-# ============================================================
-# MarketLens Pro v5 — PART 3/?
-# SPX Baseline page v2 (reuses Part 2 helpers)
-# ============================================================
-
-def _anchor_summary_card(title: str, when_ct: datetime, price: float, extra: str = ""):
-    st.markdown(
-        f"""
-        <div class="ml-card">
-            <div style="font-size:0.9rem; opacity:.7; margin-bottom:.25rem;">{title}</div>
-            <div style="font-size:1.2rem; font-weight:700;">{price:.4f}</div>
-            <div class="muted" style="margin-top:.25rem;">
-                {when_ct.strftime('%Y-%m-%d %H:%M CT')} {extra}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-def page_spx_baseline_v2():
-    st.markdown("### SPX Baseline")
-
-    if not HAS_YF:
-        st.warning("yfinance not available. Install it before running the full app: `pip install yfinance`.")
-        return
-
-    # Reuse Skyline settings if available
-    reuse = "spx_anchors" in st.session_state
-    if reuse:
-        with st.expander("Reuse Skyline settings", expanded=True):
-            reuse = st.toggle(
-                "Use Skyline k / previous day / projection day / ES→SPX offset",
-                value=True
-            )
-
-    if reuse and "spx_anchors" in st.session_state:
-        sky = st.session_state["spx_anchors"]
-        prev_day_input   = sky["previous_day"]
-        projection_day   = sky["projection_day"]
-        k                = sky["k"]
-        es_to_spx_offset = sky["offset"]
-        st.caption("Using settings from Skyline.")
-    else:
-        colA, colB, colC, colD = st.columns([1.2, 1, 1, 1.2])
-        with colA:
-            prev_day_input = st.date_input(
-                "Previous trading day (for ES window)",
-                value=prev_trading_day_base(now_ct()),
-                help="ES=F 30m candles, 17:00–19:30 CT window."
-            )
-        with colB:
-            k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0)
-        with colC:
-            es_to_spx_offset = st.number_input(
-                "ES→SPX offset", value=0.0, step=0.5,
-                help="Adjustment to convert ES close to an SPX anchor (points)."
-            )
-        with colD:
-            projection_day = st.date_input(
-                "Projection day",
-                value=projection_day_default(now_ct()),
-                help="08:30–14:30 CT will be projected."
-            )
-
-    # Fetch ES window & compute k-th extremes
-    df_es_win = fetch_es_30m_for_prev_day_window(prev_day_input)
-    if df_es_win.empty:
-        st.error("No ES data returned for the selected previous day.")
-        return
-
-    (hi_price, hi_time), (lo_price, lo_time) = kth_extreme_by_close(df_es_win, k=k)
-    if hi_price is None or lo_price is None:
-        st.error("Could not compute k-th extremes from ES window.")
-        return
-
-    # Baseline uses LOW-side anchor; show HIGH for context
-    lo_price_adj = (lo_price or 0.0) + es_to_spx_offset
-    lo_time_ct   = _as_ct(lo_time)
-
-    hi_price_adj = (hi_price or 0.0) + es_to_spx_offset
-    hi_time_ct   = _as_ct(hi_time)
-
-    # Build projection for RTH
-    slots_ct = generate_rth_times_ct(projection_day)
-    spx_baseline_slope = st.session_state["spx_slopes"]["baseline"]
-    base_df = build_projection_table(lo_price_adj, lo_time_ct, spx_baseline_slope, slots_ct)
-
-    # Save/merge into session anchors
-    st.session_state.setdefault("spx_anchors", {})
-    st.session_state["spx_anchors"].update({
-        "previous_day": prev_day_input,
-        "projection_day": projection_day,
-        "k": k,
-        "offset": es_to_spx_offset,
-        "baseline": {"price": lo_price_adj, "time": lo_time_ct},
-        # keep skyline if already present; otherwise store current hi as reference
-        "skyline": st.session_state["spx_anchors"].get("skyline", {"price": hi_price_adj, "time": hi_time_ct}),
-    })
-
-    # UI
-    cTop1, cTop2 = st.columns(2)
-    with cTop1:
-        _anchor_summary_card("Baseline anchor (k-th LOW close, ES+offset)", lo_time_ct, lo_price_adj, f"• k={k}")
-    with cTop2:
-        _anchor_summary_card("Skyline anchor (k-th HIGH close, ES+offset)", hi_time_ct, hi_price_adj, f"• k={k}")
-
-    st.markdown("#### Baseline Projection (08:30–14:30 CT)")
-    st.dataframe(base_df, hide_index=True, use_container_width=True)
-    st.download_button(
-        "📥 Download Baseline CSV",
-        data=base_df.to_csv(index=False),
-        file_name=f"SPX_Baseline_{projection_day}.csv",
-        mime="text/csv",
-        key="dl_baseline_csv_p3",
-    )
-
-    with st.expander("ES 30m window (prev day 17:00–19:30 CT)", expanded=False):
-        df_show = df_es_win.copy()
-        df_show.index = df_show.index.tz_convert(CT)
-        st.dataframe(df_show, use_container_width=True)
-
-    st.success("SPX Baseline projection generated.")
-
-# Upgrade router entry (append-only)
-PAGES["SPX • Baseline"] = page_spx_baseline_v2
-
-
-
-
-
-# ============================================================
-# MarketLens Pro v5 — PART 4/?
-# Signals & Probabilities (analytics-only, no simulation)
-# - Cached yfinance downloads
-# - Historical scan of triggers:
-#   • H1: Baseline-touch → Long (Call)
-#   • H2: Skyline-touch then overnight drop → Short (Put)
-# - Probabilities:
-#   • direction_prob_up/down
-#   • entry_success_prob (target before stop)
-#   • exit_success_prob (favorable close at horizon)
-# ============================================================
-
-# -------- Cached downloads (UTC index) --------
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=64)
-def _yf_download_cached(symbol: str, start_dt_utc: datetime, end_dt_utc: datetime, interval: str = "30m") -> pd.DataFrame:
-    if not HAS_YF:
-        return pd.DataFrame()
-    df = yf.download(
-        symbol,
-        interval=interval,
-        start=start_dt_utc.replace(tzinfo=None),
-        end=end_dt_utc.replace(tzinfo=None),
-        progress=False,
-        auto_adjust=True,
-        prepost=False,
-        threads=True,
-    )
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df.index = pd.to_datetime(df.index)
-    return ensure_dtindex_utc(df)
-
-def _fetch_symbol_30m_ct_range(symbol: str, start_ct: datetime, end_ct: datetime) -> pd.DataFrame:
-    df = _yf_download_cached(symbol, to_utc(start_ct), to_utc(end_ct), interval="30m")
-    if df.empty:
-        return df
-    return df.tz_convert(CT)
-
-def fetch_rth_30m_for_day(symbol: str, day: date) -> pd.DataFrame:
-    """Fetch an entire calendar day and filter to 08:30–14:30 CT to avoid boundary gaps."""
-    start_ct = datetime.combine(day, time(0, 0), tzinfo=CT)
-    end_ct   = datetime.combine(day, time(23, 59), tzinfo=CT)
-    df_ct = _fetch_symbol_30m_ct_range(symbol, start_ct, end_ct)
-    if df_ct.empty:
-        return df_ct
-    rth_mask = (df_ct.index.time >= time(8,30)) & (df_ct.index.time <= time(14,30))
-    return df_ct.loc[rth_mask].copy()
-
-# -------- Helper math for projected lines --------
 def line_value_at(anchor_price: float, anchor_time_ct: datetime, slope_per_block: float, t: datetime) -> float:
     """Value of projected line at time t (30m blocks)."""
     blocks = int(np.floor((t - anchor_time_ct).total_seconds() / 60.0 / 30.0))
@@ -895,16 +598,13 @@ def evaluate_path_long(rth_df_ct: pd.DataFrame, entry_time: datetime, entry_pric
     Long logic (Baseline-touch):
       - entry_success: did High reach entry + rr*risk before Low hit entry - risk, within horizon?
       - exit_success:  Close at horizon >= entry (favorable close)
-      - returns (entry_success, exit_success, time_of_resolution)
     """
     if rth_df_ct.empty:
         return (False, False, None)
     target = entry_price + rr_target * risk_points
     stop   = entry_price - risk_points
 
-    # Walk forward up to N blocks
     times = [t for t in rth_df_ct.index if t >= entry_time][:lookahead_blocks+1]
-    # If entry bar isn't exact index (e.g., touch within bar), include following bars
     if len(times) == 0:
         return (False, False, None)
 
@@ -913,15 +613,12 @@ def evaluate_path_long(rth_df_ct: pd.DataFrame, entry_time: datetime, entry_pric
         hi = float(row.get("High", np.nan))
         lo = float(row.get("Low", np.nan))
         if not np.isnan(hi) and hi >= target:
-            # Check stop on same bar first — assume worst-case: stop before target if both touched
             if not np.isnan(lo) and lo <= stop:
-                # Order ambiguity: treat as fail (conservative)
                 return (False, False, t)
-            return (True, True, t)  # target met ⇒ exit_success True by definition
+            return (True, True, t)
         if not np.isnan(lo) and lo <= stop:
             return (False, False, t)
 
-    # No target/stop: exit_success by time (close at horizon ≥ entry)
     horizon_t = times[-1]
     close_h = float(rth_df_ct.loc[horizon_t].get("Close", np.nan))
     exit_success = (not np.isnan(close_h)) and (close_h >= entry_price)
@@ -978,28 +675,24 @@ def direction_move_prob(rth_df_ct: pd.DataFrame, entry_time: datetime, lookahead
         return (0.0, 0.0)
     return (1.0, 0.0) if horizon_close >= entry_close else (0.0, 1.0)
 
-# -------- Historical scanners for each hypothesis --------
+# ============================================================
+# Historical scanners (probabilities)
+# ============================================================
 def scan_baseline_touch_signals(lookback_days: int, k: int, es_to_spx_offset: float,
                                 risk_points: float, lookahead_blocks: int, rr_target: float,
                                 symbol_underlying: str = "ES=F",
                                 touch_pad: float = 0.0) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """
-    For the last N trading days, compute Baseline-touch long signals and outcomes.
-    Returns (events_df, summary_probs)
-    """
     events = []
     counted = 0
     dir_up = dir_down = 0.0
     succ_entry = succ_exit = 0.0
 
-    # iterate projection days from yesterday backwards skipping weekends
     day = previous_weekday(now_ct().date())
     processed = 0
     while processed < lookback_days:
         proj_day = day
         prev_day = previous_weekday(proj_day - timedelta(days=1))
 
-        # Anchors from Part 2 function
         df_es_win = fetch_es_30m_for_prev_day_window(prev_day)
         if not df_es_win.empty:
             (_, _), (lo_price, lo_time) = kth_extreme_by_close(df_es_win, k=k)
@@ -1007,10 +700,8 @@ def scan_baseline_touch_signals(lookback_days: int, k: int, es_to_spx_offset: fl
                 lo_price_adj = lo_price + es_to_spx_offset
                 lo_time_ct   = _as_ct(lo_time)
 
-                # RTH data for projection day
                 rth = fetch_rth_30m_for_day(symbol_underlying, proj_day)
                 if not rth.empty:
-                    # Find first touch of Baseline projection (using baseline slope)
                     touch_t = first_touch_time(rth, lo_price_adj, lo_time_ct, st.session_state["spx_slopes"]["baseline"], touch_pad=touch_pad)
                     if touch_t is not None:
                         counted += 1
@@ -1037,7 +728,6 @@ def scan_baseline_touch_signals(lookback_days: int, k: int, es_to_spx_offset: fl
                             dir_down=int(down == 1.0),
                         ))
 
-        # previous trading day
         day = previous_weekday(proj_day - timedelta(days=1))
         processed += 1
 
@@ -1063,10 +753,6 @@ def scan_skyline_overnight_drop_signals(lookback_days: int, k: int, es_to_spx_of
                                         risk_points: float, lookahead_blocks: int, rr_target: float,
                                         symbol_underlying: str = "ES=F",
                                         touch_pad: float = 0.0) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """
-    For the last N trading days, compute Skyline-touch + overnight drop short signals and outcomes.
-    Trigger criterion: 08:30 CT open below Skyline line at 08:30.
-    """
     events = []
     counted = 0
     dir_up = dir_down = 0.0
@@ -1087,17 +773,15 @@ def scan_skyline_overnight_drop_signals(lookback_days: int, k: int, es_to_spx_of
 
                 rth = fetch_rth_30m_for_day(symbol_underlying, proj_day)
                 if not rth.empty:
-                    # Check 08:30 open relative to Skyline line at 08:30
                     rth_830 = rth.loc[rth.index.time == time(8,30)]
                     if not rth_830.empty:
                         t0 = rth_830.index[0]
                         skyline_at_830 = line_value_at(hi_price_adj, hi_time_ct, st.session_state["spx_slopes"]["skyline"], t0)
                         open_830 = float(rth_830.iloc[0].get("Open", np.nan))
-                        if not np.isnan(open_830) and open_830 < (skyline_at_830 - touch_pad):
-                            # Trigger: overnight drop below skyline at open
+                        if not np.isnan(open_830) and open_830 < skyline_at_830 - touch_pad:
                             counted += 1
                             entry_time = t0
-                            entry_price = open_830  # conservative: use open as entry reference
+                            entry_price = open_830
                             e_succ, x_succ, t_res = evaluate_path_short(
                                 rth, entry_time, entry_price, lookahead_blocks, risk_points, rr_target
                             )
@@ -1142,7 +826,260 @@ def scan_skyline_overnight_drop_signals(lookback_days: int, k: int, es_to_spx_of
     )
     return pd.DataFrame(events), summary
 
-# -------- Signals & Probabilities Page (v2) --------
+# ============================================================
+# Contract mapping helpers
+# ============================================================
+def map_contract_from_anchor(anchor_under: float, anchor_contract: float,
+                             entry_under: float, elasticity: float) -> float:
+    """
+    Linear advisory mapping (no greeks/IV):
+      contract_entry ≈ anchor_contract + elasticity * (entry_under - anchor_under)
+    elasticity: $ contract change per 1 point of underlying.
+    """
+    return float(anchor_contract + elasticity * (entry_under - anchor_under))
+
+def contract_levels_from_entry(entry_contract: float, risk_points: float, rr_target: float,
+                               side: str, elasticity: float, slippage: float = 0.0) -> Tuple[float, float]:
+    """
+    Compute (stop_contract, target_contract) from contract entry using the same underlying R:R geometry,
+    but scaled with elasticity (advisory). Slippage adjusts pessimistically.
+    """
+    if side == "long":
+        stop_c   = entry_contract - elasticity * risk_points + slippage
+        target_c = entry_contract + elasticity * (rr_target * risk_points) - slippage
+    else:  # short
+        stop_c   = entry_contract + elasticity * risk_points + slippage
+        target_c = entry_contract - elasticity * (rr_target * risk_points) - slippage
+    return float(round(stop_c, 4)), float(round(target_c, 4))
+
+# ============================================================
+# UI PAGES
+# ============================================================
+def page_dashboard():
+    st.markdown("### Overview")
+    n_consts = len(st.session_state["spx_slopes"]) + len(st.session_state["stock_slopes"])
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(
+            """
+            <div class="ml-card">
+              <div class="muted">Strategy Focus</div>
+              <div style="font-size:20px; font-weight:700;">Analytics, not Simulation</div>
+              <div class="muted" style="margin-top:6px;">
+                Probabilities for direction, entry success, and exit success — advisory only.
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+    with c2:
+        st.markdown(
+            f"""
+            <div class="ml-card">
+              <div class="muted">Hidden Model Vars</div>
+              <div style="font-size:22px; font-weight:700;">{n_consts} constants</div>
+              <div class="muted" style="margin-top:6px;">Slopes kept out of UI</div>
+            </div>
+            """, unsafe_allow_html=True)
+    with c3:
+        st.markdown(
+            """
+            <div class="ml-card">
+              <div class="muted">Key Hypotheses</div>
+              <div style="font-size:14px; margin-top:6px;">
+                • Baseline touch → Call bounce<br/>
+                • Skyline touch + overnight drop → Put follow-through
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+# ---------- SPX Skyline ----------
+def page_spx_skyline_v2():
+    st.markdown("### SPX Skyline")
+    if not HAS_YF:
+        st.warning("yfinance not available. Install it and rerun: `pip install yfinance`.")
+        return
+
+    colA, colB, colC, colD = st.columns([1.2, 1, 1, 1.2])
+    with colA:
+        prev_day_default = prev_trading_day_base(now_ct())
+        prev_day_input = st.date_input(
+            "Previous trading day (for ES window)",
+            value=prev_day_default,
+            help="Uses ES=F 30m candles in the 17:00–19:30 CT window."
+        )
+    with colB:
+        k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0, help="k=1 highest/lowest close; k=2 second; k=3 third")
+    with colC:
+        es_to_spx_offset = st.number_input("ES→SPX offset", value=0.0, step=0.5)
+    with colD:
+        projection_day = st.date_input("Projection day", value=projection_day_default(now_ct()))
+
+    df_es_win = fetch_es_30m_for_prev_day_window(prev_day_input)
+    if df_es_win.empty:
+        st.error("No ES data returned for the selected previous day. Try another date or check your connection.")
+        return
+
+    (hi_price, hi_time), (lo_price, lo_time) = kth_extreme_by_close(df_es_win, k=k)
+    if hi_price is None or lo_price is None:
+        st.error("Could not compute k-th extremes from ES window.")
+        return
+
+    hi_price_adj = hi_price + es_to_spx_offset
+    lo_price_adj = lo_price + es_to_spx_offset
+    hi_time_ct = _as_ct(hi_time)
+    lo_time_ct = _as_ct(lo_time)
+
+    slots_ct = generate_rth_times_ct(projection_day)
+    spx_skyline_slope  = st.session_state["spx_slopes"]["skyline"]
+    spx_baseline_slope = st.session_state["spx_slopes"]["baseline"]
+
+    sky_df  = build_projection_table(hi_price_adj, hi_time_ct, spx_skyline_slope,  slots_ct)
+    base_df = build_projection_table(lo_price_adj, lo_time_ct, spx_baseline_slope, slots_ct)
+
+    st.session_state["spx_anchors"] = {
+        "previous_day": prev_day_input,
+        "projection_day": projection_day,
+        "skyline": {"price": hi_price_adj, "time": hi_time_ct},
+        "baseline": {"price": lo_price_adj, "time": lo_time_ct},
+        "k": k,
+        "offset": es_to_spx_offset,
+    }
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Skyline anchor** (k-th high close)")
+        st.caption(f"Time: {hi_time_ct.strftime('%Y-%m-%d %H:%M CT')} • Price (ES+offset): {hi_price_adj:.4f} • k={k}")
+        st.dataframe(sky_df, hide_index=True, use_container_width=True)
+        st.download_button(
+            "📥 Download Skyline CSV",
+            data=sky_df.to_csv(index=False),
+            file_name=f"SPX_Skyline_{projection_day}.csv",
+            mime="text/csv",
+            key="dl_skyline_csv",
+        )
+    with c2:
+        st.markdown("**Baseline anchor** (k-th low close)")
+        st.caption(f"Time: {lo_time_ct.strftime('%Y-%m-%d %H:%M CT')} • Price (ES+offset): {lo_price_adj:.4f} • k={k}")
+        st.dataframe(base_df, hide_index=True, use_container_width=True)
+        st.download_button(
+            "📥 Download Baseline CSV",
+            data=base_df.to_csv(index=False),
+            file_name=f"SPX_Baseline_{projection_day}.csv",
+            mime="text/csv",
+            key="dl_baseline_csv_from_sky",
+        )
+
+    with st.expander("ES 30m window (prev day 17:00–19:30 CT)", expanded=False):
+        df_show = df_es_win.copy()
+        df_show.index = df_show.index.tz_convert(CT)
+        st.dataframe(df_show, use_container_width=True)
+
+# ---------- SPX Baseline ----------
+def _anchor_summary_card(title: str, when_ct: datetime, price: float, extra: str = ""):
+    st.markdown(
+        f"""
+        <div class="ml-card">
+            <div style="font-size:0.9rem; opacity:.7; margin-bottom:.25rem;">{title}</div>
+            <div style="font-size:1.2rem; font-weight:700;">{price:.4f}</div>
+            <div class="muted" style="margin-top:.25rem;">
+                {when_ct.strftime('%Y-%m-%d %H:%M CT')} {extra}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def page_spx_baseline_v2():
+    st.markdown("### SPX Baseline")
+    if not HAS_YF:
+        st.warning("yfinance not available. Install it and rerun: `pip install yfinance`.")
+        return
+
+    reuse = "spx_anchors" in st.session_state
+    if reuse:
+        with st.expander("Reuse Skyline settings", expanded=True):
+            reuse = st.toggle(
+                "Use Skyline k / previous day / projection day / ES→SPX offset",
+                value=True
+            )
+
+    if reuse and "spx_anchors" in st.session_state:
+        sky = st.session_state["spx_anchors"]
+        prev_day_input   = sky["previous_day"]
+        projection_day   = sky["projection_day"]
+        k                = sky["k"]
+        es_to_spx_offset = sky["offset"]
+        st.caption("Using settings from Skyline.")
+    else:
+        colA, colB, colC, colD = st.columns([1.2, 1, 1, 1.2])
+        with colA:
+            prev_day_input = st.date_input(
+                "Previous trading day (for ES window)",
+                value=prev_trading_day_base(now_ct()),
+                help="ES=F 30m candles, 17:00–19:30 CT window."
+            )
+        with colB:
+            k = st.selectbox("Swing selectivity (k)", [1, 2, 3], index=0)
+        with colC:
+            es_to_spx_offset = st.number_input("ES→SPX offset", value=0.0, step=0.5)
+        with colD:
+            projection_day = st.date_input(
+                "Projection day",
+                value=projection_day_default(now_ct()),
+                help="08:30–14:30 CT will be projected."
+            )
+
+    df_es_win = fetch_es_30m_for_prev_day_window(prev_day_input)
+    if df_es_win.empty:
+        st.error("No ES data returned for the selected previous day.")
+        return
+
+    (hi_price, hi_time), (lo_price, lo_time) = kth_extreme_by_close(df_es_win, k=k)
+    if hi_price is None or lo_price is None:
+        st.error("Could not compute k-th extremes from ES window.")
+        return
+
+    lo_price_adj = (lo_price or 0.0) + es_to_spx_offset
+    lo_time_ct   = _as_ct(lo_time)
+
+    hi_price_adj = (hi_price or 0.0) + es_to_spx_offset
+    hi_time_ct   = _as_ct(hi_time)
+
+    slots_ct = generate_rth_times_ct(projection_day)
+    spx_baseline_slope = st.session_state["spx_slopes"]["baseline"]
+    base_df = build_projection_table(lo_price_adj, lo_time_ct, spx_baseline_slope, slots_ct)
+
+    st.session_state.setdefault("spx_anchors", {})
+    st.session_state["spx_anchors"].update({
+        "previous_day": prev_day_input,
+        "projection_day": projection_day,
+        "k": k,
+        "offset": es_to_spx_offset,
+        "baseline": {"price": lo_price_adj, "time": lo_time_ct},
+        "skyline": st.session_state["spx_anchors"].get("skyline", {"price": hi_price_adj, "time": hi_time_ct}),
+    })
+
+    cTop1, cTop2 = st.columns(2)
+    with cTop1:
+        _anchor_summary_card("Baseline anchor (k-th LOW close, ES+offset)", lo_time_ct, lo_price_adj, f"• k={k}")
+    with cTop2:
+        _anchor_summary_card("Skyline anchor (k-th HIGH close, ES+offset)", hi_time_ct, hi_price_adj, f"• k={k}")
+
+    st.markdown("#### Baseline Projection (08:30–14:30 CT)")
+    st.dataframe(base_df, hide_index=True, use_container_width=True)
+    st.download_button(
+        "📥 Download Baseline CSV",
+        data=base_df.to_csv(index=False),
+        file_name=f"SPX_Baseline_{projection_day}.csv",
+        mime="text/csv",
+        key="dl_baseline_csv",
+    )
+
+    with st.expander("ES 30m window (prev day 17:00–19:30 CT)", expanded=False):
+        df_show = df_es_win.copy()
+        df_show.index = df_show.index.tz_convert(CT)
+        st.dataframe(df_show, use_container_width=True)
+
+# ---------- Signals & Probabilities ----------
 def page_signals_probabilities_v2():
     st.markdown("### Signals & Probabilities — Analytics Only")
 
@@ -1150,14 +1087,11 @@ def page_signals_probabilities_v2():
         st.warning("yfinance not available. Install before running: `pip install yfinance`.")
         return
 
-    # Ensure defaults exist (backward compatible with Part 1)
     st.session_state.setdefault("analytics", {})
     analytics = st.session_state["analytics"]
     analytics.setdefault("lookahead_blocks", 4)
     analytics.setdefault("rr_target", 1.0)
-    analytics.setdefault("stop_blocks", 2)
-    analytics.setdefault("use_close_only", True)
-    analytics.setdefault("risk_points", 5.0)  # new: base risk unit in points for target/stop
+    analytics.setdefault("risk_points", 5.0)
 
     cA, cB, cC, cD = st.columns([1.1, 1, 1, 1.2])
     with cA:
@@ -1233,51 +1167,10 @@ def page_signals_probabilities_v2():
 
     st.caption("Notes: Analytics only (no simulation). Results are historical frequencies under the stated rules.")
 
-# Upgrade router entry (append-only)
-PAGES["Signals • Probabilities"] = page_signals_probabilities_v2
-
-
-# ============================================================
-# MarketLens Pro v5 — PART 5/?
-# Contract Tool wiring:
-# - Strategy selection (Baseline→Call or Skyline OVN Drop→Put)
-# - Detect entry time in RTH (08:30–14:30 CT)
-# - Compute underlying Entry / Stop / Target (RR-based)
-# - Map to contract prices via elasticity from an overnight reference
-# - Show entries table + probability overlay (from Part 4 scanners)
-# ============================================================
-
-# -------- Helper: map underlying delta -> contract delta --------
-def map_contract_from_anchor(anchor_under: float, anchor_contract: float,
-                             entry_under: float, elasticity: float) -> float:
-    """
-    Linear advisory mapping (no greeks/IV):
-      contract_entry ≈ anchor_contract + elasticity * (entry_under - anchor_under)
-    elasticity: $ contract change per 1 point of underlying.
-    """
-    return float(anchor_contract + elasticity * (entry_under - anchor_under))
-
-def contract_levels_from_entry(entry_contract: float, risk_points: float, rr_target: float,
-                               side: str, elasticity: float, slippage: float = 0.0) -> Tuple[float, float]:
-    """
-    Compute (stop_contract, target_contract) from contract entry using the same underlying R:R geometry,
-    but scaled with elasticity (advisory). Slippage adjusts pessimistically.
-    """
-    if side == "long":
-        stop_c   = entry_contract - elasticity * risk_points + slippage
-        target_c = entry_contract + elasticity * (rr_target * risk_points) - slippage
-    else:  # short
-        stop_c   = entry_contract + elasticity * risk_points + slippage
-        target_c = entry_contract - elasticity * (rr_target * risk_points) - slippage
-    return float(round(stop_c, 4)), float(round(target_c, 4))
-
-# -------- Entry detectors (RTH) --------
+# ---------- Contract Tool ----------
 def detect_entry_baseline_long(rth_df_ct: pd.DataFrame,
                                lo_anchor_price: float, lo_anchor_time_ct: datetime,
                                baseline_slope: float, touch_pad: float = 0.0) -> Optional[Tuple[datetime, float]]:
-    """
-    Return (entry_time, entry_underlying_price) at first RTH touch of the Baseline projection.
-    """
     t = first_touch_time(rth_df_ct, lo_anchor_price, lo_anchor_time_ct, baseline_slope, touch_pad=touch_pad)
     if t is None:
         return None
@@ -1287,10 +1180,6 @@ def detect_entry_baseline_long(rth_df_ct: pd.DataFrame,
 def detect_entry_skyline_short_overnight_drop(rth_df_ct: pd.DataFrame,
                                               hi_anchor_price: float, hi_anchor_time_ct: datetime,
                                               skyline_slope: float, touch_pad: float = 0.0) -> Optional[Tuple[datetime, float]]:
-    """
-    Trigger: 08:30 CT open < Skyline line at 08:30 (overnight drop).
-    Entry reference is 08:30 open.
-    """
     rth_830 = rth_df_ct.loc[rth_df_ct.index.time == time(8, 30)]
     if rth_830.empty:
         return None
@@ -1303,7 +1192,6 @@ def detect_entry_skyline_short_overnight_drop(rth_df_ct: pd.DataFrame,
         return (t0, float(round(open_830, 4)))
     return None
 
-# -------- Page: Contract Tool v2 --------
 def page_contract_tool_v2():
     st.markdown("### Contract Tool — Entries • Stops • Targets • Probabilities (Advisory Only)")
 
@@ -1316,7 +1204,6 @@ def page_contract_tool_v2():
     st.session_state["analytics"].setdefault("rr_target", 1.0)
     st.session_state["analytics"].setdefault("risk_points", 5.0)
 
-    # ---- Strategy + config ----
     colS1, colS2, colS3, colS4 = st.columns([1.1, 1, 1, 1.2])
     with colS1:
         strat = st.selectbox(
@@ -1342,10 +1229,8 @@ def page_contract_tool_v2():
     with colP4:
         slippage = st.number_input("Slippage ($)", value=0.00, min_value=0.0, step=0.05)
 
-    # ---- Anchors / days ----
-    # Prefer previously computed anchors from Skyline/Baseline pages; otherwise compute on-the-fly.
     default_prev = previous_weekday(now_ct().date() - timedelta(days=1))
-    default_proj = previous_weekday(now_ct().date())  # yesterday by default
+    default_proj = previous_weekday(now_ct().date())
 
     have_anchors = "spx_anchors" in st.session_state
     with st.expander("Anchors & Days", expanded=not have_anchors):
@@ -1356,7 +1241,6 @@ def page_contract_tool_v2():
         with colB:
             projection_day = st.date_input("Projection day (RTH 08:30–14:30 CT)", value=default_proj)
 
-        # If anchors missing or user wants to refresh, compute them here
         refresh = st.checkbox("Compute/refresh anchors for these days", value=not have_anchors)
         if refresh:
             df_es_win = fetch_es_30m_for_prev_day_window(prev_day)
@@ -1376,14 +1260,12 @@ def page_contract_tool_v2():
                 "offset": float(es_to_spx_offset),
             }
         else:
-            # fall back to existing
             if not have_anchors:
                 st.warning("No anchors in session; check 'Compute/refresh anchors'.")
                 return
             prev_day      = st.session_state["spx_anchors"]["previous_day"]
             projection_day= st.session_state["spx_anchors"]["projection_day"]
 
-    # ---- Contract price inputs (overnight references at anchor) ----
     colC1, colC2 = st.columns(2)
     with colC1:
         call_ref = st.number_input(
@@ -1402,21 +1284,18 @@ def page_contract_tool_v2():
     st.session_state["contracts"]["overnight_call_entry_price"] = float(call_ref)
     st.session_state["contracts"]["overnight_put_entry_price"]  = float(put_ref)
 
-    # ---- Fetch RTH for projection day ----
     rth = fetch_rth_30m_for_day("ES=F", projection_day)
     if rth.empty:
         st.error("No RTH data fetched for the projection day.")
         return
 
-    # ---- Build entries table depending on strategy ----
     cols = ["Time_CT","RefLine","Side","Entry_Under","Stop_Under","Target_Under",
             "Entry_Contract","Stop_Contract","Target_Contract","RR"]
     rows = []
 
-    # Probabilities overlay (aggregated from history by the matching hypothesis)
+    # Probability overlay package
     if "Baseline touch" in strat:
-        # Scan historical Baseline-touch long signals
-        df_hist, summary = scan_baseline_touch_signals(
+        df_hist, prob_pack = scan_baseline_touch_signals(
             lookback_days=int(lookback_days),
             k=int(k),
             es_to_spx_offset=float(es_to_spx_offset),
@@ -1426,10 +1305,8 @@ def page_contract_tool_v2():
             symbol_underlying="ES=F",
             touch_pad=0.0,
         )
-        prob_pack = summary
     else:
-        # Scan historical Skyline overnight-drop short signals
-        df_hist, summary = scan_skyline_overnight_drop_signals(
+        df_hist, prob_pack = scan_skyline_overnight_drop_signals(
             lookback_days=int(lookback_days),
             k=int(k),
             es_to_spx_offset=float(es_to_spx_offset),
@@ -1439,9 +1316,7 @@ def page_contract_tool_v2():
             symbol_underlying="ES=F",
             touch_pad=0.0,
         )
-        prob_pack = summary
 
-    # Compute strategy specifics
     base = st.session_state["spx_anchors"]["baseline"]
     sky  = st.session_state["spx_anchors"]["skyline"]
     baseline_slope = st.session_state["spx_slopes"]["baseline"]
@@ -1451,21 +1326,17 @@ def page_contract_tool_v2():
         side = "long"
         anchor_price = float(base["price"])
         anchor_time  = _as_ct(base["time"])
-        # Fill the time grid (reference line values)
         for t in rth.index:
             ref_line = line_value_at(anchor_price, anchor_time, baseline_slope, t)
             rows.append([t.strftime("%Y-%m-%d %H:%M"), round(ref_line,4), "CALL","","","","","","", f"{rr_target:.2f}"])
 
-        # Detect entry
         det = detect_entry_baseline_long(rth, anchor_price, anchor_time, baseline_slope, touch_pad=0.0)
         if det is None:
             st.info("No Baseline touch detected during RTH. Table shows the Baseline reference line only.")
         else:
             entry_t, entry_under = det
-            # Underlying stop/target
             stop_under   = entry_under - float(risk_points)
             target_under = entry_under + float(rr_target) * float(risk_points)
-            # Contract mapping from anchor
             entry_contract = map_contract_from_anchor(
                 anchor_under=anchor_price,
                 anchor_contract=float(call_ref),
@@ -1480,7 +1351,6 @@ def page_contract_tool_v2():
                 elasticity=float(elasticity),
                 slippage=float(slippage),
             )
-            # Patch the row at entry time
             for r in rows:
                 if r[0] == entry_t.strftime("%Y-%m-%d %H:%M"):
                     r[3] = round(entry_under,4)
@@ -1490,12 +1360,10 @@ def page_contract_tool_v2():
                     r[7] = stop_c
                     r[8] = target_c
                     break
-
     else:
         side = "short"
         anchor_price = float(sky["price"])
         anchor_time  = _as_ct(sky["time"])
-        # Time grid (reference Skyline line)
         for t in rth.index:
             ref_line = line_value_at(anchor_price, anchor_time, skyline_slope, t)
             rows.append([t.strftime("%Y-%m-%d %H:%M"), round(ref_line,4), "PUT","","","","","","", f"{rr_target:.2f}"])
@@ -1539,10 +1407,9 @@ def page_contract_tool_v2():
         data=df_entries.to_csv(index=False),
         file_name=f"Entries_{('CALL' if side=='long' else 'PUT')}_{st.session_state['spx_anchors']['projection_day']}.csv",
         mime="text/csv",
-        key="dl_entries_csv_p5",
+        key="dl_entries_csv",
     )
 
-    # Probability overlay summary
     if prob_pack["samples"] == 0:
         st.info("No historical samples in the chosen lookback to compute probabilities.")
     else:
@@ -1553,68 +1420,10 @@ def page_contract_tool_v2():
         with c3: st.metric("Dir ↓ prob", f'{prob_pack["direction_prob_down"]:.2%}')
         with c4: st.metric("Entry success", f'{prob_pack["entry_success_prob"]:.2%}')
         with c5: st.metric("Exit success", f'{prob_pack["exit_success_prob"]:.2%}')
-        st.caption("Advisory analytics only — not trading advice. No simulations used; pure historical frequencies under stated rules.")
+        st.caption("Advisory analytics only — not trading advice. Pure historical frequencies under stated rules.")
 
-# Upgrade router entry (append-only)
-PAGES["Contract • Tool"] = page_contract_tool_v2
-
-
-
-
-
-# ============================================================
-# MarketLens Pro v5 — PART 6/?
-# Stocks • Skyline / Baseline (per-ticker)
-# - Fetch each equity's 30m extended-hours prev-day window (17:00–19:30 CT)
-# - k-th extremes for anchors (per ticker)
-# - Projection tables 08:30–14:30 CT using STOCK_SLOPES magnitudes:
-#     Skyline slope = +magnitude, Baseline slope = -magnitude
-# - Detect first RTH entry (touch) and compute Stop/Target (advisory)
-# - Optional probability overlay using ES-anchored scanners
-# ============================================================
-
-# ---------- yfinance (extended-hours) ----------
-def _yf_download_ext(symbol: str, start_dt_utc: datetime, end_dt_utc: datetime,
-                     interval: str = "30m", prepost: bool = True) -> pd.DataFrame:
-    if not HAS_YF:
-        return pd.DataFrame()
-    df = yf.download(
-        symbol,
-        interval=interval,
-        start=start_dt_utc.replace(tzinfo=None),
-        end=end_dt_utc.replace(tzinfo=None),
-        progress=False,
-        auto_adjust=True,
-        prepost=prepost,
-        threads=True,
-    )
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df.index = pd.to_datetime(df.index)
-    return ensure_dtindex_utc(df)
-
-def fetch_equity_30m_for_prev_day_window(symbol: str, prev_day: date) -> pd.DataFrame:
-    """
-    For equities, use extended-hours to capture 17:00–19:30 CT.
-    """
-    start_ct = datetime.combine(prev_day, time(0, 0), tzinfo=CT)
-    end_ct   = datetime.combine(prev_day + timedelta(days=1), time(23, 59), tzinfo=CT)
-    df = _yf_download_ext(symbol, to_utc(start_ct), to_utc(end_ct), interval="30m", prepost=True)
-    if df.empty:
-        return df
-    df_ct = df.tz_convert(CT)
-    win_start = datetime.combine(prev_day, time(17, 0), tzinfo=CT)
-    win_end   = datetime.combine(prev_day, time(19, 30), tzinfo=CT)
-    df_ct = df_ct.loc[(df_ct.index >= win_start) & (df_ct.index <= win_end)].copy()
-    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df_ct.columns]
-    return df_ct[cols] if cols else df_ct
-
-# ---------- Shared helpers for stocks ----------
+# ---------- Stocks Baseline ----------
 def _stock_slopes(symbol: str) -> Tuple[float, float]:
-    """
-    Returns (skyline_slope, baseline_slope) for a given stock symbol
-    using your STOCK_SLOPES magnitude with +/- sign.
-    """
     mag = float(STOCK_SLOPES.get(symbol, 0.0))
     return (mag, -mag)
 
@@ -1626,15 +1435,12 @@ def _fill_entries_rows(rth_df_ct: pd.DataFrame, refline_fn, side_label: str,
         rows.append([t.strftime("%Y-%m-%d %H:%M"), ref_line, side_label, "", "", "", "", "", "", f"{rr_target:.2f}"])
     return rows
 
-# ---------- Stocks • Baseline (per-ticker) ----------
 def page_stocks_baseline_v2():
     st.markdown("### Stocks • Baseline (per-ticker)")
-
     if not HAS_YF:
         st.warning("yfinance not available. Install before running: `pip install yfinance`.")
         return
 
-    st.session_state.setdefault("analytics", {})
     lookahead_blocks = int(st.session_state["analytics"].get("lookahead_blocks", 4))
     rr_target = float(st.session_state["analytics"].get("rr_target", 1.0))
     risk_points = float(st.session_state["analytics"].get("risk_points", 1.0))
@@ -1669,23 +1475,19 @@ def page_stocks_baseline_v2():
             st.info(f"Could not compute k-th LOW for {sym}.")
             continue
 
-        # Slopes for this stock
         sky_slope, base_slope = _stock_slopes(sym)
 
-        # Build projection
         lo_price_adj = float(lo_price)
         lo_time_ct   = _as_ct(lo_time)
         slots_ct     = generate_rth_times_ct(projection_day)
-        proj_df      = build_projection_table(lo_price_adj, lo_time_ct, base_slope, slots_ct)
+        _ = build_projection_table(lo_price_adj, lo_time_ct, base_slope, slots_ct)  # not shown separately
 
-        # Fetch RTH and detect first touch for long
         rth = fetch_rth_30m_for_day(sym, projection_day)
         if rth.empty:
             st.info(f"No RTH data for {sym} on {projection_day}.")
             continue
 
         entry_det = detect_entry_baseline_long(rth, lo_price_adj, lo_time_ct, base_slope, touch_pad=touch_pad)
-        # Pre-fill rows with ref line
         rows = _fill_entries_rows(rth, lambda t: line_value_at(lo_price_adj, lo_time_ct, base_slope, t), "CALL", rr_target, risk_points)
 
         if entry_det is not None:
@@ -1712,7 +1514,7 @@ def page_stocks_baseline_v2():
                 data=df_entries.to_csv(index=False),
                 file_name=f"{sym}_Baseline_{projection_day}.csv",
                 mime="text/csv",
-                key=f"dl_{sym}_baseline_csv_p6",
+                key=f"dl_{sym}_baseline_csv",
             )
             st.markdown(
                 f"""
@@ -1729,15 +1531,13 @@ def page_stocks_baseline_v2():
             df_show.index = df_show.index.tz_convert(CT)
             st.dataframe(df_show, use_container_width=True)
 
-# ---------- Stocks • Skyline (per-ticker) ----------
+# ---------- Stocks Skyline ----------
 def page_stocks_skyline_v2():
     st.markdown("### Stocks • Skyline (per-ticker)")
-
     if not HAS_YF:
         st.warning("yfinance not available. Install before running: `pip install yfinance`.")
         return
 
-    st.session_state.setdefault("analytics", {})
     lookahead_blocks = int(st.session_state["analytics"].get("lookahead_blocks", 4))
     rr_target = float(st.session_state["analytics"].get("rr_target", 1.0))
     risk_points = float(st.session_state["analytics"].get("risk_points", 1.0))
@@ -1774,13 +1574,11 @@ def page_stocks_skyline_v2():
 
         sky_slope, base_slope = _stock_slopes(sym)
 
-        # Build projection
         hi_price_adj = float(hi_price)
         hi_time_ct   = _as_ct(hi_time)
         slots_ct     = generate_rth_times_ct(projection_day)
-        proj_df      = build_projection_table(hi_price_adj, hi_time_ct, sky_slope, slots_ct)
+        _ = build_projection_table(hi_price_adj, hi_time_ct, sky_slope, slots_ct)
 
-        # Fetch RTH and detect overnight-drop short (08:30 open < skyline@08:30)
         rth = fetch_rth_30m_for_day(sym, projection_day)
         if rth.empty:
             st.info(f"No RTH data for {sym} on {projection_day}.")
@@ -1813,7 +1611,7 @@ def page_stocks_skyline_v2():
                 data=df_entries.to_csv(index=False),
                 file_name=f"{sym}_Skyline_{projection_day}.csv",
                 mime="text/csv",
-                key=f"dl_{sym}_skyline_csv_p6",
+                key=f"dl_{sym}_skyline_csv",
             )
             st.markdown(
                 f"""
@@ -1830,20 +1628,94 @@ def page_stocks_skyline_v2():
             df_show.index = df_show.index.tz_convert(CT)
             st.dataframe(df_show, use_container_width=True)
 
-# ---------- Upgrade router entries ----------
-PAGES["Stocks • Baseline"] = page_stocks_baseline_v2
-PAGES["Stocks • Skyline"]  = page_stocks_skyline_v2
+# ---------- Settings ----------
+def page_settings():
+    st.markdown("### Settings")
+    st.caption("Non-sensitive preferences only; model constants remain internal.")
+    cols = st.columns(4)
+    with cols[0]:
+        la = st.number_input("Lookahead blocks (30-min each)", min_value=1, max_value=16,
+                             value=int(st.session_state["analytics"]["lookahead_blocks"]), step=1)
+    with cols[1]:
+        rr = st.number_input("Reward:Risk target", min_value=0.1, max_value=5.0,
+                             value=float(st.session_state["analytics"]["rr_target"]), step=0.1)
+    with cols[2]:
+        rp = st.number_input("Risk unit (points)", min_value=0.1, max_value=50.0,
+                             value=float(st.session_state["analytics"]["risk_points"]), step=0.5)
+    with cols[3]:
+        debug = st.toggle("Debug mode", value=st.session_state["settings"]["debug"])
+    st.session_state["analytics"]["lookahead_blocks"] = int(la)
+    st.session_state["analytics"]["rr_target"] = float(rr)
+    st.session_state["analytics"]["risk_points"] = float(rp)
+    st.session_state["settings"]["debug"] = bool(debug)
+    st.success("Settings saved.")
 
+# ---------- About ----------
+def page_about():
+    st.markdown("### About")
+    st.write(
+        f"""**{APP_NAME}** — {APP_TAGLINE}
+- Version: {APP_VERSION}
+- Timezone: America/Chicago (CT)
+- Data: yfinance {'available' if HAS_YF else 'not detected'}
+- UI: Dark glassmorphism
+- Mode: Analytics only (no simulation). Not a trading app."""
+    )
 
-
+# ---------- Router ----------
+PAGES = {
+    "Dashboard": page_dashboard,
+    "SPX • Skyline": page_spx_skyline_v2,
+    "SPX • Baseline": page_spx_baseline_v2,
+    "Signals • Probabilities": page_signals_probabilities_v2,
+    "Contract • Tool": page_contract_tool_v2,
+    "Stocks • Skyline": page_stocks_skyline_v2,
+    "Stocks • Baseline": page_stocks_baseline_v2,
+    "Settings": page_settings,
+    "About": page_about,
+}
 
 # ============================================================
-# MarketLens Pro v5 — FINAL BOOT (call render_app exactly once)
+# APP RENDERER & BOOT
 # ============================================================
+def render_app() -> None:
+    init_state()
+    inject_css(st.session_state["theme"])
+
+    # Sidebar nav
+    with st.sidebar:
+        st.markdown("#### Navigation")
+        choice = st.radio(
+            "Choose a section",
+            list(PAGES.keys()),
+            index=list(PAGES.keys()).index(st.session_state.get("nav", "Dashboard")),
+            label_visibility="collapsed",
+        )
+        st.session_state["nav"] = choice
+        st.divider()
+        st.markdown("#### Quick Info")
+        st.caption(f"Local time (CT): {now_ct():%Y-%m-%d %I:%M %p}")
+
+    # Top bar + page body
+    topbar()
+    PAGES[st.session_state["nav"]]()
+
+# ---- Final boot (call exactly once) ----
 if "render_app" in globals():
     if not st.session_state.get("__MLP_BOOTED__", False):
         st.session_state["__MLP_BOOTED__"] = True
     render_app()
 else:
-    import streamlit as st  # safety in case top imports failed
-    st.error("render_app() not found. Make sure Parts 1–6 are pasted above this block.")
+    st.error("render_app() not found (this should not happen).")
+
+If you need a fresh requirements.txt, use:
+
+streamlit>=1.32,<2
+pandas>=2.1,<3
+numpy>=1.26,<3
+yfinance>=0.2.38,<0.3
+tzdata>=2024.1
+pytz>=2024.1
+
+Happy trading research 📈
+
