@@ -537,6 +537,23 @@ st.markdown("---")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# AUTO-UPDATE FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def update_offset_for_date():
+    """Automatically update offset when date changes"""
+    if 'spx_prev_day' in st.session_state:
+        selected_date = st.session_state.spx_prev_day
+        
+        # Fetch data for the selected date
+        es_data = fetch_live_data("ES=F", selected_date, selected_date)
+        spx_data = fetch_live_data("^GSPC", selected_date, selected_date)
+        
+        if not es_data.empty and not spx_data.empty:
+            new_offset = calculate_es_spx_offset(es_data, spx_data)
+            st.session_state.current_offset = new_offset
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ENTRY/EXIT ANALYSIS FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -677,7 +694,8 @@ with tab1:
         prev_day = st.date_input(
             "Previous Trading Day", 
             value=datetime.now(CT_TZ).date() - timedelta(days=1),
-            key="spx_prev_day"
+            key="spx_prev_day",
+            on_change=update_offset_for_date
         )
         
         weekday = prev_day.strftime("%A")
@@ -692,6 +710,19 @@ with tab1:
         
         proj_weekday = proj_day.strftime("%A") 
         st.caption(f"Projecting for: {proj_weekday}")
+
+def update_offset_for_date():
+    """Automatically update offset when date changes"""
+    if 'spx_prev_day' in st.session_state:
+        selected_date = st.session_state.spx_prev_day
+        
+        # Fetch data for the selected date
+        es_data = fetch_live_data("ES=F", selected_date, selected_date)
+        spx_data = fetch_live_data("^GSPC", selected_date, selected_date)
+        
+        if not es_data.empty and not spx_data.empty:
+            new_offset = calculate_es_spx_offset(es_data, spx_data)
+            st.session_state.current_offset = new_offset
     
     st.markdown("---")
     
