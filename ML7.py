@@ -1,6 +1,6 @@
 # app.py
 # ═══════════════════════════════════════════════════════════════════════════════
-# 🔮 SPX PROPHET — Unified App (fan + weekend/maintenance fix + mean reversion)
+# 🔮 SPX PROPHET — Unified App (ES engine → SPX display), Light Theme, v1.0
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import streamlit as st
@@ -9,613 +9,737 @@ import numpy as np
 import yfinance as yf
 import pytz
 from datetime import datetime, date, time, timedelta
-from datetime import time as dtime
-from typing import Dict, List, Optional
-import warnings
-warnings.filterwarnings('ignore')
 
 # ───────────────────────────────────────────────────────────────────────────────
-# CORE CONFIG
+# GLOBALS & CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
-CT_TZ = pytz.timezone('America/Chicago')
-UTC_TZ = pytz.UTC
+CT = pytz.timezone("America/Chicago")
+ET = pytz.timezone("US/Eastern")
 
-RTH_START = "08:30"  # CT
-RTH_END   = "14:30"  # CT
+RTH_START = time(8, 30)   # 08:30 CT
+RTH_END   = time(14, 30)  # 14:30 CT
 
-# Slope magnitude per 30-min block (after 1h maintenance considered)
-SLOPE_PER_BLOCK = 0.377  # ascending +0.377, descending -0.377
+# Fan slope for SPX projections (per 30-min "trading block")
+SPX_FAN_SLOPE = 0.333
 
-SPX_ANCHOR_START = "17:00"
-SPX_ANCHOR_END   = "19:30"
+# Your per-stock slopes (parallel channel; not fan)
+STOCK_SLOPES = {
+    "TSLA": 0.0285, "NVDA": 0.086, "AAPL": 0.0155,
+    "MSFT": 0.0541, "AMZN": 0.0139, "GOOGL": 0.0122,
+    "META": 0.0674, "NFLX": 0.0230
+}
 
 # ───────────────────────────────────────────────────────────────────────────────
-# PAGE
+# PAGE CONFIG & STYLES (Light Mode, polished UI)
 # ───────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="🔮 SPX Prophet Analytics",
+    page_title="🔮 SPX Prophet (ES→SPX)",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-st.markdown("""
+LIGHT_CSS = """
 <style>
-.main { background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%); color: white;}
-.metric-container { background: linear-gradient(135deg, rgba(255,255,255,0.1), rgba(255,255,255,0.05));
-  padding: 1.2rem; border-radius: 15px; border: 2px solid rgba(255,255,255,0.2); backdrop-filter: blur(10px);
-  box-shadow: 0 8px 32px rgba(0,0,0,0.1); transition: all 0.3s ease;}
-.metric-container:hover { transform: translateY(-5px); box-shadow: 0 15px 35px rgba(0,0,0,0.2);}
-.stTab { background: linear-gradient(135deg, rgba(255,255,255,0.1), rgba(255,255,255,0.05));
-  border-radius: 10px; padding: 10px; margin: 5px;}
-.stDataFrame { background: rgba(255,255,255,0.95); border-radius: 10px; overflow: hidden;}
+:root { --card-bg: #ffffff; --soft: rgba(0,0,0,0.06); }
+.block-container { padding-top: 1.2rem !important; }
+.main > div { background: linear-gradient(180deg,#f7f9fc 0%, #eef2f7 100%); }
+h1,h2,h3,h4 { color: #0f172a; }
+.card {
+    background: var(--card-bg); border: 1px solid #e5e7eb; border-radius: 16px;
+    padding: 18px 18px; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+}
+.metric {
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 12px 16px;
+}
+.badge { display:inline-block; padding:4px 10px; border-radius:999px; font-size:12px; border:1px solid #e2e8f0; }
+.badge.green { background:#ecfdf5; color:#065f46; border-color:#a7f3d0; }
+.badge.yellow{ background:#fffbeb; color:#92400e; border-color:#fde68a; }
+.badge.red   { background:#fef2f2; color:#991b1b; border-color:#fecaca; }
+.table-note { color:#475569; font-size:12px; }
+hr { border: none; border-top: 1px solid #e5e7eb; margin: 1rem 0; }
 </style>
-""", unsafe_allow_html=True)
+"""
+st.markdown(LIGHT_CSS, unsafe_allow_html=True)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# TIME / SESSIONS
+# UTILITIES
 # ───────────────────────────────────────────────────────────────────────────────
-def rth_slots_ct(target_date: date) -> List[datetime]:
-    s = CT_TZ.localize(datetime.combine(target_date, time(8,30)))
-    e = CT_TZ.localize(datetime.combine(target_date, time(14,30)))
+def now_ct():
+    return datetime.now(CT)
+
+def localize_to_ct(idx):
+    if idx.tz is None:
+        return idx.tz_localize(ET).tz_convert(CT)
+    return idx.tz_convert(CT)
+
+def between_ct(df, start_str, end_str):
+    if df.empty:
+        return df
+    return df.between_time(start_str, end_str)
+
+def rth_slots(dt_date: date):
+    start_dt = CT.localize(datetime.combine(dt_date, RTH_START))
+    end_dt   = CT.localize(datetime.combine(dt_date, RTH_END))
     slots = []
-    cur = s
-    while cur <= e:
+    cur = start_dt
+    while cur <= end_dt:
         slots.append(cur)
         cur += timedelta(minutes=30)
     return slots
 
-def format_ct_time(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = CT_TZ.localize(dt)
-    else:
-        dt = dt.astimezone(CT_TZ)
-    return dt.strftime("%H:%M")
+def is_maintenance(dt_ct: datetime) -> bool:
+    t = dt_ct.time()
+    return t >= time(16,0) and t < time(17,0)
 
-def _is_maintenance(dt_ct: datetime) -> bool:
-    """Daily maintenance halt 16:00–17:00 CT."""
-    t = dt_ct.timetz()
-    return dtime(16,0) <= t < dtime(17,0)
+def is_weekend_halt(dt_ct: datetime) -> bool:
+    wd = dt_ct.weekday()  # Mon=0 ... Sun=6
+    if wd == 4 and dt_ct.time() >= time(16,0):  # Fri after 16:00
+        return True
+    if wd == 5:  # Saturday all
+        return True
+    if wd == 6 and dt_ct.time() < time(17,0):  # Sunday before 17:00
+        return True
+    return False
 
-def _is_globex_open(dt_ct: datetime) -> bool:
-    """
-    Globex session rules (CT):
-      - Sunday: opens 17:00
-      - Mon–Thu: 17:00 previous day → 16:00 current day (maintenance 16:00–17:00)
-      - Friday: closes 16:00; weekend halt until Sunday 17:00
-    """
-    if _is_maintenance(dt_ct):
-        return False
-    wd = dt_ct.weekday()  # Mon=0..Sun=6
-    t  = dt_ct.timetz()
-    if wd == 5:  # Saturday
-        return False
-    if wd == 6:  # Sunday
-        return t >= dtime(17,0)
-    if wd == 4:  # Friday
-        return t < dtime(16,0)
-    return True  # Mon–Thu (outside maintenance)
-
-def _ceil_to_next_30m(dt_ct: datetime) -> datetime:
-    dt_ct = dt_ct.astimezone(CT_TZ)
-    if dt_ct.minute in (0,30) and dt_ct.second == 0 and dt_ct.microsecond == 0:
-        return dt_ct
-    if dt_ct.minute < 30:
-        return dt_ct.replace(minute=30, second=0, microsecond=0)
-    return (dt_ct.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-
-def trading_blocks_since(anchor_time: datetime, slot_time: datetime) -> float:
-    """
-    Count 30-minute blocks between anchor_time and slot_time,
-    including ONLY times where Globex is open; excludes maintenance halt and weekend.
-    Assumes both are timezone-aware CT.
-    We count a block if the END of that 30m step lands in open trading.
-    """
-    if slot_time <= anchor_time:
-        return 0.0
-    step = timedelta(minutes=30)
-    t = _ceil_to_next_30m(anchor_time)
+def count_trading_blocks(start_ct: datetime, end_ct: datetime) -> int:
+    """Count 30-min blocks excluding maintenance and weekend halt."""
+    if end_ct <= start_ct:
+        return 0
+    cur = start_ct
     blocks = 0
-    while t <= slot_time:
-        if _is_globex_open(t):
+    while cur < end_ct:
+        if not is_maintenance(cur) and not is_weekend_halt(cur):
             blocks += 1
-        t += step
-    return float(blocks)
+        cur += timedelta(minutes=30)
+    return blocks
 
 # ───────────────────────────────────────────────────────────────────────────────
-# DATA
+# DATA FETCH
 # ───────────────────────────────────────────────────────────────────────────────
-def validate_ohlc_data(df: pd.DataFrame) -> bool:
-    if df.empty: return False
-    for c in ['Open','High','Low','Close']:
-        if c not in df.columns: return False
-    invalid = (
-        (df['High'] < df['Low']) |
-        (df['High'] < df['Open']) |
-        (df['High'] < df['Close'])|
-        (df['Low']  > df['Open']) |
-        (df['Low']  > df['Close'])|
-        (df['Close'] <= 0) | (df['High'] <= 0)
-    )
-    return not invalid.any()
-
-@st.cache_data(ttl=60)
-def fetch_live_data(symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
-    """Robust intraday fetch with period fallback, 30m interval, CT index."""
-    def _normalize(df):
-        if df.empty: return df
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] if isinstance(c, tuple) else str(c) for c in df.columns]
-        req = ['Open','High','Low','Close','Volume']
-        if any(c not in df.columns for c in req):
-            return pd.DataFrame()
-        if df.index.tz is None:
-            df.index = df.index.tz_localize('US/Eastern')
-        df.index = df.index.tz_convert(CT_TZ)
-        sdt = CT_TZ.localize(datetime.combine(start_date, time(0,0)))
-        edt = CT_TZ.localize(datetime.combine(end_date,   time(23,59)))
-        return df.loc[sdt:edt]
-
+@st.cache_data(ttl=120)
+def fetch_bars(symbol: str, start_date: date, end_date: date, interval: str) -> pd.DataFrame:
     try:
-        t = yf.Ticker(symbol)
-        df = t.history(
-            start=(start_date - timedelta(days=5)).strftime('%Y-%m-%d'),
-            end=(end_date + timedelta(days=2)).strftime('%Y-%m-%d'),
-            interval="30m", prepost=True, auto_adjust=False, back_adjust=False
+        start_str = (start_date - timedelta(days=2)).strftime("%Y-%m-%d")
+        end_str   = (end_date + timedelta(days=2)).strftime("%Y-%m-%d")
+        df = yf.Ticker(symbol).history(
+            start=start_str, end=end_str, interval=interval, prepost=True, auto_adjust=False, back_adjust=False
         )
-        df = _normalize(df)
-
-        if df.empty:
-            days = max(7, (end_date - start_date).days + 7)
-            df2 = t.history(period=f"{days}d", interval="30m",
-                            prepost=True, auto_adjust=False, back_adjust=False)
-            df = _normalize(df2)
-
-        if df.empty:
+        if df is None or df.empty:
             return pd.DataFrame()
-
-        if not validate_ohlc_data(df):
-            st.warning(f"⚠️ Data quality issues detected for {symbol}")
+        # Standardize columns
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+        if "Open" not in df.columns:
+            return pd.DataFrame()
+        df.index = localize_to_ct(df.index)
+        # Filter to requested date(s)
+        sdt = CT.localize(datetime.combine(start_date, time(0,0)))
+        edt = CT.localize(datetime.combine(end_date, time(23,59)))
+        df = df.loc[(df.index >= sdt) & (df.index <= edt)]
         return df
-
-    except Exception as e:
-        st.error(f"❌ Error fetching {symbol}: {e}")
+    except Exception:
         return pd.DataFrame()
 
-def get_session_window(df: pd.DataFrame, start_time: str, end_time: str) -> pd.DataFrame:
-    if df.empty: return df
-    return df.between_time(start_time, end_time)
+@st.cache_data(ttl=300)
+def es30(prev_day: date, proj_day: date) -> pd.DataFrame:
+    return fetch_bars("ES=F", prev_day - timedelta(days=1), proj_day, "30m")
 
-def get_daily_ohlc(df: pd.DataFrame, target_date: date) -> Dict:
-    if df.empty: return {}
-    sdt = CT_TZ.localize(datetime.combine(target_date, time(0,0)))
-    edt = CT_TZ.localize(datetime.combine(target_date, time(23,59)))
-    day = df.loc[sdt:edt]
-    if day.empty: return {}
-    o = day.iloc[0]['Open']
-    h = day['High'].max(); ht = day[day['High']==h].index[0]
-    l = day['Low'].min();  lt = day[day['Low']==l].index[0]
-    c = day.iloc[-1]['Close']; ct = day.index[-1]
-    return {'open':(o,day.index[0]), 'high':(h,ht), 'low':(l,lt), 'close':(c,ct)}
+@st.cache_data(ttl=300)
+def es1m(day: date) -> pd.DataFrame:
+    return fetch_bars("ES=F", day, day, "1m")
+
+@st.cache_data(ttl=300)
+def spx30(prev_day: date, proj_day: date) -> pd.DataFrame:
+    return fetch_bars("^GSPC", prev_day, proj_day, "30m")
+
+@st.cache_data(ttl=300)
+def spy30(prev_day: date, proj_day: date) -> pd.DataFrame:
+    return fetch_bars("SPY", prev_day, proj_day, "30m")
+
+@st.cache_data(ttl=300)
+def stock30(symbol: str, start_day: date, end_day: date) -> pd.DataFrame:
+    return fetch_bars(symbol, start_day, end_day, "30m")
 
 # ───────────────────────────────────────────────────────────────────────────────
-# PROJECTIONS
+# OFFSET & ATR
 # ───────────────────────────────────────────────────────────────────────────────
-def project_line(anchor_price: float, anchor_time: datetime, slope_per_block: float,
-                 target_date: date, col_name: str) -> pd.DataFrame:
-    """Project using ONLY trading-active 30m blocks between anchor and each RTH slot."""
+def compute_es_spx_offset(prev_or_proj_day: date) -> float:
+    """ES→SPX offset from last RTH close on given day; fallback SPY."""
+    es = fetch_bars("ES=F", prev_or_proj_day, prev_or_proj_day, "30m")
+    es_rth = between_ct(es, "08:30", "14:30")
+    if es_rth.empty:
+        return 0.0
+    es_close = es_rth.iloc[-1]["Close"]
+
+    spx = spx30(prev_or_proj_day, prev_or_proj_day)
+    spx_rth = between_ct(spx, "08:30", "14:30")
+    if not spx_rth.empty:
+        spx_close = spx_rth.iloc[-1]["Close"]
+        return float(spx_close - es_close)
+
+    spy = spy30(prev_or_proj_day, prev_or_proj_day)
+    spy_rth = between_ct(spy, "08:30", "14:30")
+    if not spy_rth.empty:
+        spy_close = spy_rth.iloc[-1]["Close"]
+        # SPY ~ (SPX/10) roughly; scale back to SPX (approx). If you prefer strict, set 0.
+        # We'll keep conservative: don't scale; better show 0 than mislead.
+        return 0.0
+
+    return 0.0
+
+def atr(series_high, series_low, series_close, n=14):
+    tr1 = series_high - series_low
+    tr2 = (series_high - series_close.shift()).abs()
+    tr3 = (series_low  - series_close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+def ema(s, span):
+    return s.ewm(span=span, adjust=False).mean()
+
+# ───────────────────────────────────────────────────────────────────────────────
+# ANCHOR EXTRACTION (ES space)
+# ───────────────────────────────────────────────────────────────────────────────
+def prev_day_es_close(df30_prev: pd.DataFrame, prev_day: date):
+    rth = between_ct(df30_prev, "08:30", "14:30")
+    if rth.empty:
+        return None, None
+    row = rth.iloc[-1]
+    return float(row["Close"]), rth.index[-1]
+
+def prev_day_high_low(df30_prev_full: pd.DataFrame, prev_day: date):
+    day_s = CT.localize(datetime.combine(prev_day, time(0,0)))
+    day_e = CT.localize(datetime.combine(prev_day, time(23,59)))
+    day = df30_prev_full.loc[(df30_prev_full.index>=day_s)&(df30_prev_full.index<=day_e)]
+    if day.empty:
+        return (None,None,None,None)
+    hi_idx = day["High"].idxmax()
+    lo_idx = day["Low"].idxmin()
+    return float(day.loc[hi_idx,"High"]), hi_idx, float(day.loc[lo_idx,"Low"]), lo_idx
+
+def asian_skyline_baseline(df30_wide: pd.DataFrame, prev_day: date, proj_day: date):
+    start = CT.localize(datetime.combine(prev_day, time(17,0)))
+    end   = CT.localize(datetime.combine(proj_day, time(7,0)))
+    win = df30_wide.loc[(df30_wide.index>=start)&(df30_wide.index<=end)]
+    if win.empty:
+        return (None,None,None,None)
+    hi_idx = win["High"].idxmax()
+    lo_idx = win["Low"].idxmin()
+    return float(win.loc[hi_idx,"High"]), hi_idx, float(win.loc[lo_idx,"Low"]), lo_idx
+
+# ───────────────────────────────────────────────────────────────────────────────
+# PROJECTIONS (ES → SPX via offset)
+# ───────────────────────────────────────────────────────────────────────────────
+def project_line_from_anchor_es(anchor_price: float, anchor_time: datetime, slope: float, slots: list[datetime]):
     rows = []
-    for t in rth_slots_ct(target_date):
-        b = trading_blocks_since(anchor_time, t)
-        price = anchor_price + slope_per_block * b
-        rows.append({'Time': format_ct_time(t), col_name: round(price,2), 'Blocks': round(b,1)})
+    for t in slots:
+        blocks = count_trading_blocks(anchor_time, t)
+        price_es = anchor_price + slope * blocks
+        rows.append({"Time": t, "ES_Price": price_es, "Blocks": blocks})
     return pd.DataFrame(rows)
 
-def project_close_fan(close_price: float, close_time: datetime, target_date: date) -> pd.DataFrame:
-    top = project_line(close_price, close_time, +SLOPE_PER_BLOCK, target_date, 'Top')
-    bot = project_line(close_price, close_time, -SLOPE_PER_BLOCK, target_date, 'Bottom')
-    df = pd.merge(top[['Time','Top']], bot[['Time','Bottom']], on='Time', how='inner')
-    df['Fan_Width'] = (df['Top'] - df['Bottom']).round(2)
-    df['Mid'] = round(close_price,2)
-    return df
+def build_spx_fan_tables(prev_day: date, proj_day: date, skybas_on=True):
+    df30 = es30(prev_day, proj_day)
+    if df30.empty:
+        return None
+
+    # Anchors
+    close_price, close_time = prev_day_es_close(df30, prev_day)
+    hi, hi_t, lo, lo_t = prev_day_high_low(df30, prev_day)
+    sky, sky_t, base, base_t = asian_skyline_baseline(df30, prev_day, proj_day) if skybas_on else (None,None,None,None)
+
+    # Guard
+    if close_price is None or hi is None or lo is None:
+        return None
+
+    # Slots for projection day
+    slots = rth_slots(proj_day)
+
+    # ES projections
+    close_top_es  = project_line_from_anchor_es(close_price, close_time, +SPX_FAN_SLOPE, slots)
+    close_bot_es  = project_line_from_anchor_es(close_price, close_time, -SPX_FAN_SLOPE, slots)
+    high_line_es  = project_line_from_anchor_es(hi,          hi_t,        +SPX_FAN_SLOPE, slots)
+    low_line_es   = project_line_from_anchor_es(lo,          lo_t,        -SPX_FAN_SLOPE, slots)
+    sky_line_es   = project_line_from_anchor_es(sky,         sky_t,       +SPX_FAN_SLOPE, slots) if sky is not None else None
+    base_line_es  = project_line_from_anchor_es(base,        base_t,      -SPX_FAN_SLOPE, slots) if base is not None else None
+
+    # ES→SPX offset from prev_day RTH
+    offset = compute_es_spx_offset(prev_day)
+
+    # Merge & convert to SPX
+    df = close_top_es.merge(close_bot_es, on=["Time","Blocks"], suffixes=("_TopES","_BotES"))
+    df["SPX_Top"] = df["ES_Price_TopES"] + offset
+    df["SPX_Bot"] = df["ES_Price_BotES"] + offset
+    df["SPX_Mid"] = (df["SPX_Top"] + df["SPX_Bot"]) / 2.0
+    df["SPX_FanWidth"] = (df["SPX_Top"] - df["SPX_Bot"]).abs()
+
+    # Add anchors (SPX)
+    df["SPX_High+"] = (high_line_es["ES_Price"] + offset).values
+    df["SPX_Low−"]  = (low_line_es["ES_Price"]  + offset).values
+    if sky_line_es is not None and base_line_es is not None:
+        df["SPX_Skyline"]  = (sky_line_es["ES_Price"]  + offset).values
+        df["SPX_Baseline"] = (base_line_es["ES_Price"] + offset).values
+    else:
+        df["SPX_Skyline"]  = np.nan
+        df["SPX_Baseline"] = np.nan
+
+    # Pretty view
+    out = pd.DataFrame({
+        "Time": [t.strftime("%H:%M") for t in df["Time"]],
+        "Top": df["SPX_Top"].round(2),
+        "Bottom": df["SPX_Bot"].round(2),
+        "Fan_Width": df["SPX_FanWidth"].round(2),
+        "Mid(Prev Close)": df["SPX_Mid"].round(2),
+        "High(+0.333)": df["SPX_High+"].round(2),
+        "Low(−0.333)": df["SPX_Low−"].round(2),
+        "Skyline(Asian)": df["SPX_Skyline"].round(2),
+        "Baseline(Asian)": df["SPX_Baseline"].round(2),
+    })
+    meta = {
+        "offset": offset,
+        "close_time": close_time,
+        "hi_time": hi_t,
+        "lo_time": lo_t,
+        "sky_time": sky_t,
+        "base_time": base_t
+    }
+    return out, df, meta
 
 # ───────────────────────────────────────────────────────────────────────────────
-# STRATEGY (Bias + fan entries/targets + mean reversion when outside fan)
+# SIGNALS: TOUCH + SAME-BAR 1-MIN EMA CONFIRMATION (ES engine → SPX)
 # ───────────────────────────────────────────────────────────────────────────────
-def df_to_time_price_lookup(df: pd.DataFrame, price_col: str) -> Dict[str,float]:
-    if df is None or df.empty: return {}
-    return {row['Time']: row[price_col] for _,row in df[['Time',price_col]].iterrows()}
+def detect_touch_and_confirmation(prev_day, proj_day, fan_df_internal):
+    """fan_df_internal is the ES→SPX merged internal (df), includes ES blocks and SPX levels.
+       We use ES 1m for confirmation; display SPX numbers only."""
+    # Fetch 30m SPX (for prices to show) via ES+offset: we will use ES 30m but convert closes
+    # For touch accuracy, we use the 30m ES bars mapped to SPX via offset
+    es30_df = es30(proj_day, proj_day)
+    if es30_df.empty:
+        return pd.DataFrame()
+    es30_rth = between_ct(es30_df, "08:30", "14:30")
+    if es30_rth.empty:
+        return pd.DataFrame()
 
-def build_strategy_from_fan(
-    rth_prices: pd.DataFrame, fan_df: pd.DataFrame,
-    high_up_df: Optional[pd.DataFrame], low_dn_df: Optional[pd.DataFrame],
-    anchor_close_price: float
-) -> pd.DataFrame:
-    """
-    Within fan:
-      - Bias UP → BUY Bottom → TP at Top
-      - Bias DOWN → SELL Top → TP at Bottom
+    offset_today = compute_es_spx_offset(proj_day)  # for display of SPX price on projection day
+    # Tolerance from 30m ATR (ES) mapped to SPX (same difference)
+    atr30 = atr(es30_rth["High"], es30_rth["Low"], es30_rth["Close"], 14)
+    tol = (atr30.iloc[-1] if not atr30.empty else 0) * 0.30  # 30% ATR
+    tol = float(tol) if not np.isnan(tol) else 1.0
 
-    Outside fan (mean reversion rule you specified):
-      - ABOVE fan → use High(+0.377) as MR trigger; SELL from High(+0.377) → TP1=Top (mean), TP2=Top−width
-      - BELOW fan → use Low(−0.377) as MR trigger; BUY  from Low(−0.377) → TP1=Bottom (mean), TP2=Bottom+width
-    """
-    if rth_prices.empty or fan_df.empty: return pd.DataFrame()
+    # 1m ES for confirmation
+    es1 = es1m(proj_day)
+    if es1.empty:
+        return pd.DataFrame()
+    # 1m EMA
+    es1["EMA8"]  = ema(es1["Close"], 8)
+    es1["EMA21"] = ema(es1["Close"], 21)
 
-    price_lookup = {format_ct_time(ix): rth_prices.loc[ix,'Close'] for ix in rth_prices.index}
-    top_lu   = df_to_time_price_lookup(fan_df, 'Top')
-    bot_lu   = df_to_time_price_lookup(fan_df, 'Bottom')
-    high_up  = df_to_time_price_lookup(high_up_df, 'High_Asc')
-    low_dn   = df_to_time_price_lookup(low_dn_df,  'Low_Desc')
-
-    rows=[]
-    for t in fan_df['Time']:
-        if t not in price_lookup: continue
-        p   = price_lookup[t]
-        top = top_lu.get(t,np.nan)
-        bot = bot_lu.get(t,np.nan)
-        width = top - bot if pd.notna(top) and pd.notna(bot) else np.nan
-        bias = "UP" if p >= anchor_close_price else "DOWN"
-
-        if pd.isna(width):
+    rows = []
+    for i, (t, row) in enumerate(es30_rth.iterrows()):
+        time_str = t.strftime("%H:%M")
+        spx_price_close = row["Close"] + offset_today
+        # Fan lines at this slot
+        m = fan_df_internal.loc[fan_df_internal["Time"]==t]
+        if m.empty:
             continue
+        spx_top = float(m["SPX_Top"])
+        spx_bot = float(m["SPX_Bot"])
 
-        within = bot <= p <= top
-        above  = p > top
-        below  = p < bot
+        # Touch logic on 30m bar (display SPX; compute using ES + offset)
+        spx_high = row["High"] + offset_today
+        spx_low  = row["Low"]  + offset_today
+        spx_open = row["Open"] + offset_today
+        spx_close= spx_price_close
 
-        direction=""; entry=np.nan; tp1=np.nan; tp2=np.nan; mr_trigger=np.nan; note=""
+        touched_top = spx_high >= spx_top - tol and spx_low <= spx_top + tol
+        touched_bot = spx_low  <= spx_bot + tol and spx_high>= spx_bot - tol
 
-        if within:
-            if bias=="UP":
-                direction="BUY"; entry=bot; tp1=top; tp2=top
-                note="Within fan; bias UP → buy bottom edge; mean=top edge."
-            else:
-                direction="SELL"; entry=top; tp1=bot; tp2=bot
-                note="Within fan; bias DOWN → sell top edge; mean=bottom edge."
+        touch_side = None
+        if touched_top:
+            # Direction of approach
+            from_below = spx_open < spx_top
+            touch_side = "Top_from_below" if from_below else "Top_from_above"
+        elif touched_bot:
+            from_above = spx_open > spx_bot
+            touch_side = "Bottom_from_above" if from_above else "Bottom_from_below"
 
-        elif above:
-            # Mean reversion from High(+0.377) down to Top (mean)
-            mr_trigger = high_up.get(t, np.nan)
-            direction  = "SELL"
-            entry      = mr_trigger if pd.notna(mr_trigger) else top
-            tp1        = top                                 # mean
-            tp2        = top - width                         # extension beyond mean
-            note = "Above fan: MR from High(+0.377) → SELL to Top (mean), TP2=Top−width."
+        signal = ""
+        cross_type = ""
+        next_expect = ""
+        target = ""
+        ema8 = np.nan; ema21 = np.nan
 
-        elif below:
-            # Mean reversion from Low(−0.377) up to Bottom (mean)
-            mr_trigger = low_dn.get(t, np.nan)
-            direction  = "BUY"
-            entry      = mr_trigger if pd.notna(mr_trigger) else bot
-            tp1        = bot                                 # mean
-            tp2        = bot + width                         # extension beyond mean
-            note = "Below fan: MR from Low(−0.377) → BUY to Bottom (mean), TP2=Bottom+width."
+        if touch_side:
+            # Same 30m window in 1m
+            win = es1.loc[(es1.index >= t) & (es1.index < t + timedelta(minutes=30))]
+            if not win.empty and len(win) > 1:
+                # Minute-level touch prox check and EMA cross
+                # Cross occurs when (EMA8_prev<=EMA21_prev and EMA8>EMA21) or vice versa.
+                win["EMA8_prev"] = win["EMA8"].shift()
+                win["EMA21_prev"] = win["EMA21"].shift()
+                # Map fan to ES by subtracting today's offset (constant); relation preserved either way.
+                es_top = spx_top - offset_today
+                es_bot = spx_bot - offset_today
+
+                # Check same-bar cross aligned with touch rule
+                for idx1m, r1 in win.iloc[1:].iterrows():
+                    touched_top_1m = (r1["High"] >= es_top - tol) and (r1["Low"] <= es_top + tol)
+                    touched_bot_1m = (r1["Low"]  <= es_bot + tol) and (r1["High"]>= es_bot - tol)
+                    bull_cross = (r1["EMA8_prev"] <= r1["EMA21_prev"]) and (r1["EMA8"] > r1["EMA21"])
+                    bear_cross = (r1["EMA8_prev"] >= r1["EMA21_prev"]) and (r1["EMA8"] < r1["EMA21"])
+                    if touch_side == "Bottom_from_above" and touched_bot_1m and bull_cross:
+                        signal     = "BUY (bottom touch + bullish 1m cross)"
+                        cross_type = "Bullish"
+                        next_expect= "Move to Top"
+                        target     = f"{spx_top:.2f}"
+                        ema8, ema21= float(r1["EMA8"]), float(r1["EMA21"])
+                        break
+                    if touch_side == "Bottom_from_below" and touched_bot_1m and bear_cross:
+                        signal     = "SELL (bottom touch from below + bearish 1m cross)"
+                        cross_type = "Bearish"
+                        next_expect= "Continuation lower"
+                        target     = f"{spx_bot:.2f}"
+                        ema8, ema21= float(r1["EMA8"]), float(r1["EMA21"])
+                        break
+                    if touch_side == "Top_from_below" and touched_top_1m and bear_cross:
+                        signal     = "SELL (top touch + bearish 1m cross)"
+                        cross_type = "Bearish"
+                        next_expect= "Move to Bottom"
+                        target     = f"{spx_bot:.2f}"
+                        ema8, ema21= float(r1["EMA8"]), float(r1["EMA21"])
+                        break
+                    if touch_side == "Top_from_above" and touched_top_1m and bull_cross:
+                        signal     = "BUY (top touch from above + bullish 1m cross)"
+                        cross_type = "Bullish"
+                        next_expect= "Breakout / continuation"
+                        target     = f"{spx_top:.2f}"
+                        ema8, ema21= float(r1["EMA8"]), float(r1["EMA21"])
+                        break
 
         rows.append({
-            'Time': t, 'Price': round(p,2), 'Bias': bias, 'EntrySide': direction,
-            'MR_Trigger': round(mr_trigger,2) if pd.notna(mr_trigger) else "",
-            'Entry': round(entry,2) if pd.notna(entry) else np.nan,
-            'TP1_Mean': round(tp1,2) if pd.notna(tp1) else np.nan,
-            'TP2_Ext': round(tp2,2) if pd.notna(tp2) else np.nan,
-            'Top': round(top,2), 'Bottom': round(bot,2),
-            'Fan_Width': round(width,2), 'Note': note
+            "Time": time_str,
+            "Price": round(spx_price_close,2),
+            "Top": round(spx_top,2), "Bottom": round(spx_bot,2),
+            "TouchSide": touch_side or "",
+            "1m_EMA8": round(ema8,2) if not np.isnan(ema8) else "",
+            "1m_EMA21": round(ema21,2) if not np.isnan(ema21) else "",
+            "CrossType": cross_type,
+            "Signal": signal,
+            "Next_Expectation": next_expect,
+            "Target": target
         })
-
     return pd.DataFrame(rows)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# FAN TOUCH SIGNAL RULES (Next-candle expectations)
+# STRATEGY TABLE (SPX display)
 # ───────────────────────────────────────────────────────────────────────────────
-def evaluate_fan_touch_signals(rth_prices: pd.DataFrame, fan_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Implements your rules:
-    - Bottom touch & bearish candle that closes above bottom → Next bullish → BUY to Top.
-    - First RTH bar touches bottom & closes bullish → Next bearish → SELL, break down through fan.
-    - Top touch & closes bearish → Next bullish → BUY, break up through fan.
-    - Top touch & closes bullish but below top → Next bearish → SELL to Bottom.
-    """
-    if rth_prices.empty or fan_df.empty:
+def build_strategy_table_spx(proj_day: date, fan_pretty: pd.DataFrame, fan_internal: pd.DataFrame):
+    # Price per slot from ES 30m mapped to SPX (display only)
+    es = es30(proj_day, proj_day)
+    if es.empty:
         return pd.DataFrame()
+    rth = between_ct(es, "08:30", "14:30")
+    if rth.empty:
+        return pd.DataFrame()
+    offset_today = compute_es_spx_offset(proj_day)
 
-    top_lu = df_to_time_price_lookup(fan_df, 'Top')
-    bot_lu = df_to_time_price_lookup(fan_df, 'Bottom')
-
-    rows=[]
-    idxs = list(rth_prices.index)
-    for i, ts in enumerate(idxs):
-        tstr = format_ct_time(ts)
-        if tstr not in top_lu or tstr not in bot_lu:
+    rows = []
+    for t,row in rth.iterrows():
+        spx_price = row["Close"] + offset_today
+        time_str = t.strftime("%H:%M")
+        f = fan_internal.loc[fan_internal["Time"]==t]
+        if f.empty:
             continue
-
-        bar = rth_prices.loc[ts]
-        o,h,l,c = bar['Open'], bar['High'], bar['Low'], bar['Close']
-        top = top_lu[tstr]; bottom = bot_lu[tstr]
-        is_bull = c > o
-        is_bear = c < o
-
-        touched_bottom = (l <= bottom <= h)
-        touched_top    = (l <= top    <= h)
-
-        signal=None; next_dir=None; target=None; rationale=None
-
-        # SPECIAL: first RTH bar override
-        if i == 0 and touched_bottom and is_bull:
-            signal   = "FirstBar_BottomTouch_BullClose"
-            next_dir = "BEARISH_NEXT"  # next candle expected bearish & breakdown
-            target   = "BreakDown_Through_Fan"
-            rationale= "First RTH bar touched bottom & closed bullish → next candle bearish breakdown."
+        top = float(f["SPX_Top"]); bot = float(f["SPX_Bot"])
+        fan_w = float((top - bot))
+        if spx_price > top:
+            bias = "UP"
+            entry_side = "SELL (MR)"
+            mr_trigger = float(f["SPX_High+"])
+            entry = mr_trigger
+            tp1 = top
+            tp2 = top - fan_w
+            note = "Above fan → mean reversion via High(+)"
+        elif spx_price < bot:
+            bias = "DOWN"
+            entry_side = "BUY (MR)"
+            mr_trigger = float(f["SPX_Low−"])
+            entry = mr_trigger
+            tp1 = bot
+            tp2 = bot + fan_w
+            note = "Below fan → mean reversion via Low(−)"
         else:
-            # Bottom touch rule
-            if touched_bottom and is_bear and (c > bottom):
-                signal   = "BottomTouch_BearCloseAboveBottom"
-                next_dir = "BULLISH_NEXT"
-                target   = "BUY_to_Top"
-                rationale= "Bearish candle touched bottom but closed above → next bullish to Top."
+            bias = "RANGE"
+            # inside fan: fade edges (direction chooses edge)
+            if abs(spx_price - bot) < abs(spx_price - top):
+                entry_side = "BUY (fade)"
+                mr_trigger = bot
+                entry = bot
+                tp1 = top
+                tp2 = top  # edge-to-edge simple guide
+                note = "Inside fan → fade bottom to top"
+            else:
+                entry_side = "SELL (fade)"
+                mr_trigger = top
+                entry = top
+                tp1 = bot
+                tp2 = bot
+                note = "Inside fan → fade top to bottom"
 
-            # Top touch rules
-            elif touched_top and is_bear:
-                signal   = "TopTouch_BearClose"
-                next_dir = "BULLISH_NEXT"
-                target   = "BUY_break_Up_Through_Fan"
-                rationale= "Touched Top and closed bearish → next bullish breakout up."
-
-            elif touched_top and is_bull and (c < top):
-                signal   = "TopTouch_BullClose_BelowTop"
-                next_dir = "BEARISH_NEXT"
-                target   = "SELL_to_Bottom"
-                rationale= "Touched Top; bullish close but below Top → next bearish to Bottom."
-
-        if signal:
-            rows.append({
-                'Time': tstr, 'Open': round(o,2), 'High': round(h,2), 'Low': round(l,2), 'Close': round(c,2),
-                'Top': round(top,2), 'Bottom': round(bottom,2),
-                'Signal': signal, 'Next_Expectation': next_dir, 'Suggested_Action_Target': target,
-                'Note': rationale
-            })
-
+        rows.append({
+            "Time": time_str, "Price": round(spx_price,2),
+            "Bias": bias, "EntrySide": entry_side,
+            "Entry": round(entry,2), "MR_Trigger": round(mr_trigger,2),
+            "TP1_Mean": round(tp1,2), "TP2_Ext": round(tp2,2),
+            "Top": round(top,2), "Bottom": round(bot,2),
+            "Fan_Width": round(fan_w,2), "Note": note
+        })
     return pd.DataFrame(rows)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# INDICATORS (minimal)
+# STOCK PARALLEL CHANNEL (Mon/Tue) with per-stock slopes
 # ───────────────────────────────────────────────────────────────────────────────
-def calculate_average_true_range(data: pd.DataFrame, periods: int = 14) -> pd.Series:
-    if data.empty or len(data) < periods: return pd.Series(index=data.index, dtype=float)
-    hl = data['High']-data['Low']
-    hc = np.abs(data['High']-data['Close'].shift())
-    lc = np.abs(data['Low'] -data['Close'].shift())
-    tr = np.maximum(hl, np.maximum(hc, lc))
-    return tr.rolling(window=periods).mean()
-
-def calculate_market_volatility(data: pd.DataFrame) -> float:
-    if data.empty or len(data) < 2: return 1.5
-    r = data['Close'].pct_change().dropna()
-    if r.empty: return 1.5
-    return r.std()*np.sqrt(390)*100
-
-# ───────────────────────────────────────────────────────────────────────────────
-# HEADER METRICS
-# ───────────────────────────────────────────────────────────────────────────────
-now = datetime.now(CT_TZ)
-c1,c2,c3 = st.columns(3)
-with c1:
-    st.markdown(f"""
-    <div class="metric-container">
-        <h3>⏰ Current Time (CT)</h3>
-        <h2>{now.strftime("%H:%M:%S")}</h2>
-        <p>{now.strftime("%A, %B %d")}</p>
-    </div>""", unsafe_allow_html=True)
-with c2:
-    wkday = now.weekday()<5
-    mo = now.replace(hour=8,minute=30,second=0,microsecond=0)
-    mc = now.replace(hour=14,minute=30,second=0,microsecond=0)
-    is_rth = wkday and (mo <= now <= mc)
-    status_color = "#00ff88" if is_rth else ("#ffbb33" if wkday else "#ff6b6b")
-    status_text  = "MARKET OPEN" if is_rth else ("MARKET CLOSED" if wkday else "WEEKEND")
-    st.markdown(f"""
-    <div class="metric-container">
-        <h3>Market Status</h3>
-        <h2 style="color:{status_color};">{status_text}</h2>
-        <p>RTH: 08:30 - 14:30 CT</p>
-        <p>Mon-Fri Only</p>
-    </div>""", unsafe_allow_html=True)
-with c3:
-    st.markdown(f"""
-    <div class="metric-container">
-        <h3>📐 Slope per 30m</h3>
-        <h2>{SLOPE_PER_BLOCK:+.3f}</h2>
-        <p>Ascending / Descending magnitude</p>
-    </div>""", unsafe_allow_html=True)
-
-st.markdown("---")
+def stock_parallel_channel(symbol: str, mon: date, tue: date, slope: float):
+    df = stock30(symbol, mon, tue)
+    if df.empty:
+        return None, None
+    # swings over combined window
+    hi_idx = df["High"].idxmax()
+    lo_idx = df["Low"].idxmin()
+    hi_price, hi_time = float(df.loc[hi_idx,"High"]), hi_idx
+    lo_price, lo_time = float(df.loc[lo_idx,"Low"]),  lo_idx
+    # project forward for rest of week (Wed-Fri)
+    start_day = tue + timedelta(days=1)
+    slots = rth_slots(start_day) + rth_slots(start_day+timedelta(days=1)) + rth_slots(start_day+timedelta(days=2))
+    rows = []
+    for t in slots:
+        blocks_hi = count_trading_blocks(hi_time, t)
+        blocks_lo = count_trading_blocks(lo_time, t)
+        hi_line = hi_price + slope * blocks_hi
+        lo_line = lo_price + slope * blocks_lo  # same slope → parallel
+        rows.append({"Time": t.strftime("%a %H:%M"), "Upper": round(hi_line,2), "Lower": round(lo_line,2)})
+    chan = pd.DataFrame(rows)
+    info = {"High":(hi_price,hi_time), "Low":(lo_price,lo_time)}
+    return chan, info
 
 # ───────────────────────────────────────────────────────────────────────────────
-# TABS
+# CONTRACT TOOL (0–30), slope by trading blocks
 # ───────────────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(["SPX Anchors", "Stock Anchors", "Signals & EMA", "Contract Tool"])
+def contract_projection(p1_dt: datetime, p1_price: float, p2_dt: datetime, p2_price: float, proj_day: date):
+    if p2_dt <= p1_dt: return None
+    if not (0.0 <= p1_price <= 30.0 and 0.0 <= p2_price <= 30.0): return None
+    blocks = count_trading_blocks(p1_dt, p2_dt)
+    slope = (p2_price - p1_price)/blocks if blocks>0 else 0.0
+    rows=[]
+    for t in rth_slots(proj_day):
+        b = count_trading_blocks(p1_dt, t)
+        price = p1_price + slope*b
+        rows.append({"Time": t.strftime("%H:%M"), "Contract_Price": round(price,2), "Blocks": b})
+    return pd.DataFrame(rows), slope
 
-# ╔═════════════════════════════════════════════════════════════════════════════╗
-# ║ TAB 1: SPX ANCHORS                                                          ║
-# ╚═════════════════════════════════════════════════════════════════════════════╝
-with tab1:
-    st.subheader("SPX Close-Anchor Fan + Mean Reversion (High+/Low− outside-fan)")
-    left, right = st.columns(2)
-    with left:
-        prev_day = st.date_input("Previous Trading Day", value=(now.date()-timedelta(days=1)), key="spx_prev_day")
-        st.caption(prev_day.strftime("%A"))
-    with right:
-        proj_day = st.date_input("Projection Day", value=(prev_day + timedelta(days=1)), key="spx_proj_day")
-        st.caption(f"Projecting for: {proj_day.strftime('%A')}")
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR (controls)
+# ═══════════════════════════════════════════════════════════════════════════════
+st.sidebar.title("🌞 SPX Prophet")
+st.sidebar.caption("ES engine → SPX display (light mode)")
 
-    if st.button("Generate SPX Fan & Strategy", type="primary", key="spx_generate_fan"):
-        with st.spinner("Fetching market data & building fan..."):
-            # Fetch previous day (^GSPC then SPY fallback)
-            spx_prev = fetch_live_data("^GSPC", prev_day, prev_day)
-            if spx_prev.empty:
-                spx_prev = fetch_live_data("SPY", prev_day, prev_day)
+skybas_toggle = st.sidebar.checkbox("Show Skyline/Baseline (Asian session)", value=True)
+filters_toggle = st.sidebar.checkbox("Enable probability filters (touch quality, volume, etc.)", value=False)
 
-            spx_proj = fetch_live_data("^GSPC", proj_day, proj_day)
-            if spx_proj.empty:
-                spx_proj = fetch_live_data("SPY", proj_day, proj_day)
-
-            if spx_prev.empty:
-                st.error("No previous day data (SPX/SPY).")
-            elif spx_proj.empty:
-                st.error("No projection day data (SPX/SPY).")
-            else:
-                rth = get_session_window(spx_proj, RTH_START, RTH_END)
-
-                dprev = get_daily_ohlc(spx_prev, prev_day)
-                if not dprev or 'close' not in dprev:
-                    st.error("Could not extract previous day OHLC.")
-                else:
-                    close_price, close_time = dprev['close']
-                    high_price,  high_time  = dprev['high']
-                    low_price,   low_time   = dprev['low']
-
-                    # Fan and anchor lines (weekend/maintenance aware)
-                    fan_df  = project_close_fan(close_price, close_time, proj_day)
-                    high_up = project_line(high_price, high_time, +SLOPE_PER_BLOCK, proj_day, 'High_Asc')
-                    low_dn  = project_line(low_price,  low_time,  -SLOPE_PER_BLOCK, proj_day, 'Low_Desc')
-
-                    # Strategy table (with outside-fan MR rule)
-                    strat_df = build_strategy_from_fan(rth, fan_df, high_up, low_dn, anchor_close_price=close_price)
-
-                    # Touch signals based on your rules
-                    touch_df = evaluate_fan_touch_signals(rth, fan_df)
-
-                    st.markdown("### Fan Lines")
-                    st.dataframe(fan_df, use_container_width=True, hide_index=True)
-
-                    # Optional: explicit anchor slope tables
-                    show_lines = st.checkbox("Show explicit High/Low/Close slope lines", value=False)
-                    if show_lines:
-                        lt1, lt2, lt3, lt4 = st.tabs(["Close (+)", "Close (−)", "High (+)", "Low (−)"])
-                        with lt1:
-                            st.dataframe(project_line(close_price, close_time, +SLOPE_PER_BLOCK, proj_day, 'Close_Asc'), use_container_width=True, hide_index=True)
-                        with lt2:
-                            st.dataframe(project_line(close_price, close_time, -SLOPE_PER_BLOCK, proj_day, 'Close_Desc'), use_container_width=True, hide_index=True)
-                        with lt3:
-                            st.dataframe(high_up, use_container_width=True, hide_index=True)
-                        with lt4:
-                            st.dataframe(low_dn, use_container_width=True, hide_index=True)
-
-                    st.markdown("### Strategy Table (Bias, Entries, Mean Reversion Targets)")
-                    if not strat_df.empty:
-                        st.dataframe(strat_df, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("No strategy rows were generated (possible time alignment gap).")
-
-                    st.markdown("### Fan Touch Signals (Next Candle Expectations)")
-                    if not touch_df.empty:
-                        st.dataframe(touch_df, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("No qualifying fan touches in RTH for the rules provided.")
-
-# ╔═════════════════════════════════════════════════════════════════════════════╗
-# ║ TAB 2: STOCK ANCHORS (light sample)                                         ║
-# ╚═════════════════════════════════════════════════════════════════════════════╝
-with tab2:
-    st.subheader("Stock Anchors (Mon/Tue) — sample")
-    core = ['TSLA','NVDA','AAPL','MSFT','AMZN','GOOGL','META','NFLX']
-    ccols = st.columns(4)
-    selected = None
-    for i,tkr in enumerate(core):
-        if ccols[i%4].button(tkr, key=f"stkbtn_{tkr}"):
-            selected = tkr
-            st.session_state['selected_stock'] = tkr
-    custom = st.text_input("Custom Symbol", placeholder="Enter any ticker symbol", key="stk_custom")
-    if custom:
-        selected = custom.upper()
-        st.session_state['selected_stock'] = selected
-    if not selected and 'selected_stock' in st.session_state:
-        selected = st.session_state['selected_stock']
-    if selected:
-        mon_date = st.date_input("Monday Date", value=(now.date()-timedelta(days=2)), key=f"mon_{selected}")
-        tue_date = st.date_input("Tuesday Date", value=(mon_date+timedelta(days=1)), key=f"tue_{selected}")
-        if st.button(f"Analyze {selected}", type="primary", key=f"an_{selected}"):
-            mon = fetch_live_data(selected, mon_date, mon_date)
-            tue = fetch_live_data(selected, tue_date, tue_date)
-            if mon.empty and tue.empty:
-                st.error("No data for selected dates.")
-            else:
-                combined = mon if tue.empty else (tue if mon.empty else pd.concat([mon,tue]).sort_index())
-                st.dataframe(combined.tail(24), use_container_width=True)
-
-# ╔═════════════════════════════════════════════════════════════════════════════╗
-# ║ TAB 3: SIGNALS & EMA (minimal)                                              ║
-# ╚═════════════════════════════════════════════════════════════════════════════╝
-with tab3:
-    st.subheader("Signals & EMA 8/21 (RTH)")
-    sc1, sc2 = st.columns(2)
-    with sc1:
-        symbol = st.selectbox("Symbol", ["^GSPC","ES=F","SPY"], index=0)
-    with sc2:
-        sday = st.date_input("Day", value=now.date())
-    if st.button("Analyze", type="primary", key="sig"):
-        data = fetch_live_data(symbol, sday, sday)
-        rth = get_session_window(data, RTH_START, RTH_END)
-        if rth.empty:
-            st.error("No RTH data.")
-        else:
-            ema8  = rth['Close'].ewm(span=8).mean()
-            ema21 = rth['Close'].ewm(span=21).mean()
-            out=[]
-            for i in range(1,len(rth)):
-                t = format_ct_time(rth.index[i]); p=rth['Close'].iloc[i]
-                prev8, prev21 = ema8.iloc[i-1], ema21.iloc[i-1]
-                c8, c21 = ema8.iloc[i], ema21.iloc[i]
-                cross=None
-                if prev8<=prev21 and c8>c21: cross="Bullish Cross"
-                elif prev8>=prev21 and c8<c21: cross="Bearish Cross"
-                sep = abs(c8-c21)/c21*100 if c21!=0 else 0
-                out.append({'Time':t,'Price':round(p,2),'EMA8':round(c8,2),'EMA21':round(c21,2),
-                            'Separation_%':round(sep,3),'Regime':("Bullish" if c8>c21 else "Bearish"),
-                            'Crossover': cross or 'None'})
-            st.dataframe(pd.DataFrame(out), use_container_width=True, hide_index=True)
-
-# ╔═════════════════════════════════════════════════════════════════════════════╗
-# ║ TAB 4: CONTRACT TOOL (simple)                                               ║
-# ╚═════════════════════════════════════════════════════════════════════════════╝
-with tab4:
-    st.subheader("Contract Tool (Overnight points → RTH projection)")
-    pc1, pc2 = st.columns(2)
-    with pc1:
-        p1_date = st.date_input("Point 1 Date", value=(now.date()-timedelta(days=1)))
-        p1_time = st.time_input("Point 1 Time (CT)", value=time(20,0))
-        p1_price= st.number_input("Point 1 Contract Price", value=10.0, min_value=0.01, step=0.01, format="%.2f")
-    with pc2:
-        p2_date = st.date_input("Point 2 Date", value=now.date())
-        p2_time = st.time_input("Point 2 Time (CT)", value=time(8,0))
-        p2_price= st.number_input("Point 2 Contract Price", value=12.0, min_value=0.01, step=0.01, format="%.2f")
-
-    proj_day_ct = st.date_input("RTH Projection Day", value=p2_date)
-    p1_dt = CT_TZ.localize(datetime.combine(p1_date, p1_time))
-    p2_dt = CT_TZ.localize(datetime.combine(p2_date, p2_time))
-    if p2_dt <= p1_dt:
-        st.error("Point 2 must be after Point 1")
+st.sidebar.markdown("---")
+if st.sidebar.button("🔌 Test Data Connection"):
+    test = es30(now_ct().date()-timedelta(days=1), now_ct().date())
+    if test is None or test.empty:
+        st.error("Market data connection failed (ES=F 30m).")
     else:
-        hours = (p2_dt-p1_dt).total_seconds()/3600
-        st.metric("Time Span", f"{hours:.1f}h"); st.metric("ΔPrice", f"{(p2_price-p1_price):+.2f}")
-        blocks = trading_blocks_since(p1_dt, p2_dt)
-        slope = (p2_price - p1_price)/blocks if blocks>0 else 0.0
+        st.success(f"Connection OK — ES=F returned {len(test)} bars.")
 
-        if st.button("Analyze Contract Projections", type="primary", key="ct_generate"):
-            rows=[]
-            for t in rth_slots_ct(proj_day_ct):
-                b = trading_blocks_since(p1_dt, t)
-                price = p1_price + slope*b
-                rows.append({'Time': format_ct_time(t), 'Contract_Price': round(price,2), 'Blocks': round(b,1)})
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+# ═══════════════════════════════════════════════════════════════════════════════
+# HEADER
+# ═══════════════════════════════════════════════════════════════════════════════
+colA, colB, colC, colD = st.columns(4)
+with colA:
+    st.markdown('<div class="metric"><b>⏰ CT Time</b><br>' + now_ct().strftime("%a %b %d, %H:%M:%S") + "</div>", unsafe_allow_html=True)
+with colB:
+    sess = "RTH" if RTH_START <= now_ct().time() <= RTH_END and now_ct().weekday()<5 else "Closed"
+    badge = "green" if sess=="RTH" else "yellow"
+    st.markdown(f'<div class="metric"><b>📊 Session</b><br><span class="badge {badge}">{sess}</span></div>', unsafe_allow_html=True)
+with colC:
+    st.markdown(f'<div class="metric"><b>📏 Fan Slope</b><br>±{SPX_FAN_SLOPE:.3f} / 30m</div>', unsafe_allow_html=True)
+with colD:
+    st.markdown(f'<div class="metric"><b>🎯 Stocks</b><br>Parallel channels (your slopes)</div>', unsafe_allow_html=True)
+
+st.markdown("<hr/>", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TABS
+# ═══════════════════════════════════════════════════════════════════════════════
+tab1, tab2, tab3, tab4 = st.tabs(["🧭 SPX Anchors", "🏢 Stock Anchors", "📶 Signals & EMA", "🧮 Contract Tool"])
 
 # ───────────────────────────────────────────────────────────────────────────────
-# FOOTER: Connectivity test
+# TAB 1 — SPX Anchors (ES engine → SPX display)
 # ───────────────────────────────────────────────────────────────────────────────
-st.markdown("---")
-if st.button("Test Data Connection", key="test_connection"):
-    with st.spinner("Testing market data connection..."):
-        test_data = fetch_live_data("SPY", now.date()-timedelta(days=5), now.date())
-        if not test_data.empty:
-            st.success(f"Connection OK — received {len(test_data)} bars for SPY")
+with tab1:
+    st.subheader("🧭 SPX Anchors (ES→SPX)")
+    c1, c2 = st.columns(2)
+    with c1:
+        prev_day = st.date_input("Previous Trading Day", value=now_ct().date()-timedelta(days=1))
+    with c2:
+        proj_day = st.date_input("Projection Day", value=prev_day+timedelta(days=1))
+
+    res = build_spx_fan_tables(prev_day, proj_day, skybas_toggle)
+    if res is None:
+        st.error("Unable to build fan — missing data.")
+    else:
+        fan_table, fan_internal, meta = res
+        offset_val = meta["close_time"] and compute_es_spx_offset(prev_day) or 0.0
+
+        st.markdown(f'<div class="card"><b>🔁 ES→SPX Offset (prev day RTH close):</b> {offset_val:+.2f}</div>', unsafe_allow_html=True)
+        st.markdown("### 🪜 Fan & Anchors (SPX)")
+        st.dataframe(fan_table, use_container_width=True, hide_index=True)
+
+        # Strategy table
+        st.markdown("### 🧠 Strategy Table (SPX)")
+        strat = build_strategy_table_spx(proj_day, fan_table, fan_internal)
+        if strat.empty:
+            st.info("No RTH data found for projection day.")
         else:
-            st.error("Market data connection failed (empty response). Try again later or adjust dates.")
+            st.dataframe(strat, use_container_width=True, hide_index=True)
+            st.caption("Bias: Above fan → UP, Below fan → DOWN, Inside → RANGE.")
+
+        st.markdown("### ⚡ Touch + Same-bar 1-Minute Confirmation (SPX)")
+        sigs = detect_touch_and_confirmation(prev_day, proj_day, fan_internal)
+        if sigs.empty:
+            st.info("No touch+confirmation events detected for this day.")
+        else:
+            st.dataframe(sigs, use_container_width=True, hide_index=True)
+            st.caption("Touch tolerance = 0.30 × ATR(14) on 30m. Confirmation = 1m EMA(8/21) cross on the same 1m bar within the 30m slot.")
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TAB 2 — Stock Anchors (Parallel Channel; no fan; your slopes)
+# ───────────────────────────────────────────────────────────────────────────────
+with tab2:
+    st.subheader("🏢 Stock Anchors (Parallel Channel)")
+    core = ["TSLA","NVDA","AAPL","MSFT","AMZN","GOOGL","META","NFLX"]
+    tcol = st.columns(8)
+    sel = st.text_input("Symbol (or click a button below)", value="")
+    for i,tkr in enumerate(core):
+        if tcol[i].button(tkr):
+            sel = tkr
+    if not sel:
+        st.info("Pick a symbol or type one above.")
+    else:
+        slope = STOCK_SLOPES.get(sel.upper(), 0.02)
+        st.caption(f"Using slope: {slope:.4f} per 30-min block (parallel channel)")
+        c1,c2,c3 = st.columns(3)
+        with c1:
+            mon = st.date_input("Monday", value=now_ct().date()-timedelta(days=7))
+        with c2:
+            tue = st.date_input("Tuesday", value=mon+timedelta(days=1))
+        with c3:
+            st.write("Projection: Wed–Fri (auto)")
+
+        ch, info = stock_parallel_channel(sel.upper(), mon, tue, slope)
+        if ch is None:
+            st.error("Not enough data for the selected dates.")
+        else:
+            st.markdown("### 📐 Parallel Channel (Upper=Mon/Tue highest swing, Lower=Mon/Tue lowest swing)")
+            st.dataframe(ch, use_container_width=True, hide_index=True)
+            st.caption(f"High anchor @ {info['High'][0]:.2f} ({info['High'][1]}), Low anchor @ {info['Low'][0]:.2f} ({info['Low'][1]})")
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TAB 3 — Signals & EMA (Quick RTH EMA dashboard)
+# ───────────────────────────────────────────────────────────────────────────────
+with tab3:
+    st.subheader("📶 Signals & EMA Dashboard")
+    sym = st.selectbox("Symbol", ["^GSPC (SPX display via ES)", "ES=F (engine)", "SPY", "TSLA","NVDA","AAPL","MSFT","AMZN","GOOGL","META","NFLX"], index=0)
+    day = st.date_input("Analysis Day", value=now_ct().date())
+    if st.button("Compute EMA 8/21"):
+        if "ES=F" in sym or "SPX" in sym:
+            df = es30(day, day)
+            off = compute_es_spx_offset(day)
+            if df.empty:
+                st.error("No ES data for selected day.")
+            else:
+                rth = between_ct(df, "08:30", "14:30")
+                if rth.empty:
+                    st.info("No RTH bars.")
+                else:
+                    spx_close = rth["Close"] + off
+                    e8  = ema(spx_close, 8)
+                    e21 = ema(spx_close, 21)
+                    out = pd.DataFrame({
+                        "Time":[t.strftime("%H:%M") for t in rth.index],
+                        "Price": spx_close.round(2),
+                        "EMA8": e8.round(2), "EMA21": e21.round(2),
+                        "Separation_%": ((e8-e21)/e21*100).round(3),
+                        "Regime": np.where(e8>e21, "Bullish", "Bearish")
+                    })
+                    prev8  = e8.shift()
+                    prev21 = e21.shift()
+                    cross = np.where((prev8<=prev21)&(e8>e21),"Bullish Cross",
+                            np.where((prev8>=prev21)&(e8<e21),"Bearish Cross","None"))
+                    out["Crossover"] = cross
+                    st.dataframe(out, use_container_width=True, hide_index=True)
+        else:
+            df = stock30(sym, day, day)
+            if df.empty:
+                st.error("No data for selected stock/day.")
+            else:
+                rth = between_ct(df, "08:30", "14:30")
+                if rth.empty:
+                    st.info("No RTH bars.")
+                else:
+                    e8  = ema(rth["Close"], 8)
+                    e21 = ema(rth["Close"], 21)
+                    out = pd.DataFrame({
+                        "Time":[t.strftime("%H:%M") for t in rth.index],
+                        "Price": rth["Close"].round(2),
+                        "EMA8": e8.round(2), "EMA21": e21.round(2),
+                        "Separation_%": ((e8-e21)/e21*100).round(3),
+                        "Regime": np.where(e8>e21, "Bullish", "Bearish")
+                    })
+                    prev8  = e8.shift()
+                    prev21 = e21.shift()
+                    cross = np.where((prev8<=prev21)&(e8>e21),"Bullish Cross",
+                            np.where((prev8>=prev21)&(e8<e21),"Bearish Cross","None"))
+                    out["Crossover"] = cross
+                    st.dataframe(out, use_container_width=True, hide_index=True)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TAB 4 — Contract Tool (0–30 inputs)
+# ───────────────────────────────────────────────────────────────────────────────
+with tab4:
+    st.subheader("🧮 Contract Tool (0–30)")
+    c1,c2,c3 = st.columns(3)
+    with c1:
+        p1_date = st.date_input("Point 1 Date", value=now_ct().date()-timedelta(days=1))
+        p1_time = st.time_input("Point 1 Time (CT)", value=time(20,0))
+        p1_price = st.number_input("Point 1 Price", min_value=0.00, max_value=30.00, value=10.00, step=0.01)
+    with c2:
+        p2_date = st.date_input("Point 2 Date", value=now_ct().date())
+        p2_time = st.time_input("Point 2 Time (CT)", value=time(8,0))
+        p2_price = st.number_input("Point 2 Price", min_value=0.00, max_value=30.00, value=12.00, step=0.01)
+    with c3:
+        proj = st.date_input("RTH Projection Day", value=p2_date)
+
+    if st.button("Project Contract"):
+        p1_dt = CT.localize(datetime.combine(p1_date, p1_time))
+        p2_dt = CT.localize(datetime.combine(p2_date, p2_time))
+        out = contract_projection(p1_dt, p1_price, p2_dt, p2_price, proj)
+        if out is None:
+            st.error("Invalid inputs (order, or values outside 0–30, or no blocks).")
+        else:
+            table, slope = out
+            st.markdown(f'<div class="card"><b>📐 Observed Slope:</b> {slope:+.4f} per 30-min trading block</div>', unsafe_allow_html=True)
+            st.dataframe(table, use_container_width=True, hide_index=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FOOTER
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown("<hr/>", unsafe_allow_html=True)
+st.markdown(
+    f"<div style='text-align:center;color:#64748b'>🔮 SPX Prophet • ES engine → SPX display • "
+    f"{now_ct().strftime('%Y-%m-%d %H:%M:%S CT')}</div>", unsafe_allow_html=True
+)
