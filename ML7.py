@@ -1,13 +1,10 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# 🔮 SPX PROPHET — LIGHT UI • SPX-ONLY TABLES • WEEKEND/MAINTENANCE AWARE
+# 🔮 SPX PROPHET — LIGHT UI • SPX-ONLY ANCHORS • WEEKEND/MAINTENANCE AWARE
 #   - Slope per 30-min block = 0.333 (ascending +0.333, descending −0.333)
-#   - Bias from *Close Fan* (position vs Top/Bottom of the fan)
-#   - ES→SPX conversion via prev-day RTH close offset (hidden)
-#   - Maintenance hour (16:00–17:00 CT) and Fri→Sun halt EXCLUDED from block counts
-#   - Asian anchors (Skyline/Baseline) from ES 17:00–19:30 CT window
-#   - Strategy = MR outside fan using High(+)/Low(−); fade when inside fan
-#   - Signals = Touch + 1m EMA(8/21) cross confirm (if 1m available)
-#   - UI = Light mode, icons, simplified tables
+#   - Close fan anchored to *actual SPX RTH close & time* (not ES+offset)
+#   - Prev High/Low from SPX RTH; Asian (Skyline/Baseline) from ES (offset to SPX)
+#   - Maintenance hour (16:00–17:00 CT) and Fri→Sun halt excluded from blocks
+#   - Signals: touch + 1m EMA(8/21) confirmation if 1m data is available
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import streamlit as st
@@ -17,120 +14,74 @@ import yfinance as yf
 from datetime import datetime, date, time, timedelta
 import pytz
 
-# ───────────────────────────────────────────────────────────────────────────────
-# CONFIG / CONSTANTS
-# ───────────────────────────────────────────────────────────────────────────────
 CT = pytz.timezone("America/Chicago")
-UTC = pytz.UTC
-
-SLOPE_PER_BLOCK = 0.333  # per 30-min block (your spec)
-ANCHOR_WIN_START = "17:00"  # Asian window for Skyline/Baseline (CT)
+SLOPE_PER_BLOCK = 0.333
+ANCHOR_WIN_START = "17:00"
 ANCHOR_WIN_END   = "19:30"
 RTH_START = "08:30"
 RTH_END   = "14:30"
 
-# UI
-st.set_page_config(
-    page_title="🔮 SPX Prophet (Light)",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="🔮 SPX Prophet (Light)", page_icon="📈", layout="wide")
 
-# Light theme styling
 st.markdown("""
 <style>
-.main {
-  background: linear-gradient(180deg, #f8fafc 0%, #ffffff 35%, #f9fafb 100%);
-}
-section[data-testid="stSidebar"] {
-  background: #f7f7fb;
-  border-right: 1px solid #eee;
-}
-.metric-card, .st-emotion-cache-0 {
-  background: #ffffff;
-  border: 1px solid #eee;
-  border-radius: 14px;
-  padding: 14px 16px;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
-}
-.badge {
-  display: inline-block;
-  padding: 4px 10px;
-  background: #eef2ff;
-  color: #3730a3;
-  border-radius: 999px;
-  font-size: 13px;
-  border: 1px solid #e0e7ff;
-}
-.table-note {
-  font-size: 13px;
-  color: #6b7280;
-}
-h1,h2,h3 { color: #111827; }
+.main {background: linear-gradient(180deg, #f8fafc 0%, #ffffff 35%, #f9fafb 100%);}
+section[data-testid="stSidebar"] {background: #f7f7fb; border-right: 1px solid #eee;}
+.metric-card {background:#fff;border:1px solid #eee;border-radius:14px;padding:14px 16px;box-shadow:0 2px 8px rgba(0,0,0,0.04);}
+.badge{display:inline-block;padding:4px 10px;background:#eef2ff;color:#3730a3;border-radius:999px;font-size:13px;border:1px solid #e0e7ff;}
+.table-note{font-size:13px;color:#6b7280;}
+h1,h2,h3{color:#111827;}
 </style>
 """, unsafe_allow_html=True)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# HELPERS — TIME / BLOCKS
+# Time helpers
 # ───────────────────────────────────────────────────────────────────────────────
 def to_ct(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return CT.localize(dt)
     return dt.astimezone(CT)
 
-def rth_slots_ct(target_day: date) -> list[datetime]:
-    start_dt = CT.localize(datetime.combine(target_day, datetime.strptime(RTH_START, "%H:%M").time()))
-    end_dt   = CT.localize(datetime.combine(target_day, datetime.strptime(RTH_END, "%H:%M").time()))
-    slots = []
-    cur = start_dt
-    while cur <= end_dt:
-        slots.append(cur)
-        cur += timedelta(minutes=30)
-    return slots
+def rth_slots_ct(day: date) -> list[datetime]:
+    s = CT.localize(datetime.combine(day, datetime.strptime(RTH_START,"%H:%M").time()))
+    e = CT.localize(datetime.combine(day, datetime.strptime(RTH_END,"%H:%M").time()))
+    out=[]; cur=s
+    while cur<=e:
+        out.append(cur); cur+=timedelta(minutes=30)
+    return out
 
 def maintenance_window(dt: datetime) -> tuple[datetime, datetime]:
-    day = dt.date()
-    start = CT.localize(datetime.combine(day, time(16,0)))
-    end   = CT.localize(datetime.combine(day, time(17,0)))
-    return start, end
+    d = dt.date()
+    return CT.localize(datetime.combine(d, time(16,0))), CT.localize(datetime.combine(d, time(17,0)))
 
 def is_weekend_gap(t: datetime) -> bool:
-    # Treat Fri 16:00 → Sun 17:00 as halted
-    wd = t.weekday()  # Mon=0..Sun=6
-    if wd == 5:  # Saturday
-        return True
-    if wd == 6 and t.time() < time(17,0):  # Sunday before 17:00 CT
-        return True
+    wd = t.weekday()
+    if wd==5: return True
+    if wd==6 and t.time() < time(17,0): return True
     return False
 
-def count_30min_blocks_excl_maintenance_weekend(anchor_time: datetime, target_time: datetime) -> int:
-    """Count 30-min steps between two CT datetimes, skipping 16:00–17:00 CT daily and Fri→Sun halt."""
-    if target_time < anchor_time:
-        return -count_30min_blocks_excl_maintenance_weekend(target_time, anchor_time)
-    cur = anchor_time
-    blocks = 0
-    while cur < target_time:
+def count_blocks_excl_pauses(t0: datetime, t1: datetime) -> int:
+    if t1 < t0:
+        return -count_blocks_excl_pauses(t1, t0)
+    cur = t0; blocks=0
+    while cur < t1:
         nxt = cur + timedelta(minutes=30)
-        m_start, m_end = maintenance_window(cur)
-        in_maint = (cur < m_end and nxt > m_start)
-        if not in_maint and not is_weekend_gap(cur):
+        m0,m1 = maintenance_window(cur)
+        if not (cur < m1 and nxt > m0) and not is_weekend_gap(cur):
             blocks += 1
         cur = nxt
     return blocks
 
 # ───────────────────────────────────────────────────────────────────────────────
-# DATA FETCH
+# Data fetch
 # ───────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_ohlc(symbol: str, start_d: date, end_d: date, interval: str = "30m") -> pd.DataFrame:
-    """Fetch OHLCV, localize to CT; safe against empty/multiindex; inclusive on end date."""
+def fetch_ohlc(symbol: str, start_d: date, end_d: date, interval="30m") -> pd.DataFrame:
     try:
         start = (start_d - timedelta(days=2)).strftime("%Y-%m-%d")
         end   = (end_d + timedelta(days=1)).strftime("%Y-%m-%d")
         df = yf.Ticker(symbol).history(start=start, end=end, interval=interval, auto_adjust=False, back_adjust=False, prepost=True)
-        if df is None or df.empty:
-            return pd.DataFrame()
+        if df is None or df.empty: return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] for c in df.columns]
         if df.index.tz is None:
@@ -138,11 +89,9 @@ def fetch_ohlc(symbol: str, start_d: date, end_d: date, interval: str = "30m") -
         df.index = df.index.tz_convert(CT)
         lo = CT.localize(datetime.combine(start_d, time(0,0)))
         hi = CT.localize(datetime.combine(end_d,   time(23,59,59)))
-        df = df.loc[(df.index >= lo) & (df.index <= hi)]
+        df = df.loc[(df.index>=lo) & (df.index<=hi)]
         need = {"Open","High","Low","Close"}
-        if not need.issubset(df.columns):
-            return pd.DataFrame()
-        return df
+        return df if need.issubset(df.columns) else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
@@ -151,344 +100,218 @@ def between_time_ct(df: pd.DataFrame, start_hhmm: str, end_hhmm: str) -> pd.Data
     return df.between_time(start_hhmm, end_hhmm)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# OFFSETS / ANCHORS
+# SPX RTH OHLC (for exact anchors)
 # ───────────────────────────────────────────────────────────────────────────────
-def rth_close_bar(df: pd.DataFrame) -> pd.Series | None:
-    """Return last bar within RTH on that day, else last bar."""
-    if df.empty: return None
-    rth = between_time_ct(df, RTH_START, "15:00")
-    if not rth.empty:
-        return rth.iloc[-1]
-    return df.iloc[-1]
+def spx_rth_ohlc(day: date) -> dict|None:
+    spx = fetch_ohlc("^GSPC", day, day, "30m")
+    if spx.empty:
+        # fallback to SPY if needed
+        spy = fetch_ohlc("SPY", day, day, "30m")
+        if spy.empty: return None
+        src = spy
+    else:
+        src = spx
+    rth = between_time_ct(src, RTH_START, RTH_END)
+    if rth.empty: rth = src
+    o = float(rth.iloc[0]["Open"])
+    h = float(rth["High"].max()); t_h = rth["High"].idxmax()
+    l = float(rth["Low"].min());  t_l = rth["Low"].idxmin()
+    c = float(rth.iloc[-1]["Close"]); t_c = rth.index[-1]
+    return {"open":(o, rth.index[0]), "high":(h, t_h), "low":(l, t_l), "close":(c, t_c), "source": "SPX" if not spx.empty else "SPY"}
 
-def compute_es_spx_offset(prev_day: date) -> float | None:
-    """Offset = SPX RTH close - ES RTH close (prev day)."""
-    es = fetch_ohlc("ES=F", prev_day, prev_day, interval="30m")
-    spx = fetch_ohlc("^GSPC", prev_day, prev_day, interval="30m")
+# ES→SPX offset only for Asian conversion / fallback
+def es_spx_offset(prev_day: date) -> float|None:
+    es  = fetch_ohlc("ES=F", prev_day, prev_day, "30m")
+    spx = fetch_ohlc("^GSPC", prev_day, prev_day, "30m")
     if es.empty or spx.empty: return None
-    es_bar = rth_close_bar(es)
-    spx_bar = rth_close_bar(spx)
-    if es_bar is None or spx_bar is None: return None
-    return float(spx_bar["Close"] - es_bar["Close"])
+    es_rth = between_time_ct(es, RTH_START, RTH_END)
+    spx_rth = between_time_ct(spx, RTH_START, RTH_END)
+    if es_rth.empty or spx_rth.empty: return None
+    return float(spx_rth.iloc[-1]["Close"] - es_rth.iloc[-1]["Close"])
 
-def prev_day_swing_ohlc(es_prev: pd.DataFrame) -> dict:
-    if es_prev.empty: return {}
-    day_open = es_prev.iloc[0]["Open"]
-    day_high = es_prev["High"].max()
-    day_low  = es_prev["Low"].min()
-    day_close= es_prev.iloc[-1]["Close"]
-    t_high = es_prev.index[es_prev["High"].argmax()]
-    t_low  = es_prev.index[es_prev["Low"].argmin()]
-    return {
-        "open": (day_open, es_prev.index[0]),
-        "high": (day_high, t_high),
-        "low":  (day_low,  t_low),
-        "close":(day_close, es_prev.index[-1]),
-    }
-
-def asian_skyline_baseline(es_prev: pd.DataFrame) -> tuple[tuple|None, tuple|None]:
-    """Skyline/Baseline from Asian window (17:00–19:30 CT) of prev day."""
+def asian_sky_base_es(prev_day: date) -> tuple[tuple|None, tuple|None]:
+    es_prev = fetch_ohlc("ES=F", prev_day, prev_day, "30m")
     if es_prev.empty: return None, None
     asian = between_time_ct(es_prev, ANCHOR_WIN_START, ANCHOR_WIN_END)
     if asian.empty: return None, None
-    hi = asian["Close"].idxmax()
-    lo = asian["Close"].idxmin()
-    return (float(asian.loc[hi,"Close"]), hi), (float(asian.loc[lo,"Close"]), lo)
+    hi_t = asian["Close"].idxmax(); lo_t = asian["Close"].idxmin()
+    return (float(asian.loc[hi_t,"Close"]), hi_t), (float(asian.loc[lo_t,"Close"]), lo_t)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# PROJECTIONS
+# Projections
 # ───────────────────────────────────────────────────────────────────────────────
-def project_line(price0: float, t0: datetime, target_times: list[datetime], slope_per_block: float) -> pd.Series:
-    """price(t) = price0 + slope * blocks(t0→t) with maintenance+weekend skip."""
-    out = []
-    for tt in target_times:
-        blocks = count_30min_blocks_excl_maintenance_weekend(to_ct(t0), to_ct(tt))
-        out.append(price0 + slope_per_block * blocks)
-    return pd.Series(out, index=target_times)
+def project_series(price0: float, time0: datetime, times: list[datetime], slope: float) -> pd.Series:
+    vals=[]
+    for tt in times:
+        b = count_blocks_excl_pauses(to_ct(time0), to_ct(tt))
+        vals.append(price0 + slope*b)
+    return pd.Series(vals, index=times)
 
-def build_close_fan(prev_close_price: float, prev_close_time: datetime, target_day: date) -> pd.DataFrame:
+def build_close_fan_spx(prev_close_price: float, prev_close_time: datetime, target_day: date) -> pd.DataFrame:
     times = rth_slots_ct(target_day)
-    top = project_line(prev_close_price, prev_close_time, times, +SLOPE_PER_BLOCK)
-    bot = project_line(prev_close_price, prev_close_time, times, -SLOPE_PER_BLOCK)
-    fan = pd.DataFrame({
-        "Time": [t.strftime("%H:%M") for t in times],
-        "Top":  top.values,
-        "Bottom": bot.values,
-    })
-    fan["Fan_Width"] = (fan["Top"] - fan["Bottom"]).round(2)
-    fan["Top"] = fan["Top"].round(2)
-    fan["Bottom"] = fan["Bottom"].round(2)
-    return fan
+    top = project_series(prev_close_price, prev_close_time, times, +SLOPE_PER_BLOCK)
+    bot = project_series(prev_close_price, prev_close_time, times, -SLOPE_PER_BLOCK)
+    df = pd.DataFrame({"Time":[t.strftime("%H:%M") for t in times], "Top":top.values, "Bottom":bot.values})
+    df["Fan_Width"] = (df["Top"] - df["Bottom"]).round(2)
+    df["Top"] = df["Top"].round(2); df["Bottom"] = df["Bottom"].round(2)
+    return df
 
-def project_anchor(price: float, t_anchor: datetime, target_day: date, sign: int) -> pd.DataFrame:
+def project_anchor_spx(price: float, t_anchor: datetime, target_day: date, sign: int) -> pd.DataFrame:
     times = rth_slots_ct(target_day)
-    proj = project_line(price, t_anchor, times, sign * SLOPE_PER_BLOCK)
+    proj = project_series(price, t_anchor, times, sign*SLOPE_PER_BLOCK)
     col = "High_Asc" if sign>0 else "Low_Desc"
-    return pd.DataFrame({"Time": [t.strftime("%H:%M") for t in times], col: proj.values})
+    return pd.DataFrame({"Time":[t.strftime("%H:%M") for t in times], col: proj.values})
 
 # ───────────────────────────────────────────────────────────────────────────────
-# STRATEGY & SIGNALS
+# Strategy & signals
 # ───────────────────────────────────────────────────────────────────────────────
 def build_strategy_table(fan_df: pd.DataFrame, last_prices: pd.Series,
                          high_line: pd.DataFrame|None, low_line: pd.DataFrame|None) -> pd.DataFrame:
-    """Simplified strategy table:
-       Time • Bias • Entry Trigger • TP1 • TP2 • Note
-    """
-    rows = []
+    rows=[]
     hl = None if high_line is None or high_line.empty else dict(zip(high_line["Time"], high_line.iloc[:,1]))
-    ll = None if low_line is None or low_line.empty else dict(zip(low_line["Time"], low_line.iloc[:,1]))
-
+    ll = None if low_line  is None or low_line.empty  else dict(zip(low_line["Time"],  low_line.iloc[:,1]))
     for _, r in fan_df.iterrows():
-        t = r["Time"]
-        top, bot = r["Top"], r["Bottom"]
-        width = top - bot
-        mid = (top + bot)/2.0
-        last = float(last_prices.get(t, mid))  # fallback to mid
-        # Bias from *Close fan* (position vs fan)
-        bias = "UP" if last > top else "DOWN" if last < bot else "RANGE"
-
-        if bias == "UP":
-            entry = hl.get(t, top) if hl else top  # High(+0.333) trigger or top edge
-            tp1 = top                                # mean (edge)
-            tp2 = top - width                        # one fan width back
-            note = "Above fan → MR short from High(+)."
-        elif bias == "DOWN":
-            entry = ll.get(t, bot) if ll else bot    # Low(−0.333) trigger or bottom edge
-            tp1 = bot
-            tp2 = bot + width
-            note = "Below fan → MR long from Low(−)."
+        t = r["Time"]; top=r["Top"]; bot=r["Bottom"]; width=top-bot; mid=(top+bot)/2
+        last = float(last_prices.get(t, mid))
+        bias = "UP" if last>top else "DOWN" if last<bot else "RANGE"
+        if bias=="UP":
+            entry = hl.get(t, top) if hl else top; tp1=top; tp2=top - width; note="Above fan → mean-revert short via High(+)."
+        elif bias=="DOWN":
+            entry = ll.get(t, bot) if ll else bot; tp1=bot; tp2=bot + width; note="Below fan → mean-revert long via Low(−)."
         else:
-            # Inside fan → fade toward mid/opposite edge
-            dist_top = abs(last - top)
-            dist_bot = abs(last - bot)
-            if dist_bot < dist_top:
-                entry = bot
-                tp1 = mid
-                tp2 = top
-                note = "Inside fan → Fade from Bottom to Mid/Top."
+            # inside fan: fade toward mid/opposite edge
+            if abs(last-bot) < abs(last-top):
+                entry=bot; tp1=mid; tp2=top; note="Inside fan → Fade from Bottom → Mid/Top."
             else:
-                entry = top
-                tp1 = mid
-                tp2 = bot
-                note = "Inside fan → Fade from Top to Mid/Bottom."
-
-        rows.append({
-            "Time": t,
-            "Bias": bias,
-            "Entry Trigger": round(entry,2),
-            "TP1": round(tp1,2),
-            "TP2": round(tp2,2),
-            "Note": note
-        })
+                entry=top; tp1=mid; tp2=bot; note="Inside fan → Fade from Top → Mid/Bottom."
+        rows.append({"Time":t,"Bias":bias,"Entry Trigger":round(entry,2),"TP1":round(tp1,2),"TP2":round(tp2,2),"Note":note})
     return pd.DataFrame(rows)
 
-def calc_ema(series: pd.Series, span: int) -> pd.Series:
+def ema(series: pd.Series, span:int)->pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
-def detect_touch(top: float, bottom: float, bar: pd.Series, tol: float) -> str|None:
-    lo, hi = bar["Low"], bar["High"]
-    if (abs(hi - top) <= tol) or (lo <= top <= hi):
-        return "Top"
-    if (abs(lo - bottom) <= tol) or (lo <= bottom <= hi):
-        return "Bottom"
+def detect_touch(top: float, bottom: float, bar: pd.Series, tol: float)->str|None:
+    lo,hi = bar["Low"], bar["High"]
+    if (abs(hi-top)<=tol) or (lo<=top<=hi): return "Top"
+    if (abs(lo-bottom)<=tol) or (lo<=bottom<=hi): return "Bottom"
     return None
 
-def signals_table(es_30m: pd.DataFrame, fan_df: pd.DataFrame, day: date) -> pd.DataFrame:
-    """Time • Touch Side • Candle Close • EMA Cross • Signal • Target
-       Uses 1m ES data to confirm EMA cross if available.
-    """
-    if es_30m.empty or fan_df.empty:
-        return pd.DataFrame()
-
-    es_1m = fetch_ohlc("ES=F", day, day, interval="1m")
+def signals_table(es_30m_rth: pd.DataFrame, fan_df: pd.DataFrame, day: date) -> pd.DataFrame:
+    if es_30m_rth.empty or fan_df.empty: return pd.DataFrame()
+    es_1m = fetch_ohlc("ES=F", day, day, "1m")
     have_1m = not es_1m.empty
+    tol = max(0.25, es_30m_rth["Close"].median()*0.0005)
 
-    rows = []
-    tol = max(0.25, es_30m["Close"].median() * 0.0005)  # ~5 bps or $0.25 minimum
+    top_lu = dict(zip(fan_df["Time"], fan_df["Top"]))
+    bot_lu = dict(zip(fan_df["Time"], fan_df["Bottom"]))
 
-    fan_top = dict(zip(fan_df["Time"], fan_df["Top"]))
-    fan_bot = dict(zip(fan_df["Time"], fan_df["Bottom"]))
+    out=[]
+    for idx, bar in es_30m_rth.iterrows():
+        ts = idx.strftime("%H:%M")
+        if ts not in top_lu: continue
+        touch = detect_touch(top_lu[ts], bot_lu[ts], bar, tol)
+        if not touch: continue
 
-    for idx, bar in es_30m.iterrows():
-        t_str = idx.strftime("%H:%M")
-        if t_str not in fan_top:
-            continue
-        top, bot = fan_top[t_str], fan_bot[t_str]
-        touch = detect_touch(top, bot, bar, tol)
-        if not touch:
-            continue
-
-        ema_cross = "N/A"
-        signal = "—"
-        target = "—"
-
+        ema_cross="N/A"; signal="—"; target="—"
         if have_1m:
-            window_start = idx
-            window_end = idx + timedelta(minutes=30)
-            win = es_1m.loc[(es_1m.index >= window_start) & (es_1m.index <= window_end)]
+            win = es_1m.loc[(es_1m.index>=idx) & (es_1m.index<=idx+timedelta(minutes=30))]
             if not win.empty:
-                ema8 = calc_ema(win["Close"], 8)
-                ema21 = calc_ema(win["Close"], 21)
-                cross_type = None
-                for i in range(1, len(win)):
-                    prev_bull = ema8.iloc[i-1] <= ema21.iloc[i-1]
-                    curr_bull = ema8.iloc[i]   >  ema21.iloc[i]
-                    prev_bear = ema8.iloc[i-1] >= ema21.iloc[i-1]
-                    curr_bear = ema8.iloc[i]   <  ema21.iloc[i]
-                    if prev_bull and curr_bull:
-                        cross_type = "Bullish"; break
-                    if prev_bear and curr_bear:
-                        cross_type = "Bearish"; break
+                e8 = ema(win["Close"],8); e21 = ema(win["Close"],21)
+                cross=None
+                for i in range(1,len(win)):
+                    if e8.iloc[i-1]<=e21.iloc[i-1] and e8.iloc[i]>e21.iloc[i]:
+                        cross="Bullish"; break
+                    if e8.iloc[i-1]>=e21.iloc[i-1] and e8.iloc[i]<e21.iloc[i]:
+                        cross="Bearish"; break
+                if cross:
+                    ema_cross=cross
+                    if touch=="Bottom":
+                        signal = "BUY" if bar["Close"]>=bot_lu[ts] else "SELL"
+                        target = "Top" if signal=="BUY" else "Bottom"
+                    else:
+                        signal = "SELL" if bar["Close"]<=top_lu[ts] else "BUY"
+                        target = "Bottom" if signal=="SELL" else "Top"
 
-                if cross_type:
-                    ema_cross = cross_type
-                    if touch == "Bottom":
-                        if bar["Close"] >= bot:
-                            signal = "BUY";  target = "Top"
-                        else:
-                            signal = "SELL"; target = "Bottom"
-                    else:  # Top
-                        if bar["Close"] <= top:
-                            signal = "SELL"; target = "Bottom"
-                        else:
-                            signal = "BUY";  target = "Top"
-
-        rows.append({
-            "Time": t_str,
-            "Touch Side": touch,
-            "Candle Close": round(float(bar["Close"]),2),
-            "EMA Cross": ema_cross,
-            "Signal": signal,
-            "Target": target
-        })
-
-    return pd.DataFrame(rows)
+        out.append({"Time":ts,"Touch Side":touch,"Candle Close":round(float(bar["Close"]),2),
+                    "EMA Cross":ema_cross,"Signal":signal,"Target":target})
+    return pd.DataFrame(out)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# UI — SIDEBAR
+# UI — Sidebar & Header
 # ───────────────────────────────────────────────────────────────────────────────
 st.sidebar.title("🔮 SPX Prophet")
-st.sidebar.caption("Light mode • SPX tables • ES data under the hood")
-
 today_ct = datetime.now(CT).date()
 prev_default = today_ct - timedelta(days=1)
+prev_day = st.sidebar.date_input("Previous Trading Day", value=prev_default)
+proj_day = st.sidebar.date_input("Projection Day (RTH)", value=prev_day+timedelta(days=1))
+show_asian = st.sidebar.toggle("Show Asian Skyline/Baseline", value=True)
+GO = st.sidebar.button("🚀 Generate SPX Tables", type="primary", use_container_width=True)
 
-with st.sidebar:
-    st.markdown("### 📅 Dates")
-    prev_day = st.date_input("Previous Trading Day", value=prev_default, key="prev_day")
-    proj_day = st.date_input("Projection Day (RTH)", value=prev_day + timedelta(days=1), key="proj_day")
-
-    st.markdown("---")
-    st.markdown("### ⚙️ Options")
-    show_asian = st.toggle("Show Asian Skyline/Baseline cards (if available)", value=True)
-    st.caption("Asian window: 17:00–19:30 CT on the previous day")
-
-    st.markdown("---")
-    if st.button("🚀 Generate SPX Tables", type="primary", use_container_width=True):
-        st.session_state["GO"] = True
-
-# ───────────────────────────────────────────────────────────────────────────────
-# HEADER
-# ───────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div style="text-align:center; margin: 6px 0 14px;">
   <h1>📈 SPX Prophet — Close Fan & Strategy</h1>
-  <div class="table-note">Slope per 30-min block: <b>±0.333</b> • Bias from <b>Close Fan</b> • ES→SPX offset auto</div>
+  <div class="table-note">Fan anchored to actual <b>SPX RTH close</b>. Slope: <b>±0.333</b> per 30-min. ES used only for Asian anchors & fallback.</div>
 </div>
 """, unsafe_allow_html=True)
 
-metric1, metric2, metric3 = st.columns(3)
-with metric1:
-    now_ct = datetime.now(CT)
-    st.markdown("**⏰ Current (CT)**")
-    st.write(now_ct.strftime("%A %b %d, %H:%M:%S"))
-with metric2:
-    is_wk = now_ct.weekday() < 5
-    st.markdown("**🕒 RTH**")
-    st.write("08:30–14:30 CT")
-    st.write("Mon–Fri" if is_wk else "Weekend")
-with metric3:
-    st.markdown("**📐 Slope**")
-    st.write("+0.333 / −0.333 per 30-min")
-
-st.markdown("---")
-
 # ───────────────────────────────────────────────────────────────────────────────
-# CORE COMPUTATION
+# Main flow
 # ───────────────────────────────────────────────────────────────────────────────
-if st.session_state.get("GO"):
-
-    # 1) Load previous day ES (30m) for anchors and Asian skyline/baseline
-    es_prev = fetch_ohlc("ES=F", prev_day, prev_day, interval="30m")
-    if es_prev.empty:
-        st.error("Could not fetch ES=F 30m data for the previous day. Try a different date.")
+if GO:
+    # 1) Exact SPX anchors (RTH)
+    spx_prev = spx_rth_ohlc(prev_day)
+    if not spx_prev:
+        st.error("Could not fetch SPX (or SPY fallback) RTH data for previous day.")
         st.stop()
 
-    # 2) Offset ES→SPX from prev day closes
-    offset = compute_es_spx_offset(prev_day)
-    if offset is None:
-        st.warning("Could not compute ES→SPX offset from prev day closes. Using 0.0 temporarily.")
-        offset = 0.0
+    spx_close_price, spx_close_time = spx_prev["close"]
+    spx_high_price,  spx_high_time  = spx_prev["high"]
+    spx_low_price,   spx_low_time   = spx_prev["low"]
 
-    # 3) Prev-day OHLC anchors (ES prices & times)
-    swings = prev_day_swing_ohlc(es_prev)
-    if not swings:
-        st.error("Could not compute previous day swings.")
-        st.stop()
+    # 2) ES→SPX offset (for Asian & fallback)
+    offset = es_spx_offset(prev_day) or 0.0
 
-    prev_close_price, prev_close_time = swings["close"]
-    prev_high_price,  prev_high_time  = swings["high"]
-    prev_low_price,   prev_low_time   = swings["low"]
-
-    # 4) Asian skyline/baseline (optional)
-    sky, base = asian_skyline_baseline(es_prev)
-
-    # 5) Build the Close Fan in ES, then map to SPX with offset for display
-    close_anchor_time = to_ct(prev_close_time)
-    fan_es = build_close_fan(prev_close_price, close_anchor_time, proj_day)
-    fan_spx = fan_es.copy()
-    fan_spx["Top"]    = (fan_spx["Top"]    + offset).round(2)
-    fan_spx["Bottom"] = (fan_spx["Bottom"] + offset).round(2)
-    fan_spx["Fan_Width"] = (fan_spx["Top"] - fan_spx["Bottom"]).round(2)
-
-    # 6) High(+0.333) and Low(−0.333) anchor lines in SPX terms
-    high_spx = low_spx = None
-    if prev_high_price and prev_high_time:
-        hdf = project_anchor(prev_high_price + offset, to_ct(prev_high_time), proj_day, sign=+1)
-        high_spx = hdf
-    if prev_low_price and prev_low_time:
-        ldf = project_anchor(prev_low_price + offset, to_ct(prev_low_time), proj_day, sign=-1)
-        low_spx = ldf
-
-    # 7) Skyline/Baseline (Asian) projections in SPX terms (cards only)
+    # 3) Asian skyline/baseline → convert to SPX via offset (optional)
+    sky, base = asian_sky_base_es(prev_day)
     sky_card = base_card = None
     if sky and show_asian:
-        p, t = sky
-        sky_card = ("Skyline (Asian +0.333)", round(p+offset, 2), to_ct(t).strftime("%H:%M"))
+        sky_card = ("Skyline (Asian +0.333)", round(sky[0]+offset,2), to_ct(sky[1]).strftime("%H:%M"))
     if base and show_asian:
-        p, t = base
-        base_card = ("Baseline (Asian −0.333)", round(p+offset, 2), to_ct(t).strftime("%H:%M"))
+        base_card = ("Baseline (Asian −0.333)", round(base[0]+offset,2), to_ct(base[1]).strftime("%H:%M"))
 
-    # 8) Last price per 30m slot (for bias context) — use ES 30m at proj day, offset to SPX view
-    es_proj_30m = fetch_ohlc("ES=F", proj_day, proj_day, interval="30m")
-    last_map = {}
-    if not es_proj_30m.empty:
-        for idx, bar in es_proj_30m.iterrows():
+    # 4) Build Close fan (SPX)
+    fan_spx = build_close_fan_spx(spx_close_price, to_ct(spx_close_time), proj_day)
+
+    # 5) Project High(+0.333) & Low(−0.333) anchors (SPX)
+    high_line = project_anchor_spx(spx_high_price, to_ct(spx_high_time), proj_day, +1)
+    low_line  = project_anchor_spx(spx_low_price,  to_ct(spx_low_time),  proj_day, -1)
+
+    # 6) Last price per 30m (SPX preferred; ES+offset fallback)
+    spx_proj_30m = fetch_ohlc("^GSPC", proj_day, proj_day, "30m")
+    last_map={}
+    if not spx_proj_30m.empty:
+        rth = between_time_ct(spx_proj_30m, RTH_START, RTH_END)
+        for idx, bar in rth.iterrows():
+            last_map[idx.strftime("%H:%M")] = float(bar["Close"])
+    else:
+        es_proj_30m = fetch_ohlc("ES=F", proj_day, proj_day, "30m")
+        rth = between_time_ct(es_proj_30m, RTH_START, RTH_END)
+        for idx, bar in rth.iterrows():
             last_map[idx.strftime("%H:%M")] = float(bar["Close"] + offset)
     last_series = pd.Series(last_map)
 
-    # Cards — Prev Close & Anchors
-    cards = st.columns(4)
-    with cards[0]:
-        st.markdown("**📌 Prev Close (SPX-adj)**")
-        st.markdown(f"<span class='badge'>{round(prev_close_price+offset,2)}</span>", unsafe_allow_html=True)
-    with cards[1]:
-        st.markdown("**🔺 Prev High (+0.333)**")
-        st.markdown(f"<span class='badge'>{round(prev_high_price+offset,2)} @ {to_ct(prev_high_time).strftime('%H:%M')}</span>", unsafe_allow_html=True)
-    with cards[2]:
-        st.markdown("**🔻 Prev Low (−0.333)**")
-        st.markdown(f"<span class='badge'>{round(prev_low_price+offset,2)} @ {to_ct(prev_low_time).strftime('%H:%M')}</span>", unsafe_allow_html=True)
-    with cards[3]:
+    # Cards
+    c1,c2,c3,c4 = st.columns(4)
+    with c1:
+        st.markdown("**📌 Prev Close (SPX RTH)**")
+        st.markdown(f"<span class='badge'>{round(spx_close_price,2)} @ {to_ct(spx_close_time).strftime('%H:%M')}</span>", unsafe_allow_html=True)
+    with c2:
+        st.markdown("**🔺 Prev High (SPX)**")
+        st.markdown(f"<span class='badge'>{round(spx_high_price,2)} @ {to_ct(spx_high_time).strftime('%H:%M')}</span>", unsafe_allow_html=True)
+    with c3:
+        st.markdown("**🔻 Prev Low (SPX)**")
+        st.markdown(f"<span class='badge'>{round(spx_low_price,2)} @ {to_ct(spx_low_time).strftime('%H:%M')}</span>", unsafe_allow_html=True)
+    with c4:
         st.markdown("**🌙 Asian Anchors**")
         if sky_card: st.caption(f"{sky_card[0]}: {sky_card[1]} @{sky_card[2]}")
         if base_card: st.caption(f"{base_card[0]}: {base_card[1]} @{base_card[2]}")
@@ -496,23 +319,18 @@ if st.session_state.get("GO"):
 
     st.markdown("---")
 
-    # TABLE 1 — FAN & ANCHORS (SPX)
-    st.subheader("🧭 Fan & Anchors (SPX)")
-    st.caption("Close Fan edges and width for each 30-min RTH slot.")
-    fan_view = fan_spx[["Time","Top","Bottom","Fan_Width"]]
-    st.dataframe(fan_view, use_container_width=True, hide_index=True)
+    # TABLE 1 — Fan
+    st.subheader("🧭 Fan & Width (SPX)")
+    st.dataframe(fan_spx[["Time","Top","Bottom","Fan_Width"]], use_container_width=True, hide_index=True)
 
-    # TABLE 2 — STRATEGY (SPX)
+    # TABLE 2 — Strategy
     st.subheader("🎯 Strategy (SPX)")
-    st.caption("Bias from Close Fan; MR outside fan using High(+)/Low(−) triggers; fade inside fan.")
-
-    strat = build_strategy_table(fan_spx, last_series, high_spx, low_spx)
+    strat = build_strategy_table(fan_spx, last_series, high_line, low_line)
     st.dataframe(strat, use_container_width=True, hide_index=True)
 
-    # TABLE 3 — SIGNALS (Touch + EMA 1m confirm)
+    # TABLE 3 — Signals (ES 30m + 1m confirm; display agnostic)
     st.subheader("🔔 Signals (Touch + EMA 8/21 1m Confirmation)")
-    st.caption("Fires when a 30-min bar touches a fan edge and a confirming 1m EMA cross appears in the same block.")
-    # RTH slice of 30m for proj day (for touch detection)
+    es_proj_30m = fetch_ohlc("ES=F", proj_day, proj_day, "30m")
     es_proj_30m_rth = between_time_ct(es_proj_30m, RTH_START, RTH_END) if not es_proj_30m.empty else pd.DataFrame()
     sig_df = signals_table(es_proj_30m_rth, fan_spx, proj_day)
     if sig_df.empty:
@@ -521,14 +339,13 @@ if st.session_state.get("GO"):
         st.dataframe(sig_df, use_container_width=True, hide_index=True)
 
 else:
-    st.info("Set your dates in the sidebar and click **“🚀 Generate SPX Tables”**.")
+    st.info("Choose dates in the sidebar and click **🚀 Generate SPX Tables**.")
 
-# Footer quick test
 st.markdown("---")
-if st.button("Test Data Connection", key="test_connection"):
-    with st.spinner("Testing market data connection..."):
-        test_data = fetch_ohlc("ES=F", today_ct, today_ct, interval="30m")
-        if not test_data.empty:
-            st.success(f"Connection OK — received {len(test_data)} bars for ES=F today.")
-        else:
-            st.error("Market data connection failed (empty response). Try another date or retry shortly.")
+if st.button("Test Data Connection"):
+    test = fetch_ohlc("^GSPC", today_ct, today_ct, "30m")
+    if not test.empty:
+        st.success(f"SPX connected — {len(test)} bars today.")
+    else:
+        test_es = fetch_ohlc("ES=F", today_ct, today_ct, "30m")
+        st.warning("SPX intraday empty; ES futures reachable." if not test_es.empty else "No intraday data returned.")
