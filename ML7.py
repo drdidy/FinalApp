@@ -441,19 +441,19 @@ with st.sidebar.expander("🔧 Stock Slope Settings", expanded=False):
 # 🏠 MAIN APP HEADER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Hero section with colorful design
+# Hero section
 st.markdown("""
 <div style="text-align: center; padding: 2rem; background: linear-gradient(135deg, rgba(255,255,255,0.1), rgba(255,255,255,0.05)); border-radius: 20px; margin: 1rem 0; border: 2px solid rgba(255,255,255,0.2);">
     <h1 style="font-size: 3rem; margin: 0; background: linear-gradient(135deg, #ff6b6b, #4ecdc4, #45b7d1, #f9ca24); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;">
-        🔮 SPX Prophet Analytics 📊
+        SPX Prophet Analytics
     </h1>
     <p style="font-size: 1.3rem; margin: 1rem 0; opacity: 0.9;">
-        🚀 Advanced Trading Analytics with Live Market Data Integration ⚡
+        Advanced Trading Analytics with Live Market Data Integration
     </p>
 </div>
 """, unsafe_allow_html=True)
 
-# Live market status with colorful metrics
+# Live market status with metrics
 col1, col2, col3 = st.columns(3)
 
 with col1:
@@ -467,18 +467,36 @@ with col1:
     """, unsafe_allow_html=True)
 
 with col2:
+    current_time_ct = datetime.now(CT_TZ)
+    
+    # Check if it's a trading day (Monday-Friday)
+    is_weekday = current_time_ct.weekday() < 5  # 0-4 are Mon-Fri
+    
+    # Check if within RTH hours
     market_open = current_time_ct.replace(hour=8, minute=30, second=0, microsecond=0)
     market_close = current_time_ct.replace(hour=14, minute=30, second=0, microsecond=0)
-    is_rth = market_open <= current_time_ct <= market_close
+    within_hours = market_open <= current_time_ct <= market_close
     
-    status_color = "#00ff88" if is_rth else "#ff6b6b"
-    status_text = "🟢 MARKET OPEN" if is_rth else "🔴 MARKET CLOSED"
+    # Market is open only if both conditions are true
+    is_rth = is_weekday and within_hours
+    
+    if is_weekday:
+        if is_rth:
+            status_color = "#00ff88"
+            status_text = "MARKET OPEN"
+        else:
+            status_color = "#ffbb33" 
+            status_text = "MARKET CLOSED"
+    else:
+        status_color = "#ff6b6b"
+        status_text = "WEEKEND"
     
     st.markdown(f"""
     <div class="metric-container">
-        <h3>📊 Market Status</h3>
+        <h3>Market Status</h3>
         <h2 style="color: {status_color};">{status_text}</h2>
         <p>RTH: 08:30 - 14:30 CT</p>
+        <p>Mon-Fri Only</p>
     </div>
     """, unsafe_allow_html=True)
 
