@@ -26,9 +26,9 @@ SPX_ANCHOR_END = "19:30"    # SPX anchor window end CT
 
 # Default slopes per 30-min block
 SPX_SLOPES = {
-    'high': -0.379,
-    'close': -0.379, 
-    'low': -0.379,
+    'high': -0.2792,
+    'close': -0.2792, 
+    'low': -0.2792,
     'skyline': 0.268,
     'baseline': -0.235
 }
@@ -354,29 +354,20 @@ def calculate_vwap(df: pd.DataFrame) -> pd.Series:
     return vwap
 
 def calculate_es_spx_offset(es_data: pd.DataFrame, spx_data: pd.DataFrame) -> float:
-    """Calculate ES to SPX offset using overlapping RTH sessions"""
+    """Calculate ES to SPX offset using most recent overlapping data"""
     try:
         if es_data.empty or spx_data.empty:
             return 0.0
         
-        # Filter both to RTH overlap (8:30-15:00 CT) for accurate comparison
-        es_rth = get_session_window(es_data, "08:30", "15:00")
-        spx_rth = get_session_window(spx_data, "08:30", "15:00")
+        # Get the most recent common timeframe
+        es_last = es_data.iloc[-1]['Close']
+        spx_last = spx_data.iloc[-1]['Close']
         
-        if es_rth.empty or spx_rth.empty:
-            # Fallback to any available close data
-            es_close = es_data.iloc[-1]['Close']
-            spx_close = spx_data.iloc[-1]['Close']
-        else:
-            # Use last RTH close when both markets were active
-            es_close = es_rth.iloc[-1]['Close']
-            spx_close = spx_rth.iloc[-1]['Close']
-        
-        offset = spx_close - es_close
+        offset = spx_last - es_last
         return round(offset, 1)
         
     except Exception as e:
-        st.warning(f"Offset calculation error: {str(e)}")
+        st.warning(f"⚠️ Offset calculation error: {str(e)}")
         return 0.0
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -535,9 +526,8 @@ if st.button("Test Data Connection", key="test_connection"):
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ✅ PART 1 COMPLETE - FOUNDATION
+# ✅ PART 1 COMPLET FOUNDATION
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 
 
