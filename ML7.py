@@ -15,7 +15,7 @@ from datetime import datetime, date, time, timedelta
 import pytz
 
 CT = pytz.timezone("America/Chicago")
-SLOPE_PER_BLOCK = 0.333
+SLOPE_PER_BLOCK = 0.3
 ANCHOR_WIN_START = "17:00"
 ANCHOR_WIN_END   = "19:30"
 RTH_START = "08:30"
