@@ -26,9 +26,9 @@ SPX_ANCHOR_END = "19:30"    # SPX anchor window end CT
 
 # Default slopes per 30-min block
 SPX_SLOPES = {
-    'high': -0.2792,
-    'close': -0.2792, 
-    'low': -0.2792,
+    'high': -0.379,
+    'close': -0.379, 
+    'low': -0.379,
     'skyline': 0.268,
     'baseline': -0.235
 }
@@ -354,20 +354,29 @@ def calculate_vwap(df: pd.DataFrame) -> pd.Series:
     return vwap
 
 def calculate_es_spx_offset(es_data: pd.DataFrame, spx_data: pd.DataFrame) -> float:
-    """Calculate ES to SPX offset using most recent overlapping data"""
+    """Calculate ES to SPX offset using overlapping RTH sessions"""
     try:
         if es_data.empty or spx_data.empty:
             return 0.0
         
-        # Get the most recent common timeframe
-        es_last = es_data.iloc[-1]['Close']
-        spx_last = spx_data.iloc[-1]['Close']
+        # Filter both to RTH overlap (8:30-15:00 CT) for accurate comparison
+        es_rth = get_session_window(es_data, "08:30", "15:00")
+        spx_rth = get_session_window(spx_data, "08:30", "15:00")
         
-        offset = spx_last - es_last
+        if es_rth.empty or spx_rth.empty:
+            # Fallback to any available close data
+            es_close = es_data.iloc[-1]['Close']
+            spx_close = spx_data.iloc[-1]['Close']
+        else:
+            # Use last RTH close when both markets were active
+            es_close = es_rth.iloc[-1]['Close']
+            spx_close = spx_rth.iloc[-1]['Close']
+        
+        offset = spx_close - es_close
         return round(offset, 1)
         
     except Exception as e:
-        st.warning(f"⚠️ Offset calculation error: {str(e)}")
+        st.warning(f"Offset calculation error: {str(e)}")
         return 0.0
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -399,26 +408,27 @@ st.session_state.theme = theme
 
 st.sidebar.markdown("---")
 
-# SPX slope controls with colorful headers
-st.sidebar.markdown("### 📈 SPX Slopes (per 30-min)")
-st.sidebar.caption("🎯 Adjust projection slopes for each anchor type")
+# SPX slope controls
+st.sidebar.markdown("### SPX Slopes (per 30-min)")
+st.sidebar.caption("Adjust projection slopes for each anchor type")
 
-for slope_name, default_value in SPX_SLOPES.items():
-    icon_map = {
-        'high': '🔴', 'close': '🟡', 'low': '🟢', 
-        'skyline': '🔥', 'baseline': '🏔️'
-    }
-    
-    icon = icon_map.get(slope_name, '📊')
-    display_name = slope_name.title()
-    
-    slope_value = st.sidebar.number_input(
-        f"{icon} {display_name}",
-        value=st.session_state.spx_slopes[slope_name],
-        step=0.0001, format="%.4f",
-        key=f"sb_spx_{slope_name}"
-    )
-    st.session_state.spx_slopes[slope_name] = slope_value
+# Collapsible SPX controls
+with st.sidebar.expander("SPX Slope Settings", expanded=False):
+    for slope_name, default_value in SPX_SLOPES.items():
+        icon_map = {
+            'high': 'High', 'close': 'Close', 'low': 'Low', 
+            'skyline': 'Skyline', 'baseline': 'Baseline'
+        }
+        
+        display_name = icon_map.get(slope_name, slope_name.title())
+        
+        slope_value = st.number_input(
+            display_name,
+            value=st.session_state.spx_slopes[slope_name],
+            step=0.0001, format="%.4f",
+            key=f"sb_spx_{slope_name}"
+        )
+        st.session_state.spx_slopes[slope_name] = slope_value
 
 st.sidebar.markdown("---")
 
@@ -512,15 +522,15 @@ with col3:
 st.markdown("---")
 
 # Data validation status
-if st.button("🔍 Test Data Connection", key="test_connection"):
-    with st.spinner("🔄 Testing market data connection..."):
+if st.button("Test Data Connection", key="test_connection"):
+    with st.spinner("Testing market data connection..."):
         test_data = fetch_live_data("^GSPC", datetime.now().date() - timedelta(days=1), datetime.now().date())
         
         if not test_data.empty:
-            st.success("✅ Market data connection successful!")
-            st.info(f"📊 Retrieved {len(test_data)} data points for SPX")
+            st.success("Market data connection successful!")
+            st.info(f"Retrieved {len(test_data)} data points for SPX")
         else:
-            st.error("❌ Market data connection failed!")
+            st.error("Market data connection failed!")
 
 st.markdown("---")
 
