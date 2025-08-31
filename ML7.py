@@ -1420,3 +1420,446 @@ def project_contract_line(anchor_price: float, anchor_time: datetime,
             'Blocks_from_Anchor': round(blocks,1)
         })
     return pd.DataFrame(projections)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPX PROPHET - PART 6: FINAL INTEGRATION & COMPLETION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# NOTE: This part assumes Parts 1–5 are already executed in the same Streamlit
+# app session, so imports like numpy/pandas/streamlit and helpers such as:
+#  - CT_TZ, RTH_START/RTH_END, SPX_SLOPES, STOCK_SLOPES
+#  - fetch_live_data, calculate_vwap, calculate_ema, calculate_average_true_range
+#  - calculate_es_spx_offset, rth_slots_ct, format_ct_time
+# have been defined earlier.
+
+# ───────────────────────────────────────────────────────────────────────────────
+# MARKET-DERIVED PROBABILITY / STRUCTURE FUNCTIONS
+# ───────────────────────────────────────────────────────────────────────────────
+
+def calculate_volume_profile_strength(data: pd.DataFrame, price_level: float) -> float:
+    """Volume concentration score (0–100) around a level using actual volume."""
+    if data.empty or 'Volume' not in data.columns:
+        return 50.0
+
+    tol = max(0.01, price_level * 0.005)  # ~0.5% tolerance, min safeguard
+    nearby = data[(data['Low'] <= price_level + tol) & (data['High'] >= price_level - tol)]
+
+    if nearby.empty:
+        return 40.0
+
+    level_vol = float(nearby['Volume'].sum())
+    total_vol = float(data['Volume'].sum() or 0)
+    if total_vol <= 0:
+        return 50.0
+
+    conc = (level_vol / total_vol) * 100.0
+    if conc >= 20: return 95.0
+    if conc >= 15: return 85.0
+    if conc >= 10: return 75.0
+    if conc >= 5:  return 60.0
+    return 45.0
+
+def detect_market_regime(data: pd.DataFrame) -> dict:
+    """Trend/volatility regime from last ~20 bars."""
+    if data.empty or len(data) < 20:
+        return {'regime': 'INSUFFICIENT_DATA', 'trend': 'NEUTRAL', 'strength': 0.0, 'volatility': 1.5, 'price_change': 0.0}
+
+    closes = data['Close'].tail(20)
+    price_change = float((closes.iloc[-1] - closes.iloc[0]) / max(1e-9, closes.iloc[0]) * 100.0)
+
+    returns = closes.pct_change().dropna()
+    # annualized-ish intraday vol proxy: std * sqrt(390)
+    volatility = float(returns.std() * np.sqrt(390) * 100.0) if not returns.empty else 0.0
+
+    if price_change > 1.0:
+        trend = 'BULLISH'
+    elif price_change < -1.0:
+        trend = 'BEARISH'
+    else:
+        trend = 'NEUTRAL'
+
+    strength = min(100.0, abs(price_change) * 10.0)
+
+    if volatility >= 3.0:
+        regime = 'HIGH_VOLATILITY'
+    elif volatility >= 1.8:
+        regime = 'MODERATE_VOLATILITY'
+    else:
+        regime = 'LOW_VOLATILITY'
+
+    return {'regime': regime, 'trend': trend, 'strength': strength, 'volatility': volatility, 'price_change': price_change}
+
+def calculate_support_resistance_strength(data: pd.DataFrame, price_level: float) -> float:
+    """Pivot touch count → level strength score (0–100)."""
+    if data.empty or len(data) < 10:
+        return 50.0
+
+    tol = max(0.01, price_level * 0.008)
+    highs = data['High']
+    lows  = data['Low']
+
+    high_touches = int((highs - price_level).abs().le(tol).sum())
+    low_touches  = int((lows  - price_level).abs().le(tol).sum())
+    total = high_touches + low_touches
+
+    if total >= 4: return 90.0
+    if total >= 3: return 80.0
+    if total >= 2: return 70.0
+    if total >= 1: return 60.0
+    return 45.0
+
+def calculate_confluence_score(price: float, anchor_price: float, market_data: pd.DataFrame) -> float:
+    """Weighted confluence of proximity/volume/regime/S-R (0–100)."""
+    if market_data.empty or anchor_price <= 0:
+        return 50.0
+
+    dist_pct = abs(price - anchor_price) / anchor_price * 100.0
+    proximity = max(0.0, 100.0 - dist_pct * 15.0)
+
+    volume_score  = calculate_volume_profile_strength(market_data, price)
+    regime_info   = detect_market_regime(market_data)
+    regime_score  = 80.0 if regime_info['trend'] != 'NEUTRAL' else 55.0
+    sr_score      = calculate_support_resistance_strength(market_data, price)
+
+    confluence = (proximity * 0.25 +
+                  volume_score * 0.25 +
+                  regime_score * 0.25 +
+                  sr_score * 0.25)
+    return float(min(100.0, max(0.0, confluence)))
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TIME-OF-DAY ANALYSIS
+# ───────────────────────────────────────────────────────────────────────────────
+
+def calculate_time_edge_from_data(symbol: str, lookback_days: int = 30) -> dict:
+    """Simple time-slot performance over a lookback window."""
+    try:
+        end_date = datetime.now(CT_TZ).date()
+        start_date = end_date - timedelta(days=lookback_days)
+        hist = fetch_live_data(symbol, start_date, end_date)
+        if hist.empty:
+            return {}
+
+        slots = ['08:30', '09:00', '09:30', '10:00', '10:30', '11:00',
+                 '11:30', '12:00', '12:30', '13:00', '13:30', '14:00', '14:30']
+
+        results = {}
+        for hhmm in slots:
+            slot_data = hist.between_time(hhmm, hhmm)  # same-minute bars across days
+            if slot_data.empty:
+                continue
+            slot_ret = slot_data['Close'].pct_change().dropna()
+            if len(slot_ret) <= 5:
+                continue
+
+            volatility   = float(slot_ret.std() * 100.0)
+            avg_move     = float(slot_ret.abs().mean() * 100.0)
+            upward_bias  = float((slot_ret > 0).mean() * 100.0)
+
+            if volatility > 0.8 and abs(upward_bias - 50.0) > 10.0:
+                edge_score = min(20.0, volatility * 15.0 + abs(upward_bias - 50.0))
+            else:
+                edge_score = volatility * 10.0
+
+            results[hhmm] = {
+                'volatility': volatility,
+                'avg_move': avg_move,
+                'upward_bias': upward_bias,
+                'edge_score': float(edge_score),
+            }
+        return results
+    except Exception:
+        return {}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# MARKET HOURS / STATUS
+# ───────────────────────────────────────────────────────────────────────────────
+
+def get_market_hours_status() -> dict:
+    """Rough US market session status in CT."""
+    now = datetime.now(CT_TZ)
+    weekday = now.weekday() < 5
+
+    market_open  = now.replace(hour=8,  minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=14, minute=30, second=0, microsecond=0)
+    pre_start    = now.replace(hour=7,  minute=0,  second=0, microsecond=0)
+    ah_end       = now.replace(hour=17, minute=0,  second=0, microsecond=0)
+
+    if not weekday:
+        status, session = "WEEKEND", "Closed"
+    elif market_open <= now <= market_close:
+        status, session = "RTH_OPEN", "Regular Hours"
+    elif pre_start <= now < market_open:
+        status, session = "PREMARKET", "Pre-Market"
+    elif market_close < now <= ah_end:
+        status, session = "AFTERHOURS", "After Hours"
+    else:
+        status, session = "CLOSED", "Closed"
+
+    if status == "CLOSED" and weekday:
+        next_open = market_open + timedelta(days=1)
+    elif status == "WEEKEND":
+        days_until_mon = (7 - now.weekday()) % 7
+        days_until_mon = 1 if days_until_mon == 0 else days_until_mon
+        next_open = now.replace(hour=8, minute=30, second=0, microsecond=0) + timedelta(days=days_until_mon)
+    else:
+        next_open = None
+
+    return {
+        'status': status,
+        'session': session,
+        'current_time': now,
+        'is_trading_day': weekday,
+        'next_open': next_open
+    }
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SESSION STATE SAFETY (ensures keys exist if user jumps straight here)
+# ───────────────────────────────────────────────────────────────────────────────
+
+if 'spx_analysis_ready' not in st.session_state:
+    st.session_state.spx_analysis_ready = False
+if 'stock_analysis_ready' not in st.session_state:
+    st.session_state.stock_analysis_ready = False
+if 'signal_ready' not in st.session_state:
+    st.session_state.signal_ready = False
+if 'contract_ready' not in st.session_state:
+    st.session_state.contract_ready = False
+if 'current_offset' not in st.session_state:
+    st.session_state.current_offset = 0.0
+if 'spx_slopes' not in st.session_state:
+    st.session_state.spx_slopes = SPX_SLOPES.copy()
+if 'stock_slopes' not in st.session_state:
+    st.session_state.stock_slopes = STOCK_SLOPES.copy()
+
+# ───────────────────────────────────────────────────────────────────────────────
+# MAIN DASHBOARD & SUMMARY
+# ───────────────────────────────────────────────────────────────────────────────
+
+st.markdown("---")
+st.subheader("Analysis Summary Dashboard")
+
+market_status = get_market_hours_status()
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.markdown("**Analysis Status**")
+    st.write(f"SPX Anchors: {'Ready' if st.session_state.spx_analysis_ready else 'Pending'}")
+    st.write(f"Stock Analysis: {'Ready' if st.session_state.stock_analysis_ready else 'Pending'}")
+    st.write(f"Signal Detection: {'Ready' if st.session_state.signal_ready else 'Pending'}")
+    st.write(f"Contract Tool: {'Ready' if st.session_state.contract_ready else 'Pending'}")
+
+with col2:
+    st.markdown("**Current Settings**")
+    try:
+        st.write(f"Skyline Slope: {st.session_state.spx_slopes['skyline']:+.3f}")
+        st.write(f"Baseline Slope: {st.session_state.spx_slopes['baseline']:+.3f}")
+        st.write(f"High/Close/Low: {st.session_state.spx_slopes['high']:+.3f}")
+    except Exception:
+        st.write("Slopes unavailable")
+    st.write(f"ES→SPX Offset: {st.session_state.current_offset:+.1f}")
+
+with col3:
+    st.markdown("**Market Status**")
+    st.write(f"Market: {market_status['session']}")
+    st.write(f"Time (CT): {market_status['current_time'].strftime('%H:%M:%S')}")
+    if market_status['next_open'] is not None:
+        delta = market_status['next_open'] - market_status['current_time']
+        hours_to_open = int(delta.total_seconds() // 3600)
+        st.write(f"Next Open: {hours_to_open}h")
+    else:
+        st.write("Session Active")
+
+# ───────────────────────────────────────────────────────────────────────────────
+# QUICK ACTIONS
+# ───────────────────────────────────────────────────────────────────────────────
+
+st.markdown("---")
+st.subheader("Quick Actions")
+
+qa1, qa2, qa3, qa4 = st.columns(4)
+
+with qa1:
+    if st.button("Update ES Offset", key="quick_update_offset"):
+        with st.spinner("Updating offset from market data..."):
+            today = datetime.now(CT_TZ).date()
+            yesterday = today - timedelta(days=1)
+            es_data  = fetch_live_data("ES=F",  yesterday, today)
+            spx_data = fetch_live_data("^GSPC", yesterday, today)
+            if not es_data.empty and not spx_data.empty:
+                st.session_state.current_offset = calculate_es_spx_offset(es_data, spx_data)
+                st.success(f"Offset updated: {st.session_state.current_offset:+.1f}")
+                st.rerun()
+            else:
+                st.error("Failed to fetch offset data")
+
+with qa2:
+    if st.button("Reset All Analysis", key="quick_reset_all"):
+        keys = [
+            'spx_analysis_ready', 'stock_analysis_ready', 'signal_ready', 'contract_ready',
+            'es_anchor_data', 'spx_manual_anchors', 'stock_analysis_data',
+            'signal_data', 'contract_projections', 'contract_config', 'underlying_data'
+        ]
+        for k in keys:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.success("All analysis reset")
+        st.rerun()
+
+with qa3:
+    if st.button("Reset Slopes", key="quick_reset_slopes"):
+        st.session_state.spx_slopes = SPX_SLOPES.copy()
+        st.session_state.stock_slopes = STOCK_SLOPES.copy()
+        st.success("Slopes reset to defaults")
+        st.rerun()
+
+with qa4:
+    if st.button("Test Connection", key="quick_test"):
+        with st.spinner("Testing market connection..."):
+            test = fetch_live_data("^GSPC", datetime.now().date() - timedelta(days=1), datetime.now().date())
+            if not test.empty:
+                st.success("Connection successful")
+            else:
+                st.error("Connection failed")
+
+# ───────────────────────────────────────────────────────────────────────────────
+# MARKET PERFORMANCE INSIGHTS
+# ───────────────────────────────────────────────────────────────────────────────
+
+if any([
+    st.session_state.get('spx_analysis_ready', False),
+    st.session_state.get('stock_analysis_ready', False),
+    st.session_state.get('signal_ready', False),
+    st.session_state.get('contract_ready', False),
+]):
+    st.markdown("---")
+    st.subheader("Market Performance Insights")
+
+    itab1, itab2, itab3 = st.tabs(["Market Regime", "Time-of-Day Edge", "Volume Analysis"])
+
+    with itab1:
+        # Use signal_data if available (RTH of chosen symbol/day from Part 4)
+        if st.session_state.get('signal_ready', False):
+            sig = st.session_state.get('signal_data', pd.DataFrame())
+            if not sig.empty:
+                regime = detect_market_regime(sig)
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric("Market Trend", regime['trend'])
+                    st.metric("Trend Strength", f"{regime['strength']:.1f}")
+                with c2:
+                    st.metric("Volatility Regime", regime['regime'])
+                    st.metric("Volatility Level", f"{regime['volatility']:.1f}%")
+
+                if regime['trend'] == 'BULLISH' and regime['volatility'] < 2.5:
+                    ctx = "Stable uptrend — consider long setups with standard stops."
+                elif regime['trend'] == 'BEARISH' and regime['volatility'] < 2.5:
+                    ctx = "Stable downtrend — consider short setups with standard stops."
+                elif regime['volatility'] > 3.0:
+                    ctx = "High volatility — widen stops and reduce size."
+                else:
+                    ctx = "Neutral/ranging — mean reversion and fade setups may work."
+                st.info(ctx)
+            else:
+                st.info("No signal dataset available.")
+        else:
+            st.info("Generate signal analysis to see market regime data.")
+
+    with itab2:
+        if st.button("Calculate Time Edge", key="calc_time_edge"):
+            with st.spinner("Analyzing time-of-day patterns..."):
+                ted = calculate_time_edge_from_data("^GSPC", 30)
+                if ted:
+                    rows = [{
+                        'Time': t,
+                        'Volatility': f"{v['volatility']:.2f}%",
+                        'Avg Move': f"{v['avg_move']:.2f}%",
+                        'Upward Bias': f"{v['upward_bias']:.1f}%",
+                        'Edge Score': f"{v['edge_score']:.1f}",
+                    } for t, v in ted.items()]
+                    df_edge = pd.DataFrame(rows).sort_values('Time')
+                    st.dataframe(df_edge, use_container_width=True, hide_index=True)
+                else:
+                    st.error("Could not calculate time edge data.")
+        else:
+            st.info("Click 'Calculate Time Edge' to analyze historical time-of-day patterns.")
+
+    with itab3:
+        if st.session_state.get('signal_ready', False):
+            sig = st.session_state.get('signal_data', pd.DataFrame())
+            if not sig.empty and 'Volume' in sig.columns:
+                avg_vol = float(sig['Volume'].mean())
+                std_vol = float(sig['Volume'].std())
+                thresh = avg_vol + std_vol
+                high_vol = sig[sig['Volume'] > thresh]
+
+                vc1, vc2, vc3 = st.columns(3)
+                with vc1:
+                    st.metric("Average Volume", f"{avg_vol:,.0f}")
+                with vc2:
+                    st.metric("Volume Std Dev", f"{std_vol:,.0f}")
+                with vc3:
+                    st.metric("High Volume Bars", len(high_vol))
+
+                if not high_vol.empty:
+                    hv_move = float((high_vol['Close'] - high_vol['Open']).abs().mean())
+                    norm = sig[sig['Volume'] <= thresh]
+                    nv_move = float((norm['Close'] - norm['Open']).abs().mean()) if not norm.empty else 0.0
+                    st.info(f"High-volume bars avg move: ${hv_move:.2f}")
+                    st.info(f"Normal-volume bars avg move: ${nv_move:.2f}")
+            else:
+                st.info("No volume data available for analysis.")
+        else:
+            st.info("Run signal analysis first to see volume insights.")
+
+# ───────────────────────────────────────────────────────────────────────────────
+# FOOTER / DATA STATUS
+# ───────────────────────────────────────────────────────────────────────────────
+
+st.markdown("---")
+d1, d2, d3 = st.columns(3)
+
+with d1:
+    try:
+        spx_t = fetch_live_data("^GSPC", datetime.now().date() - timedelta(days=1), datetime.now().date())
+        status = "Active" if not spx_t.empty else "Issue"
+        lastup = spx_t.index[-1].strftime("%H:%M CT") if not spx_t.empty else "N/A"
+    except Exception:
+        status, lastup = "Error", "N/A"
+    st.write("**SPX Data**")
+    st.write(f"Status: {status}")
+    st.write(f"Last Update: {lastup}")
+
+with d2:
+    try:
+        es_t = fetch_live_data("ES=F", datetime.now().date() - timedelta(days=1), datetime.now().date())
+        status = "Active" if not es_t.empty else "Issue"
+        lastup = es_t.index[-1].strftime("%H:%M CT") if not es_t.empty else "N/A"
+    except Exception:
+        status, lastup = "Error", "N/A"
+    st.write("**ES Futures**")
+    st.write(f"Status: {status}")
+    st.write(f"Last Update: {lastup}")
+
+with d3:
+    st.write("**Current Session**")
+    st.write(f"Offset Status: {'Live' if st.session_state.current_offset != 0 else 'Default'}")
+    st.write(f"Session: {market_status['session']}")
+
+st.markdown("---")
+st.markdown(
+    f"""
+    <div style='text-align:center; color:#888; font-size:0.9rem;'>
+      SPX Prophet Analytics • Market Data Integration •
+      Session: {datetime.now(CT_TZ).strftime('%H:%M:%S CT')} •
+      Status: {market_status['session']}
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# END • PART 6
+# ═══════════════════════════════════════════════════════════════════════════════
+
