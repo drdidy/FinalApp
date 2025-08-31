@@ -26,9 +26,9 @@ SPX_ANCHOR_END = "19:30"    # SPX anchor window end CT
 
 # Default slopes per 30-min block
 SPX_SLOPES = {
-    'high': -0.379,
-    'close': -0.379, 
-    'low': -0.379,
+    'high': -0.2792,
+    'close': -0.2792, 
+    'low': -0.2792,
     'skyline': 0.268,
     'baseline': -0.235
 }
