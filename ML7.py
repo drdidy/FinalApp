@@ -26,9 +26,9 @@ SPX_ANCHOR_END = "19:30"    # SPX anchor window end CT
 
 # Default slopes per 30-min block
 SPX_SLOPES = {
-    'high': -0.379,
-    'close': -0.379, 
-    'low': -0.379,
+    'high': -0.2792,
+    'close': -0.2792, 
+    'low': -0.2792,
     'skyline': 0.268,
     'baseline': -0.235
 }
@@ -521,102 +521,22 @@ with col3:
 
 st.markdown("---")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HISTORICAL ANALYSIS FOR REAL PROBABILITIES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def calculate_historical_probabilities(symbol: str = "^GSPC", days_back: int = 30) -> dict:
-    """Calculate real probabilities based on historical market behavior"""
-    try:
-        # Simplified approach - use basic success rate estimates
-        # Based on typical SPX intraday behavior patterns
+# Data validation status
+if st.button("Test Data Connection", key="test_connection"):
+    with st.spinner("Testing market data connection..."):
+        test_data = fetch_live_data("^GSPC", datetime.now().date() - timedelta(days=1), datetime.now().date())
         
-        # These are realistic estimates based on SPX behavior:
-        # - Entry success when touching key levels: ~70-75%
-        # - TP1 (30% of daily range): ~60-65% 
-        # - TP2 (50% of daily range): ~40-45%
-        
-        probabilities = {
-            'SKYLINE': {'entry': 75.0, 'tp1': 65.0, 'tp2': 45.0, 'sample_size': 20},
-            'BASELINE': {'entry': 75.0, 'tp1': 65.0, 'tp2': 45.0, 'sample_size': 20},
-            'HIGH': {'entry': 70.0, 'tp1': 60.0, 'tp2': 40.0, 'sample_size': 20},
-            'CLOSE': {'entry': 72.0, 'tp1': 62.0, 'tp2': 42.0, 'sample_size': 20},
-            'LOW': {'entry': 70.0, 'tp1': 60.0, 'tp2': 40.0, 'sample_size': 20},
-            'analysis_date': datetime.now().date(),
-            'days_analyzed': days_back
-        }
-        
-        return probabilities
-        
-    except Exception as e:
-        return get_default_probabilities()
-
-def simulate_anchor_trade(day_data: pd.DataFrame, anchor_price: float, daily_range: float, anchor_type: str) -> tuple:
-    """Simulate trade outcome based on your strategy rules"""
-    entry_success = False
-    tp1_success = False
-    tp2_success = False
-    
-    # Calculate targets (30% and 50% of daily range)
-    tp1_target = daily_range * 0.30
-    tp2_target = daily_range * 0.50
-    
-    # Check for your specific entry patterns
-    for i in range(len(day_data)):
-        bar = day_data.iloc[i]
-        
-        # Check if this bar creates entry signal based on your rules
-        is_bearish = bar['Close'] < bar['Open']
-        tolerance = anchor_price * 0.001
-        
-        # Simplified entry logic: bearish candle touches anchor and closes above
-        if (is_bearish and 
-            bar['Low'] <= anchor_price + tolerance and
-            bar['Close'] > anchor_price):
-            
-            entry_success = True
-            entry_price = bar['Close']
-            
-            # Check if subsequent bars hit targets
-            remaining_bars = day_data.iloc[i+1:]
-            
-            for future_bar in remaining_bars.itertuples():
-                # Check TP1 (30% of daily range)
-                if future_bar.High >= entry_price + tp1_target:
-                    tp1_success = True
-                
-                # Check TP2 (50% of daily range)
-                if future_bar.High >= entry_price + tp2_target:
-                    tp2_success = True
-                    break
-            
-            break  # Only check first valid entry per day
-    
-    return entry_success, tp1_success, tp2_success
-
-def get_default_probabilities() -> dict:
-    """Fallback probabilities if historical analysis fails"""
-    return {
-        'SKYLINE': {'entry': 75.0, 'tp1': 65.0, 'tp2': 45.0, 'sample_size': 0},
-        'BASELINE': {'entry': 75.0, 'tp1': 65.0, 'tp2': 45.0, 'sample_size': 0},
-        'HIGH': {'entry': 70.0, 'tp1': 60.0, 'tp2': 40.0, 'sample_size': 0},
-        'CLOSE': {'entry': 70.0, 'tp1': 60.0, 'tp2': 40.0, 'sample_size': 0},
-        'LOW': {'entry': 70.0, 'tp1': 60.0, 'tp2': 40.0, 'sample_size': 0},
-        'analysis_date': datetime.now().date(),
-        'days_analyzed': 0
-    }
-
-def get_default_anchor_prob() -> dict:
-    """Default probability for single anchor"""
-    return {'entry': 70.0, 'tp1': 60.0, 'tp2': 40.0, 'sample_size': 0}
+        if not test_data.empty:
+            st.success("Market data connection successful!")
+            st.info(f"Retrieved {len(test_data)} data points for SPX")
+        else:
+            st.error("Market data connection failed!")
 
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ✅ PART 1 COMPLETE - FOUNDATION
+# ✅ PART 1 COMPLETE - ENHANCED FOUNDATION
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 
 
