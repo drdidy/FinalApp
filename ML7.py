@@ -627,152 +627,139 @@ st.markdown("---")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# AUTO-UPDATE FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def update_offset_for_date():
+    """Automatically update offset when date changes"""
+    if 'spx_prev_day' in st.session_state:
+        selected_date = st.session_state.spx_prev_day
+        
+        # Fetch data for the selected date
+        es_data = fetch_live_data("ES=F", selected_date, selected_date)
+        spx_data = fetch_live_data("^GSPC", selected_date, selected_date)
+        
+        if not es_data.empty and not spx_data.empty:
+            new_offset = calculate_es_spx_offset(es_data, spx_data)
+            st.session_state.current_offset = new_offset
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ENTRY/EXIT ANALYSIS FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def calculate_market_based_targets(anchor_price: float, market_data: pd.DataFrame) -> dict:
-    """Calculate TP targets based on actual market volatility and range"""
-    if market_data.empty:
-        # Fallback: use minimal conservative targets
-        daily_range = anchor_price * 0.005  # 0.5% fallback
-    else:
-        # Calculate actual daily range from market data
-        if len(market_data) > 0:
-            daily_high = market_data['High'].max()
-            daily_low = market_data['Low'].min()
-            daily_range = daily_high - daily_low
-        else:
-            daily_range = anchor_price * 0.005
-    
-    # Calculate realistic targets based on actual range
-    tp1_distance = daily_range * 0.30  # 30% of actual daily range
-    tp2_distance = daily_range * 0.50  # 50% of actual daily range
-    
-    return {
-        'tp1_distance': tp1_distance,
-        'tp2_distance': tp2_distance,
-        'daily_range': daily_range
-    }
-
-def calculate_dynamic_stop_buffer(anchor_price: float, market_data: pd.DataFrame) -> float:
-    """Calculate stop buffer based on recent volatility"""
-    if market_data.empty or len(market_data) < 2:
-        return anchor_price * 0.003  # 0.3% fallback
-    
-    # Calculate recent volatility from price changes
-    recent_returns = market_data['Close'].pct_change().dropna()
-    if len(recent_returns) == 0:
-        return anchor_price * 0.003
-    
-    volatility = recent_returns.std()
-    # Use 1.5x volatility as stop buffer
-    return anchor_price * max(0.002, min(0.01, volatility * 1.5))
-
-def calculate_data_driven_probability(anchor_type: str, time_slot: str, market_data: pd.DataFrame) -> float:
-    """Calculate probability based on actual market volatility and time patterns"""
-    base_prob = 60.0  # Conservative base
-    
-    # Volatility adjustment based on actual data
-    if not market_data.empty and len(market_data) >= 5:
-        recent_vol = market_data['Close'].pct_change().tail(5).std()
-        # Higher volatility = higher probability of anchor touches
-        vol_adjustment = min(15, recent_vol * 1000)  # Scale to percentage
-        base_prob += vol_adjustment
-    
-    # Time-based adjustment from actual volume patterns
-    if not market_data.empty and 'Volume' in market_data.columns:
-        hour = int(time_slot.split(':')[0])
-        
-        # Filter data to similar time periods if possible
-        try:
-            hour_data = market_data[market_data.index.hour == hour]
-            if not hour_data.empty:
-                avg_hour_volume = hour_data['Volume'].mean()
-                total_avg_volume = market_data['Volume'].mean()
-                
-                if total_avg_volume > 0:
-                    volume_ratio = avg_hour_volume / total_avg_volume
-                    # Higher relative volume = higher probability
-                    time_adjustment = (volume_ratio - 1) * 10
-                    base_prob += time_adjustment
-        except:
-            pass  # Skip time adjustment if calculation fails
-    
-    return max(40, min(90, base_prob))
-
 def calculate_entry_exit_table(projection_df: pd.DataFrame, anchor_type: str) -> pd.DataFrame:
-    """Calculate entry/exit analysis based on actual market data"""
+    """Calculate entry/exit analysis based on anchor bounce strategy"""
     if projection_df.empty:
         return pd.DataFrame()
     
     analysis_rows = []
     
-    # Get market data for calculations
-    market_data = st.session_state.get('es_anchor_data', pd.DataFrame())
-    if market_data.empty:
-        market_data = st.session_state.get('signal_data', pd.DataFrame())
+    # Determine anchor characteristics for direction bias
+    is_skyline = anchor_type.upper() in ['SKYLINE', 'HIGH'] 
+    is_baseline = anchor_type.upper() in ['BASELINE', 'LOW']
     
     for idx, row in projection_df.iterrows():
         time_slot = row['Time']
         anchor_price = row['Price']
         
-        # Calculate targets based on actual market data
-        target_data = calculate_market_based_targets(anchor_price, market_data)
-        tp1_distance = target_data['tp1_distance']
-        tp2_distance = target_data['tp2_distance']
-        
-        # Dynamic stop based on actual volatility
-        stop_buffer = calculate_dynamic_stop_buffer(anchor_price, market_data)
-        
-        # Calculate scenarios based on anchor type
-        if anchor_type.upper() == 'HIGH':
-            buy_tp1 = anchor_price + tp1_distance
-            buy_tp2 = anchor_price + tp2_distance
-            sell_tp1 = anchor_price - tp1_distance
-            sell_tp2 = anchor_price - tp2_distance
-            stop_price = anchor_price + stop_buffer
+        # Calculate targets based on anchor type
+        if is_skyline:
+            # Skyline bounce - expect initial bounce up then potential reversal
+            volatility_factor = anchor_price * 0.012
+            tp1_distance = volatility_factor * 0.8   # Quick bounce target
+            tp2_distance = volatility_factor * 2.2   # Extended target
+            
+            entry_price = anchor_price
+            tp1_price = anchor_price + tp1_distance  # Bounce up from skyline
+            tp2_price = anchor_price + tp2_distance  # Extended bounce
+            direction = "BUY"
+            
+            # Stop above skyline with buffer for retests
+            stop_price = anchor_price + (anchor_price * 0.006)
+            
+        elif is_baseline:
+            # Baseline bounce - expect upward move
+            volatility_factor = anchor_price * 0.012
+            tp1_distance = volatility_factor * 0.8
+            tp2_distance = volatility_factor * 2.2
+            
+            entry_price = anchor_price
+            tp1_price = anchor_price + tp1_distance  # Bounce up from baseline
+            tp2_price = anchor_price + tp2_distance  # Extended bounce
+            direction = "BUY"
+            
+            # Stop below baseline with buffer
+            stop_price = max(0.01, anchor_price - (anchor_price * 0.006))
+            
         else:
-            buy_tp1 = anchor_price + tp1_distance
-            buy_tp2 = anchor_price + tp2_distance
-            sell_tp1 = anchor_price - tp1_distance
-            sell_tp2 = anchor_price - tp2_distance
-            stop_price = max(0.01, anchor_price - stop_buffer)
+            # High/Close/Low anchors 
+            volatility_factor = anchor_price * 0.010
+            tp1_distance = volatility_factor * 0.7
+            tp2_distance = volatility_factor * 1.8
+            
+            if anchor_type.upper() == 'HIGH':
+                entry_price = anchor_price
+                tp1_price = anchor_price - tp1_distance  # Expect decline from high
+                tp2_price = anchor_price - tp2_distance
+                direction = "SELL"
+                stop_price = anchor_price + (anchor_price * 0.005)
+            else:
+                entry_price = anchor_price
+                tp1_price = anchor_price + tp1_distance  # Expect rise from close/low
+                tp2_price = anchor_price + tp2_distance
+                direction = "BUY"
+                stop_price = anchor_price - (anchor_price * 0.005)
         
-        # Data-driven probability
-        touch_prob = calculate_data_driven_probability(anchor_type, time_slot, market_data)
+        risk_amount = abs(entry_price - stop_price)
+        
+        # Probability calculations
+        entry_prob = calculate_anchor_entry_probability(anchor_type, time_slot)
+        tp1_prob = calculate_anchor_target_probability(anchor_type, 1)
+        tp2_prob = calculate_anchor_target_probability(anchor_type, 2)
+        
+        # Risk-reward ratios
+        rr1 = abs(tp1_price - entry_price) / risk_amount if risk_amount > 0 else 0
+        rr2 = abs(tp2_price - entry_price) / risk_amount if risk_amount > 0 else 0
         
         analysis_rows.append({
             'Time': time_slot,
-            'Entry_Level': round(anchor_price, 2),
-            'BUY_Scenario': f"Touch from above, close above → TP1: {buy_tp1:.2f}, TP2: {buy_tp2:.2f}",
-            'SELL_Scenario': f"Touch and close below → TP1: {sell_tp1:.2f}, TP2: {sell_tp2:.2f}",
-            'Stop_Buffer': round(stop_buffer, 2),
-            'Daily_Range': round(target_data['daily_range'], 2),
-            'Touch_Probability': f"{touch_prob:.0f}%",
-            'Strategy_Note': get_anchor_strategy_note(anchor_type)
+            'Direction': direction,
+            'Entry': round(entry_price, 2),
+            'Stop': round(stop_price, 2),
+            'TP1': round(tp1_price, 2),
+            'TP2': round(tp2_price, 2),
+            'Risk': round(risk_amount, 2),
+            'RR1': f"{rr1:.1f}",
+            'RR2': f"{rr2:.1f}",
+            'Entry_Prob': f"{entry_prob:.0f}%",
+            'TP1_Prob': f"{tp1_prob:.0f}%",
+            'TP2_Prob': f"{tp2_prob:.0f}%"
         })
     
     return pd.DataFrame(analysis_rows)
 
 def calculate_anchor_entry_probability(anchor_type: str, time_slot: str) -> float:
-    """Calculate entry probability based on market data"""
-    # Get available market data
-    market_data = st.session_state.get('es_anchor_data', pd.DataFrame())
-    if market_data.empty:
-        market_data = st.session_state.get('signal_data', pd.DataFrame())
-    
-    return calculate_data_driven_probability(anchor_type, time_slot, market_data)
-
-def get_anchor_strategy_note(anchor_type: str) -> str:
-    """Get strategy note for each anchor type based on your trading rules"""
-    strategy_notes = {
-        'SKYLINE': 'Key level - if price far above, watch for drop to skyline for bounce',
-        'BASELINE': 'Primary support - strong bounce probability on touch from above',
-        'HIGH': 'Resistance level - could provide bounce or break based on candle reaction',
-        'CLOSE': 'Critical anchor - above=BUY bias, below=SELL bias, candle reaction determines',
-        'LOW': 'Support level - watch candle reaction for bounce vs break'
+    """Calculate entry probability based on anchor strategy"""
+    base_probs = {
+        'SKYLINE': 90.0,
+        'BASELINE': 90.0,
+        'HIGH': 75.0,
+        'CLOSE': 80.0,
+        'LOW': 75.0
     }
-    return strategy_notes.get(anchor_type.upper(), 'Watch candle reaction at touch')
+    
+    base_prob = base_probs.get(anchor_type.upper(), 70.0)
+    
+    # Time adjustments
+    hour = int(time_slot.split(':')[0])
+    if hour in [8, 9]:
+        time_adj = 8
+    elif hour in [13, 14]:
+        time_adj = 5
+    else:
+        time_adj = 0
+    
+    return min(95, base_prob + time_adj)
 
 def calculate_anchor_target_probability(anchor_type: str, target_num: int) -> float:
     """Calculate target probability based on anchor strength"""
@@ -797,7 +784,8 @@ with tab1:
         prev_day = st.date_input(
             "Previous Trading Day", 
             value=datetime.now(CT_TZ).date() - timedelta(days=1),
-            key="spx_prev_day"
+            key="spx_prev_day",
+            on_change=update_offset_for_date
         )
         
         weekday = prev_day.strftime("%A")
@@ -812,53 +800,112 @@ with tab1:
         
         proj_weekday = proj_day.strftime("%A") 
         st.caption(f"Projecting for: {proj_weekday}")
-    
-    # Check if date changed and auto-fetch data
-    if ('last_spx_date' not in st.session_state or 
-        st.session_state.last_spx_date != prev_day):
+
+def update_offset_for_date():
+    """Automatically update offset when date changes"""
+    if 'spx_prev_day' in st.session_state:
+        selected_date = st.session_state.spx_prev_day
         
-        st.session_state.last_spx_date = prev_day
+        # Fetch data for the selected date
+        es_data = fetch_live_data("ES=F", selected_date, selected_date)
+        spx_data = fetch_live_data("^GSPC", selected_date, selected_date)
         
-        with st.spinner("Loading data for selected date..."):
-            # Auto-update offset for selected date
-            es_data_for_offset = fetch_live_data("ES=F", prev_day, prev_day)
-            spx_data_for_offset = fetch_live_data("^GSPC", prev_day, prev_day)
-            
-            if not es_data_for_offset.empty and not spx_data_for_offset.empty:
-                st.session_state.current_offset = calculate_es_spx_offset(es_data_for_offset, spx_data_for_offset)
-            
-            # Fetch ES futures data for anchor detection
-            es_data = fetch_live_data("ES=F", prev_day, prev_day)
-            
-            if not es_data.empty:
-                # Get anchor window data
-                anchor_window = get_session_window(es_data, SPX_ANCHOR_START, SPX_ANCHOR_END)
-                if anchor_window.empty:
-                    anchor_window = es_data
-                
-                st.session_state.es_anchor_data = anchor_window
-                
-                # Get SPX data for High/Close/Low anchors
-                spx_data = fetch_live_data("^GSPC", prev_day, prev_day)
-                
-                if not spx_data.empty:
-                    daily_ohlc = get_daily_ohlc(spx_data, prev_day)
-                    if daily_ohlc:
-                        st.session_state.spx_manual_anchors = daily_ohlc
-                else:
-                    # Convert ES to SPX equivalent
-                    es_daily_ohlc = get_daily_ohlc(anchor_window, prev_day)
-                    if es_daily_ohlc:
-                        spx_equivalent = {}
-                        for key, (es_price, timestamp) in es_daily_ohlc.items():
-                            spx_equivalent[key] = (es_price + st.session_state.current_offset, timestamp)
-                        st.session_state.spx_manual_anchors = spx_equivalent
-                
-                st.session_state.spx_analysis_ready = True
+        if not es_data.empty and not spx_data.empty:
+            new_offset = calculate_es_spx_offset(es_data, spx_data)
+            st.session_state.current_offset = new_offset
     
-    # Show current offset
-    st.info(f"ES→SPX Offset for {prev_day}: {st.session_state.current_offset:+.1f}")
     st.markdown("---")
+    
+    # Manual price override section
+    st.subheader("Price Override (Optional)")
+    st.caption("Override Yahoo Finance data with your exact prices for accurate projections")
+    
+    use_manual = st.checkbox("Use Manual Prices", key="use_manual_prices")
+    
+    if use_manual:
+        override_col1, override_col2, override_col3 = st.columns(3)
+        
+        with override_col1:
+            manual_high = st.number_input(
+                "Manual High Price",
+                value=0.0,
+                step=0.1, format="%.1f",
+                key="manual_high_price"
+            )
+        
+        with override_col2:
+            manual_close = st.number_input(
+                "Manual Close Price", 
+                value=0.0,
+                step=0.1, format="%.1f",
+                key="manual_close_price"
+            )
+        
+        with override_col3:
+            manual_low = st.number_input(
+                "Manual Low Price",
+                value=0.0,
+                step=0.1, format="%.1f", 
+                key="manual_low_price"
+            )
+    
+    st.markdown("---")
+    
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # DATA ANALYSIS WITH AUTO OFFSET
+    # ═══════════════════════════════════════════════════════════════════════════════
+    
+    if st.button("Generate SPX Anchors", key="spx_generate", type="primary"):
+        with st.spinner("Analyzing market data..."):
+            try:
+                # Get offset for the specific historical date
+                es_data_for_offset = fetch_live_data("ES=F", prev_day, prev_day)
+                spx_data_for_offset = fetch_live_data("^GSPC", prev_day, prev_day)
+                
+                if not es_data_for_offset.empty and not spx_data_for_offset.empty:
+                    st.session_state.current_offset = calculate_es_spx_offset(es_data_for_offset, spx_data_for_offset)
+                
+                # Fetch ES futures data for anchor detection
+                es_data = fetch_live_data("ES=F", prev_day, prev_day)
+                
+                if es_data.empty:
+                    st.error(f"No ES futures data for {prev_day}")
+                else:
+                    # Get anchor window data (17:00-19:30 CT)
+                    anchor_window = get_session_window(es_data, SPX_ANCHOR_START, SPX_ANCHOR_END)
+                    
+                    if anchor_window.empty:
+                        # Use full day ES data as fallback
+                        anchor_window = es_data
+                    
+                    # Store ES anchor data
+                    st.session_state.es_anchor_data = anchor_window
+                    
+                    # Get SPX data for High/Close/Low anchors
+                    spx_data = fetch_live_data("^GSPC", prev_day, prev_day)
+                    
+                    if not spx_data.empty:
+                        # Extract actual daily SPX OHLC
+                        daily_ohlc = get_daily_ohlc(spx_data, prev_day)
+                        
+                        if daily_ohlc:
+                            st.session_state.spx_manual_anchors = daily_ohlc
+                        else:
+                            st.warning("Could not extract SPX OHLC data")
+                    else:
+                        # Convert ES anchor window to SPX equivalent using offset
+                        es_daily_ohlc = get_daily_ohlc(anchor_window, prev_day)
+                        
+                        if es_daily_ohlc:
+                            spx_equivalent = {}
+                            for key, (es_price, timestamp) in es_daily_ohlc.items():
+                                spx_equivalent[key] = (es_price + st.session_state.current_offset, timestamp)
+                            st.session_state.spx_manual_anchors = spx_equivalent
+                    
+                    st.session_state.spx_analysis_ready = True
+                    
+            except Exception as e:
+                st.error(f"Analysis error: {str(e)}")
     
     # ═══════════════════════════════════════════════════════════════════════════════
     # RESULTS DISPLAY
@@ -867,16 +914,17 @@ with tab1:
     if st.session_state.get('spx_analysis_ready', False):
         st.subheader("SPX Anchor Projections")
         
-        # Process swing detection for Skyline/Baseline
+        # Process ES swing detection but convert to SPX values
         es_data = st.session_state.get('es_anchor_data', pd.DataFrame())
         skyline_anchor_spx = None
         baseline_anchor_spx = None
         
         if not es_data.empty:
+            # Detect swings in ES data
             es_swings = detect_swings_simple(es_data)
             es_skyline, es_baseline = get_anchor_points(es_swings)
             
-            # Convert ES anchors to SPX equivalent
+            # Convert ES anchor points to SPX equivalent
             current_offset = st.session_state.current_offset
             
             if es_skyline:
@@ -896,7 +944,7 @@ with tab1:
             st.subheader("Detected SPX Anchors")
             summary_cols = st.columns(5)
             
-            # Manual anchors display
+            # Manual anchors (High/Close/Low)
             anchor_info = [
                 ('high', 'High', '#ff6b6b'),
                 ('close', 'Close', '#f9ca24'),
@@ -915,7 +963,7 @@ with tab1:
                         </div>
                         """, unsafe_allow_html=True)
             
-            # Swing anchors display
+            # Swing anchors (Skyline/Baseline) - converted to SPX
             with summary_cols[3]:
                 if skyline_anchor_spx:
                     price, timestamp = skyline_anchor_spx
@@ -924,6 +972,7 @@ with tab1:
                         <h4>Skyline</h4>
                         <h3>${price:.2f}</h3>
                         <p>{format_ct_time(timestamp)}</p>
+                        <small>SPX Equivalent</small>
                     </div>
                     """, unsafe_allow_html=True)
                 else:
@@ -937,6 +986,7 @@ with tab1:
                         <h4>Baseline</h4>
                         <h3>${price:.2f}</h3>
                         <p>{format_ct_time(timestamp)}</p>
+                        <small>SPX Equivalent</small>
                     </div>
                     """, unsafe_allow_html=True)
                 else:
@@ -944,10 +994,10 @@ with tab1:
         
         st.markdown("---")
         
-        # Projection tabs
+        # Projection tabs with SPX values
         projection_tabs = st.tabs(["High", "Close", "Low", "Skyline", "Baseline"])
         
-        # Manual anchor projections
+        # Manual anchor projections using SPX values
         if st.session_state.get('spx_manual_anchors'):
             manual_anchors = st.session_state.spx_manual_anchors
             
@@ -962,14 +1012,16 @@ with tab1:
                         st.session_state.spx_slopes['high'], proj_day
                     )
                     
-                    st.subheader("High Anchor SPX Projection")
-                    st.dataframe(high_proj, use_container_width=True, hide_index=True)
-                    
-                    high_analysis = calculate_entry_exit_table(high_proj, "HIGH")
-                    st.subheader("Entry/Exit Strategy")
-                    st.dataframe(high_analysis, use_container_width=True, hide_index=True)
+                    if not high_proj.empty:
+                        st.subheader("High Anchor SPX Projection")
+                        st.dataframe(high_proj, use_container_width=True, hide_index=True)
+                        
+                        high_analysis = calculate_entry_exit_table(high_proj, "HIGH")
+                        if not high_analysis.empty:
+                            st.subheader("Entry/Exit Strategy")
+                            st.dataframe(high_analysis, use_container_width=True, hide_index=True)
                 else:
-                    st.warning("No high anchor data")
+                    st.warning("No high anchor data available")
             
             # Close Anchor
             with projection_tabs[1]:
@@ -982,14 +1034,16 @@ with tab1:
                         st.session_state.spx_slopes['close'], proj_day
                     )
                     
-                    st.subheader("Close Anchor SPX Projection")
-                    st.dataframe(close_proj, use_container_width=True, hide_index=True)
-                    
-                    close_analysis = calculate_entry_exit_table(close_proj, "CLOSE")
-                    st.subheader("Entry/Exit Strategy")
-                    st.dataframe(close_analysis, use_container_width=True, hide_index=True)
+                    if not close_proj.empty:
+                        st.subheader("Close Anchor SPX Projection")
+                        st.dataframe(close_proj, use_container_width=True, hide_index=True)
+                        
+                        close_analysis = calculate_entry_exit_table(close_proj, "CLOSE")
+                        if not close_analysis.empty:
+                            st.subheader("Entry/Exit Strategy")
+                            st.dataframe(close_analysis, use_container_width=True, hide_index=True)
                 else:
-                    st.warning("No close anchor data")
+                    st.warning("No close anchor data available")
             
             # Low Anchor
             with projection_tabs[2]:
@@ -1002,14 +1056,16 @@ with tab1:
                         st.session_state.spx_slopes['low'], proj_day
                     )
                     
-                    st.subheader("Low Anchor SPX Projection")
-                    st.dataframe(low_proj, use_container_width=True, hide_index=True)
-                    
-                    low_analysis = calculate_entry_exit_table(low_proj, "LOW")
-                    st.subheader("Entry/Exit Strategy")
-                    st.dataframe(low_analysis, use_container_width=True, hide_index=True)
+                    if not low_proj.empty:
+                        st.subheader("Low Anchor SPX Projection")
+                        st.dataframe(low_proj, use_container_width=True, hide_index=True)
+                        
+                        low_analysis = calculate_entry_exit_table(low_proj, "LOW")
+                        if not low_analysis.empty:
+                            st.subheader("Entry/Exit Strategy") 
+                            st.dataframe(low_analysis, use_container_width=True, hide_index=True)
                 else:
-                    st.warning("No low anchor data")
+                    st.warning("No low anchor data available")
         
         # Swing-based projections using SPX converted values
         with projection_tabs[3]:  # Skyline
@@ -1022,12 +1078,15 @@ with tab1:
                     st.session_state.spx_slopes['skyline'], proj_day
                 )
                 
-                st.subheader("Skyline SPX Projection (80% Zone)")
-                st.dataframe(skyline_proj, use_container_width=True, hide_index=True)
-                
-                sky_analysis = calculate_entry_exit_table(skyline_proj, "SKYLINE")
-                st.subheader("Skyline Bounce Strategy")
-                st.dataframe(sky_analysis, use_container_width=True, hide_index=True)
+                if not skyline_proj.empty:
+                    st.subheader("Skyline SPX Projection (90% Zone)")
+                    st.info("Strategy: Bearish candle touches from above + closes above = BUY signal")
+                    st.dataframe(skyline_proj, use_container_width=True, hide_index=True)
+                    
+                    sky_analysis = calculate_entry_exit_table(skyline_proj, "SKYLINE")
+                    if not sky_analysis.empty:
+                        st.subheader("Skyline Bounce Strategy")
+                        st.dataframe(sky_analysis, use_container_width=True, hide_index=True)
             else:
                 st.warning("No skyline anchor detected")
         
@@ -1041,22 +1100,24 @@ with tab1:
                     st.session_state.spx_slopes['baseline'], proj_day
                 )
                 
-                st.subheader("Baseline SPX Projection (80% Zone)")
-                st.dataframe(baseline_proj, use_container_width=True, hide_index=True)
-                
-                base_analysis = calculate_entry_exit_table(baseline_proj, "BASELINE")
-                st.subheader("Baseline Bounce Strategy")
-                st.dataframe(base_analysis, use_container_width=True, hide_index=True)
+                if not baseline_proj.empty:
+                    st.subheader("Baseline SPX Projection (90% Zone)")
+                    st.info("Strategy: Bearish candle touches from above + closes above = BUY signal")
+                    st.dataframe(baseline_proj, use_container_width=True, hide_index=True)
+                    
+                    base_analysis = calculate_entry_exit_table(baseline_proj, "BASELINE")
+                    if not base_analysis.empty:
+                        st.subheader("Baseline Bounce Strategy")
+                        st.dataframe(base_analysis, use_container_width=True, hide_index=True)
             else:
                 st.warning("No baseline anchor detected")
     
     else:
-        st.info("Select a date to automatically load SPX anchor analysis")
+        st.info("Configure your dates and click 'Generate SPX Anchors' to begin analysis")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # END OF SPX ANCHORS TAB
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
