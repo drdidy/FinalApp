@@ -399,27 +399,26 @@ st.session_state.theme = theme
 
 st.sidebar.markdown("---")
 
-# SPX slope controls
-st.sidebar.markdown("### SPX Slopes (per 30-min)")
-st.sidebar.caption("Adjust projection slopes for each anchor type")
+# SPX slope controls with colorful headers
+st.sidebar.markdown("### 📈 SPX Slopes (per 30-min)")
+st.sidebar.caption("🎯 Adjust projection slopes for each anchor type")
 
-# Collapsible SPX controls
-with st.sidebar.expander("SPX Slope Settings", expanded=False):
-    for slope_name, default_value in SPX_SLOPES.items():
-        icon_map = {
-            'high': 'High', 'close': 'Close', 'low': 'Low', 
-            'skyline': 'Skyline', 'baseline': 'Baseline'
-        }
-        
-        display_name = icon_map.get(slope_name, slope_name.title())
-        
-        slope_value = st.number_input(
-            display_name,
-            value=st.session_state.spx_slopes[slope_name],
-            step=0.0001, format="%.4f",
-            key=f"sb_spx_{slope_name}"
-        )
-        st.session_state.spx_slopes[slope_name] = slope_value
+for slope_name, default_value in SPX_SLOPES.items():
+    icon_map = {
+        'high': '🔴', 'close': '🟡', 'low': '🟢', 
+        'skyline': '🔥', 'baseline': '🏔️'
+    }
+    
+    icon = icon_map.get(slope_name, '📊')
+    display_name = slope_name.title()
+    
+    slope_value = st.sidebar.number_input(
+        f"{icon} {display_name}",
+        value=st.session_state.spx_slopes[slope_name],
+        step=0.0001, format="%.4f",
+        key=f"sb_spx_{slope_name}"
+    )
+    st.session_state.spx_slopes[slope_name] = slope_value
 
 st.sidebar.markdown("---")
 
