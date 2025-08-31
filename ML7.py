@@ -24,7 +24,7 @@ RTH_START = "08:30"  # CT
 RTH_END   = "14:30"  # CT
 
 # Slope magnitude per 30-min block (ascending +, descending −)
-SLOPE_PER_BLOCK = 0.267
+SLOPE_PER_BLOCK = 0.24
 
 SPX_ANCHOR_START = "17:00"  # kept for completeness
 SPX_ANCHOR_END   = "19:30"
@@ -387,7 +387,7 @@ tab1, tab2, tab3, tab4 = st.tabs(["SPX Anchors", "Stock Anchors", "Signals & EMA
 # ╚═════════════════════════════════════════════════════════════════════════════╝
 with tab1:
     st.subheader("SPX Close-Anchor Fan Strategy (Globex-aware)")
-    st.caption("Fan from previous day Close: Top=+0.267/30m, Bottom=−0.267/30m (blocks skip 16:00–17:00 and weekend).")
+    st.caption("Fan from previous day Close: Top=+0.24/30m, Bottom=−0.24/30m (blocks skip 16:00–17:00 and weekend).")
 
     left, right = st.columns(2)
     with left:
