@@ -1,6 +1,6 @@
 # app.py
 # ═══════════════════════════════════════════════════════════════════════════════
-# 🔮 SPX PROPHET — Unified App (Fan logic + weekend/maintenance fix + touch rules)
+# 🔮 SPX PROPHET — Unified App (fan + weekend/maintenance fix + mean reversion)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import streamlit as st
@@ -98,7 +98,7 @@ def _is_globex_open(dt_ct: datetime) -> bool:
 
 def _ceil_to_next_30m(dt_ct: datetime) -> datetime:
     dt_ct = dt_ct.astimezone(CT_TZ)
-    if dt_ct.minute == 0 and dt_ct.second == 0 and dt_ct.microsecond == 0:
+    if dt_ct.minute in (0,30) and dt_ct.second == 0 and dt_ct.microsecond == 0:
         return dt_ct
     if dt_ct.minute < 30:
         return dt_ct.replace(minute=30, second=0, microsecond=0)
@@ -220,7 +220,7 @@ def project_close_fan(close_price: float, close_time: datetime, target_date: dat
     return df
 
 # ───────────────────────────────────────────────────────────────────────────────
-# STRATEGY (Bias + fan entries/targets)
+# STRATEGY (Bias + fan entries/targets + mean reversion when outside fan)
 # ───────────────────────────────────────────────────────────────────────────────
 def df_to_time_price_lookup(df: pd.DataFrame, price_col: str) -> Dict[str,float]:
     if df is None or df.empty: return {}
@@ -231,6 +231,15 @@ def build_strategy_from_fan(
     high_up_df: Optional[pd.DataFrame], low_dn_df: Optional[pd.DataFrame],
     anchor_close_price: float
 ) -> pd.DataFrame:
+    """
+    Within fan:
+      - Bias UP → BUY Bottom → TP at Top
+      - Bias DOWN → SELL Top → TP at Bottom
+
+    Outside fan (mean reversion rule you specified):
+      - ABOVE fan → use High(+0.377) as MR trigger; SELL from High(+0.377) → TP1=Top (mean), TP2=Top−width
+      - BELOW fan → use Low(−0.377) as MR trigger; BUY  from Low(−0.377) → TP1=Bottom (mean), TP2=Bottom+width
+    """
     if rth_prices.empty or fan_df.empty: return pd.DataFrame()
 
     price_lookup = {format_ct_time(ix): rth_prices.loc[ix,'Close'] for ix in rth_prices.index}
@@ -255,33 +264,40 @@ def build_strategy_from_fan(
         above  = p > top
         below  = p < bot
 
-        direction=""; entry=np.nan; tp1=np.nan; tp2=np.nan; note=""
+        direction=""; entry=np.nan; tp1=np.nan; tp2=np.nan; mr_trigger=np.nan; note=""
 
         if within:
             if bias=="UP":
                 direction="BUY"; entry=bot; tp1=top; tp2=top
-                note="Within fan; bias UP → buy bottom → exit top"
+                note="Within fan; bias UP → buy bottom edge; mean=top edge."
             else:
                 direction="SELL"; entry=top; tp1=bot; tp2=bot
-                note="Within fan; bias DOWN → sell top → exit bottom"
+                note="Within fan; bias DOWN → sell top edge; mean=bottom edge."
 
         elif above:
-            direction="SELL"; entry=top
-            tp2 = max(bot, entry - width)  # drop fan width
-            tp1 = high_up.get(t, np.nan)   # prev day high ascending
-            note="Above fan; entry=Top; TP2=Top-width; TP1=High ascending"
+            # Mean reversion from High(+0.377) down to Top (mean)
+            mr_trigger = high_up.get(t, np.nan)
+            direction  = "SELL"
+            entry      = mr_trigger if pd.notna(mr_trigger) else top
+            tp1        = top                                 # mean
+            tp2        = top - width                         # extension beyond mean
+            note = "Above fan: MR from High(+0.377) → SELL to Top (mean), TP2=Top−width."
 
         elif below:
-            direction="SELL"; entry=bot
-            tp2 = entry - width            # drop fan width
-            tp1 = low_dn.get(t, np.nan)    # prev day low descending
-            note="Below fan; entry=Bottom; TP2=Bottom-width; TP1=Low descending"
+            # Mean reversion from Low(−0.377) up to Bottom (mean)
+            mr_trigger = low_dn.get(t, np.nan)
+            direction  = "BUY"
+            entry      = mr_trigger if pd.notna(mr_trigger) else bot
+            tp1        = bot                                 # mean
+            tp2        = bot + width                         # extension beyond mean
+            note = "Below fan: MR from Low(−0.377) → BUY to Bottom (mean), TP2=Bottom+width."
 
         rows.append({
             'Time': t, 'Price': round(p,2), 'Bias': bias, 'EntrySide': direction,
+            'MR_Trigger': round(mr_trigger,2) if pd.notna(mr_trigger) else "",
             'Entry': round(entry,2) if pd.notna(entry) else np.nan,
-            'TP1': round(tp1,2) if pd.notna(tp1) else np.nan,
-            'TP2': round(tp2,2) if pd.notna(tp2) else np.nan,
+            'TP1_Mean': round(tp1,2) if pd.notna(tp1) else np.nan,
+            'TP2_Ext': round(tp2,2) if pd.notna(tp2) else np.nan,
             'Top': round(top,2), 'Bottom': round(bot,2),
             'Fan_Width': round(width,2), 'Note': note
         })
@@ -302,7 +318,6 @@ def evaluate_fan_touch_signals(rth_prices: pd.DataFrame, fan_df: pd.DataFrame) -
     if rth_prices.empty or fan_df.empty:
         return pd.DataFrame()
 
-    # lookups
     top_lu = df_to_time_price_lookup(fan_df, 'Top')
     bot_lu = df_to_time_price_lookup(fan_df, 'Bottom')
 
@@ -423,7 +438,7 @@ tab1, tab2, tab3, tab4 = st.tabs(["SPX Anchors", "Stock Anchors", "Signals & EMA
 # ║ TAB 1: SPX ANCHORS                                                          ║
 # ╚═════════════════════════════════════════════════════════════════════════════╝
 with tab1:
-    st.subheader("SPX Close-Anchor Fan Strategy (+ touch signals)")
+    st.subheader("SPX Close-Anchor Fan + Mean Reversion (High+/Low− outside-fan)")
     left, right = st.columns(2)
     with left:
         prev_day = st.date_input("Previous Trading Day", value=(now.date()-timedelta(days=1)), key="spx_prev_day")
@@ -459,11 +474,11 @@ with tab1:
                     low_price,   low_time   = dprev['low']
 
                     # Fan and anchor lines (weekend/maintenance aware)
-                    fan_df = project_close_fan(close_price, close_time, proj_day)
+                    fan_df  = project_close_fan(close_price, close_time, proj_day)
                     high_up = project_line(high_price, high_time, +SLOPE_PER_BLOCK, proj_day, 'High_Asc')
                     low_dn  = project_line(low_price,  low_time,  -SLOPE_PER_BLOCK, proj_day, 'Low_Desc')
 
-                    # Strategy table
+                    # Strategy table (with outside-fan MR rule)
                     strat_df = build_strategy_from_fan(rth, fan_df, high_up, low_dn, anchor_close_price=close_price)
 
                     # Touch signals based on your rules
@@ -485,7 +500,7 @@ with tab1:
                         with lt4:
                             st.dataframe(low_dn, use_container_width=True, hide_index=True)
 
-                    st.markdown("### Strategy Table")
+                    st.markdown("### Strategy Table (Bias, Entries, Mean Reversion Targets)")
                     if not strat_df.empty:
                         st.dataframe(strat_df, use_container_width=True, hide_index=True)
                     else:
