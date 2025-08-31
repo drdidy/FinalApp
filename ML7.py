@@ -1,7 +1,6 @@
 # app.py
 # ═══════════════════════════════════════════════════════════════════════════════
-# 🔮 SPX PROPHET — FULL APP (All 6 Parts, Unified)
-# Close-fan anchored strategy with Globex-aware blocks and slope = 0.267
+# 🔮 SPX PROPHET — FULL APP (slope = 0.24, Globex-aware, sidebar dates, enterprise UI)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import streamlit as st
@@ -26,9 +25,6 @@ RTH_END   = "14:30"  # CT
 # Slope magnitude per 30-min block (ascending +, descending −)
 SLOPE_PER_BLOCK = 0.24
 
-SPX_ANCHOR_START = "17:00"  # kept for completeness
-SPX_ANCHOR_END   = "19:30"
-
 STOCK_SLOPES_DEFAULT = {
     "TSLA": 0.0285, "NVDA": 0.086, "AAPL": 0.0155,
     "MSFT": 0.0541, "AMZN": 0.0139, "GOOGL": 0.0122,
@@ -45,20 +41,43 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Light mode minimalist styling
+# ✨ Enterprise light-mode styling
 st.markdown("""
 <style>
-:root { --card-bg: #ffffff; --muted:#6b7280; }
-.main block-container { padding-top: 1rem; }
-.metric-container {
-  background: var(--card-bg);
-  border: 1px solid #eef2f7;
-  border-radius: 14px;
-  padding: 1rem 1.2rem;
-  box-shadow: 0 2px 8px rgba(15,23,42,0.06);
+:root {
+  --bg: #f6f8fb;
+  --card: #ffffff;
+  --muted: #6b7280;
+  --primary: #2563eb;
+  --success: #16a34a;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --grad: linear-gradient(135deg,#60a5fa,#34d399);
 }
-.dataframe { border-radius: 10px; overflow: hidden; }
-hr { border: none; height: 1px; background: #e5e7eb; margin: 1.2rem 0; }
+html, body, [data-testid="stAppViewContainer"] { background: var(--bg); }
+.block-container { padding-top: 1rem !important; }
+.card {
+  background: var(--card);
+  border: 1px solid #eef2f7;
+  border-radius: 16px;
+  padding: 18px 20px;
+  box-shadow: 0 4px 18px rgba(20,40,80,0.08);
+}
+.stat { display:flex; align-items:center; gap:14px; }
+.stat .icon {
+  width:58px; height:58px; border-radius:14px; display:flex; align-items:center; justify-content:center;
+  font-size:28px; background: #f1f5f9; border:1px solid #e2e8f0;
+}
+.stat .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em;}
+.stat .value { font-weight: 700; font-size: 22px; }
+.kpi-grid { display:grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+hr { border:none; height:1px; background:#e5e7eb; margin: 16px 0; }
+.df { border-radius: 12px; overflow:hidden; }
+.section-title {
+  font-weight: 700; font-size: 18px; margin: 0 0 8px 0;
+  background: var(--grad); -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.sidebar-group { padding: 8px 12px; border-radius: 12px; background: #f1f5f9; border: 1px solid #e5e7eb; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -84,15 +103,12 @@ def is_globex_open(dt_ct: datetime) -> bool:
     if time(16,0) <= t < time(17,0):
         return False
 
-    # Weekend close: Fri 16:00 → Sun 17:00
-    # If it's Saturday: closed all day
-    if wd == 5:
+    # Weekend close
+    if wd == 5:  # Saturday
         return False
-    # If it's Friday and after/equal 16:00 → closed
-    if wd == 4 and t >= time(16,0):
+    if wd == 4 and t >= time(16,0):  # Fri after 16:00
         return False
-    # If it's Sunday and before 17:00 → closed
-    if wd == 6 and t < time(17,0):
+    if wd == 6 and t < time(17,0):   # Sun before 17:00
         return False
 
     return True
@@ -106,12 +122,10 @@ def active_30m_blocks_between(start_ct: datetime, end_ct: datetime) -> int:
     blocks = 0
     step = timedelta(minutes=30)
     while cur < end_ct:
-        nxt = cur + step
-        # Count this block if midpoint is within open session
         mid = cur + timedelta(minutes=15)
         if is_globex_open(mid):
             blocks += 1
-        cur = nxt
+        cur += step
     return blocks
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -128,8 +142,7 @@ def rth_slots_ct(target_date: date) -> List[datetime]:
     return slots
 
 def format_ct_time(dt: datetime) -> str:
-    dt = as_ct(dt)
-    return dt.strftime("%H:%M")
+    return as_ct(dt).strftime("%H:%M")
 
 def get_session_window(df: pd.DataFrame, start_time: str, end_time: str) -> pd.DataFrame:
     if df.empty: return df
@@ -160,7 +173,6 @@ def fetch_live_data(symbol: str, start_date: date, end_date: date) -> pd.DataFra
         if any(c not in df.columns for c in req):
             return pd.DataFrame()
         if df.index.tz is None:
-            # Yahoo returns US/Eastern; localize if naive
             df.index = df.index.tz_localize('US/Eastern')
         df.index = df.index.tz_convert(CT_TZ)
         sdt = CT_TZ.localize(datetime.combine(start_date, time(0,0)))
@@ -169,7 +181,6 @@ def fetch_live_data(symbol: str, start_date: date, end_date: date) -> pd.DataFra
 
     try:
         t = yf.Ticker(symbol)
-        # Try start/end with buffer
         df = t.history(
             start=(start_date - timedelta(days=5)).strftime('%Y-%m-%d'),
             end=(end_date + timedelta(days=2)).strftime('%Y-%m-%d'),
@@ -178,7 +189,6 @@ def fetch_live_data(symbol: str, start_date: date, end_date: date) -> pd.DataFra
         )
         df = _normalize(df)
 
-        # Fallback: period-based
         if df.empty:
             days = max(7, (end_date - start_date).days + 7)
             df2 = t.history(
@@ -223,7 +233,7 @@ def calculate_vwap(df: pd.DataFrame) -> pd.Series:
     return vwap
 
 # ───────────────────────────────────────────────────────────────────────────────
-# PROJECTIONS (Core to your logic) — Globex-aware blocks
+# PROJECTIONS (Globex-aware)
 # ───────────────────────────────────────────────────────────────────────────────
 def project_line_globex(anchor_price: float, anchor_time: datetime, slope_per_block: float,
                         target_date: date, col_name: str) -> pd.DataFrame:
@@ -237,7 +247,6 @@ def project_line_globex(anchor_price: float, anchor_time: datetime, slope_per_bl
     return pd.DataFrame(rows)
 
 def project_close_fan(close_price: float, close_time: datetime, target_date: date) -> pd.DataFrame:
-    """Top = +SLOPE_PER_BLOCK from Close; Bottom = −SLOPE_PER_BLOCK from Close, Globex-aware."""
     top = project_line_globex(close_price, close_time, +SLOPE_PER_BLOCK, target_date, 'Top')
     bot = project_line_globex(close_price, close_time, -SLOPE_PER_BLOCK, target_date, 'Bottom')
     df = pd.merge(top[['Time','Top','Blocks']], bot[['Time','Bottom']], on='Time', how='inner')
@@ -274,10 +283,11 @@ def build_strategy_from_fan(
         top  = top_lookup.get(t, np.nan)
         bot  = bot_lookup.get(t, np.nan)
         width= top - bot if pd.notna(top) and pd.notna(bot) else np.nan
-        # Bias from close fan (as requested)
-        bias = "UP" if p >= bot and p >= anchor_close_price else ("DOWN" if p <= top and p < anchor_close_price else "RANGE")
 
-        # Simplified entries per your rules
+        # Bias from close fan
+        bias = "UP" if p > top else ("DOWN" if p < bot else "RANGE")
+
+        # Entries per your rules
         direction=""; entry=np.nan; tp1=np.nan; tp2=np.nan; note=""
         within_fan = (pd.notna(top) and pd.notna(bot) and bot <= p <= top)
         above_fan  = (pd.notna(top) and p > top)
@@ -318,7 +328,6 @@ def build_strategy_from_fan(
         })
     return pd.DataFrame(rows)
 
-# Extra analytics used in Signals & Contract Tool (unchanged)
 def calculate_average_true_range(data: pd.DataFrame, periods: int = 14) -> pd.Series:
     if data.empty or len(data) < periods: return pd.Series(index=data.index, dtype=float)
     hl = data['High']-data['Low']
@@ -341,38 +350,66 @@ if 'stock_slopes' not in st.session_state:
     st.session_state.stock_slopes = STOCK_SLOPES_DEFAULT.copy()
 
 # ───────────────────────────────────────────────────────────────────────────────
-# HEADER
+# SIDEBAR — Dates & Quick Settings
 # ───────────────────────────────────────────────────────────────────────────────
-st.markdown("## 🔮 SPX Prophet Analytics")
-c1,c2,c3 = st.columns(3)
-with c1:
-    now = datetime.now(CT_TZ)
+now = datetime.now(CT_TZ)
+
+st.sidebar.markdown("### ⚙️ Settings")
+with st.sidebar.container():
+    st.markdown('<div class="sidebar-group">', unsafe_allow_html=True)
+    prev_day = st.date_input("📅 SPX Previous Trading Day", value=(now.date()-timedelta(days=1)), key="spx_prev_day")
+    proj_day = st.date_input("📆 SPX Projection Day", value=(prev_day + timedelta(days=1)), key="spx_proj_day")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🎯 Stocks (Mon/Tue)")
+with st.sidebar.container():
+    st.markdown('<div class="sidebar-group">', unsafe_allow_html=True)
+    default_tickers = "TSLA,NVDA,AAPL,MSFT,AMZN,GOOGL,META,NFLX"
+    st.text_input("Core tickers (comma-sep)", value=default_tickers, key="core_tickers")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# HEADER KPIs (big icons)
+# ───────────────────────────────────────────────────────────────────────────────
+k1, k2, k3 = st.columns(3)
+with k1:
     st.markdown(f"""
-    <div class="metric-container">
-        <div style="font-size:0.9rem;color:var(--muted)">Current Time (CT)</div>
-        <div style="font-size:1.6rem;font-weight:700">{now.strftime("%H:%M:%S")}</div>
+    <div class="card stat">
+      <div class="icon">⏰</div>
+      <div>
+        <div class="label">Current Time (CT)</div>
+        <div class="value">{now.strftime("%H:%M:%S")}</div>
         <div style="color:var(--muted)">{now.strftime("%A, %B %d")}</div>
+      </div>
     </div>""", unsafe_allow_html=True)
 
-with c2:
+with k2:
     wkday = now.weekday()<5
     mo = now.replace(hour=8,minute=30,second=0,microsecond=0)
     mc = now.replace(hour=14,minute=30,second=0,microsecond=0)
     is_rth = wkday and (mo <= now <= mc)
     status_text  = "MARKET OPEN" if is_rth else ("MARKET CLOSED" if wkday else "WEEKEND")
+    badge = "🟢" if is_rth else ("🟠" if wkday else "🔴")
     st.markdown(f"""
-    <div class="metric-container">
-        <div style="font-size:0.9rem;color:var(--muted)">Market Status</div>
-        <div style="font-size:1.6rem;font-weight:700">{status_text}</div>
+    <div class="card stat">
+      <div class="icon">📊</div>
+      <div>
+        <div class="label">Market Status</div>
+        <div class="value">{badge} {status_text}</div>
         <div style="color:var(--muted)">RTH 08:30–14:30 CT (Mon–Fri)</div>
+      </div>
     </div>""", unsafe_allow_html=True)
 
-with c3:
+with k3:
     st.markdown(f"""
-    <div class="metric-container">
-        <div style="font-size:0.9rem;color:var(--muted)">Slope per 30 min</div>
-        <div style="font-size:1.6rem;font-weight:700">{SLOPE_PER_BLOCK:+.3f}</div>
+    <div class="card stat">
+      <div class="icon">📐</div>
+      <div>
+        <div class="label">Slope per 30 min</div>
+        <div class="value">{SLOPE_PER_BLOCK:+.3f}</div>
         <div style="color:var(--muted)">Globex-aware blocks</div>
+      </div>
     </div>""", unsafe_allow_html=True)
 
 st.markdown("<hr/>", unsafe_allow_html=True)
@@ -386,21 +423,11 @@ tab1, tab2, tab3, tab4 = st.tabs(["SPX Anchors", "Stock Anchors", "Signals & EMA
 # ║ TAB 1: SPX ANCHORS — Close Anchor Fan (Core Strategy)                      ║
 # ╚═════════════════════════════════════════════════════════════════════════════╝
 with tab1:
-    st.subheader("SPX Close-Anchor Fan Strategy (Globex-aware)")
-    st.caption("Fan from previous day Close: Top=+0.24/30m, Bottom=−0.24/30m (blocks skip 16:00–17:00 and weekend).")
-
-    left, right = st.columns(2)
-    with left:
-        prev_day = st.date_input("Previous Trading Day", value=(now.date()-timedelta(days=1)), key="spx_prev_day")
-        st.caption(prev_day.strftime("%A"))
-
-    with right:
-        proj_day = st.date_input("Projection Day", value=(prev_day + timedelta(days=1)), key="spx_proj_day")
-        st.caption(f"Projecting for: {proj_day.strftime('%A')}")
+    st.markdown('<div class="section-title">SPX Close-Anchor Fan (Globex-aware)</div>', unsafe_allow_html=True)
+    st.caption("Fan from previous day Close: Top=+0.24/30m, Bottom=−0.24/30m. (Blocks skip 16:00–17:00 & weekend).")
 
     if st.button("Generate SPX Fan & Strategy", type="primary", key="spx_generate_fan"):
         with st.spinner("Fetching market data & building fan..."):
-            # Fetch SPX prev & proj (fallback to SPY if ^GSPC empty)
             spx_prev = fetch_live_data("^GSPC", prev_day, prev_day)
             if spx_prev.empty:
                 spx_prev = fetch_live_data("SPY", prev_day, prev_day)
@@ -423,46 +450,40 @@ with tab1:
                     high_price,  high_time  = dprev['high']
                     low_price,   low_time   = dprev['low']
 
-                    # Fan from previous day Close (Globex-aware)
-                    fan_df = project_close_fan(close_price, close_time, proj_day)
-                    # Previous-day High ascending (for TP1 when above fan)
+                    fan_df  = project_close_fan(close_price, close_time, proj_day)
                     high_up = project_line_globex(high_price, high_time, +SLOPE_PER_BLOCK, proj_day, 'High_Asc')
-                    # Previous-day Low descending (for TP1 when below fan)
                     low_dn  = project_line_globex(low_price,  low_time,  -SLOPE_PER_BLOCK, proj_day, 'Low_Desc')
 
-                    # Strategy table (SPX-only display)
                     strat_df = build_strategy_from_fan(
                         spx_proj_rth, fan_df, high_up, low_dn, anchor_close_price=close_price
                     )
 
-                    st.markdown("#### Fan Lines")
-                    st.dataframe(fan_df, use_container_width=True, hide_index=True)
-
-                    st.markdown("#### Strategy Table")
-                    if not strat_df.empty:
-                        st.dataframe(strat_df, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("No strategy rows were generated (possible time alignment gap).")
+                    c1, c2 = st.columns([1,1])
+                    with c1:
+                        st.markdown("#### 🧭 Fan Lines")
+                        st.dataframe(fan_df, use_container_width=True, hide_index=True)
+                    with c2:
+                        st.markdown("#### 🎯 Strategy Table")
+                        if not strat_df.empty:
+                            st.dataframe(strat_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No strategy rows were generated (possible time alignment gap).")
 
 # ╔═════════════════════════════════════════════════════════════════════════════╗
-# ║ TAB 2: STOCK ANCHORS (Mon/Tue) — simplified sample                         ║
+# ║ TAB 2: STOCK ANCHORS (Mon/Tue)                                             ║
 # ╚═════════════════════════════════════════════════════════════════════════════╝
 with tab2:
-    st.subheader("Stock Anchor Analysis")
-    st.caption("Mon/Tue combined session analysis for individual stocks (30-min).")
-
-    core = ['TSLA','NVDA','AAPL','MSFT','AMZN','GOOGL','META','NFLX']
-    tcols = st.columns(4)
+    st.markdown('<div class="section-title">Stock Anchor Analysis</div>', unsafe_allow_html=True)
+    core_list = [s.strip().upper() for s in st.session_state.get("core_tickers","").split(",") if s.strip()]
+    cols = st.columns(4)
     selected_ticker = None
-    for i,tkr in enumerate(core):
-        if tcols[i%4].button(tkr, key=f"stkbtn_{tkr}"):
+    for i,tkr in enumerate(core_list[:12]):
+        if cols[i%4].button(f"📈 {tkr}", key=f"stkbtn_{tkr}"):
             selected_ticker = tkr
             st.session_state['selected_stock'] = tkr
-
-    custom = st.text_input("Custom Symbol", placeholder="Enter any ticker symbol", key="stk_custom_input")
+    custom = st.text_input("Or type a custom symbol", placeholder="e.g. AMD", key="stk_custom_input")
     if custom:
-        selected_ticker = custom.upper()
-        st.session_state['selected_stock'] = selected_ticker
+        selected_ticker = custom.upper(); st.session_state['selected_stock']=selected_ticker
     if not selected_ticker and 'selected_stock' in st.session_state:
         selected_ticker = st.session_state['selected_stock']
 
@@ -493,14 +514,14 @@ with tab2:
                     st.session_state['stock_analysis_ready'] = True
 
         if st.session_state.get('stock_analysis_ready', False) and st.session_state.get('stock_analysis_ticker')==selected_ticker:
-            st.subheader(f"{selected_ticker} Mon/Tue Combined (sample view)")
+            st.markdown("#### 📊 Mon/Tue Combined (sample view)")
             st.dataframe(st.session_state['stock_analysis_data'].tail(24), use_container_width=True, hide_index=True)
 
 # ╔═════════════════════════════════════════════════════════════════════════════╗
-# ║ TAB 3: SIGNALS & EMA — unchanged mechanics                                 ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+# ║ TAB 3: SIGNALS & EMA                                                       ║
+# ╚═════════════════════════════════════════════════════════════════════════════╝
 with tab3:
-    st.subheader("Signal Detection & Market Analysis (EMA 8/21, RTH)")
+    st.markdown('<div class="section-title">Signals & EMA (RTH)</div>', unsafe_allow_html=True)
     sc1, sc2 = st.columns(2)
     with sc1:
         symbol = st.selectbox("Analysis Symbol", ["^GSPC","ES=F","SPY"], index=0)
@@ -537,10 +558,10 @@ with tab3:
                 st.metric("Current ATR", f"{(atr.iloc[-1] if not atr.empty else 0):.2f}")
 
 # ╔═════════════════════════════════════════════════════════════════════════════╗
-# ║ TAB 4: CONTRACT TOOL — simplified view                                      ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+# ║ TAB 4: CONTRACT TOOL                                                       ║
+# ╚═════════════════════════════════════════════════════════════════════════════╝
 with tab4:
-    st.subheader("Contract Tool (Overnight points → RTH projection)")
+    st.markdown('<div class="section-title">Contract Tool (Overnight → RTH)</div>', unsafe_allow_html=True)
     pc1, pc2 = st.columns(2)
     with pc1:
         p1_date = st.date_input("Point 1 Date", value=(now.date()-timedelta(days=1)))
@@ -573,16 +594,15 @@ with tab4:
             st.dataframe(proj_df, use_container_width=True, hide_index=True)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# FOOTER QUICK TEST
+# FOOTER: Connectivity check
 # ───────────────────────────────────────────────────────────────────────────────
 st.markdown("<hr/>", unsafe_allow_html=True)
-if st.button("Test Data Connection", key="test_connection"):
+if st.button("🔌 Test Data Connection", key="test_connection"):
     with st.spinner("Testing market data connection..."):
         test_data = fetch_live_data("^GSPC", now.date()-timedelta(days=3), now.date())
         if test_data.empty:
-            # SPY fallback for connectivity test
             test_data = fetch_live_data("SPY", now.date()-timedelta(days=3), now.date())
         if not test_data.empty:
             st.success(f"Connection OK — received {len(test_data)} bars")
         else:
-            st.error("Market data connection failed (empty response). Try again later or adjust dates.")
+            st.error("Market data connection failed (empty response).")
