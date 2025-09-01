@@ -1,9 +1,9 @@
 # app.py
 # ═══════════════════════════════════════════════════════════════════════════════
-# 🔮 SPX PROPHET — FULL APP (SPX Fan, Stock Anchors, Signals & EMA, Contract Tool)
-# Slope fixed at ±0.277 per 30-minute block; 3:00 PM CT close as SPX anchor
+# 🔮 SPX PROPHET — FULL APP (Manual Close Option)
+# Slope fixed at ±0.277 per 30-minute block; 3:00 PM CT close as anchor
 # Skips maintenance hour (4–5 PM CT) and Fri 5 PM → Sun 5 PM weekend gap
-# Shows SPX tables only (SPY fallback for continuity when ^GSPC sparse)
+# You can manually input the previous day's 3:00 PM CT close (no Yahoo dependency)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import streamlit as st
@@ -18,11 +18,11 @@ from typing import Dict, List, Optional, Tuple
 # CORE CONFIG
 # ───────────────────────────────────────────────────────────────────────────────
 CT_TZ = pytz.timezone("America/Chicago")
-SLOPE_PER_BLOCK = 0.277  # per 30-minute block (Top +, Bottom −) — per your latest
+SLOPE_PER_BLOCK = 0.277  # per 30-minute block (Top +, Bottom −)
 RTH_START = "08:30"
 RTH_END = "14:30"
 
-# Stock per-ticker slopes (magnitude) — as provided earlier
+# Stock per-ticker slopes (magnitude) — your values
 STOCK_SLOPES = {
     "TSLA": 0.0285, "NVDA": 0.086, "AAPL": 0.0155,
     "MSFT": 0.0541, "AMZN": 0.0139, "GOOGL": 0.0122,
@@ -57,12 +57,11 @@ html, body, [class*="css"]  { background: var(--muted); color: var(--text); }
   box-shadow: 0 10px 24px rgba(2,6,23,0.06);
 }
 .metric-title { font-size: 0.9rem; color: var(--subtext); margin: 0; }
-.metric-value { font-size: 1.8rem; font-weight: 700; margin-top: 6px; display: flex; gap: 10px; align-items:center; }
+.metric-value { font-size: 1.8rem; font-weight: 700; margin-top: 6px; display:flex; gap:10px; align-items:center; }
 .kicker { font-size: 0.8rem; color: var(--subtext); }
 
 .badge {
-  padding: 2px 10px; border-radius: 999px; font-size: 0.8rem; font-weight: 700;
-  border: 1px solid;
+  padding: 2px 10px; border-radius: 999px; font-size: 0.8rem; font-weight: 700; border: 1px solid;
 }
 .badge-open  { color:#065f46; background:#d1fae5; border-color:#99f6e4; }
 .badge-closed{ color:#7c2d12; background:#ffedd5; border-color:#fed7aa; }
@@ -158,6 +157,7 @@ def fetch_intraday(symbol: str, start_d: date, end_d: date) -> pd.DataFrame:
         return pd.DataFrame()
 
 def get_prev_day_3pm_close(spx_prev: pd.DataFrame, prev_day: date) -> Optional[float]:
+    """Kept for fallback when you are not in manual mode."""
     if spx_prev.empty: return None
     day_start = fmt_ct(datetime.combine(prev_day, time(0, 0)))
     day_end = fmt_ct(datetime.combine(prev_day, time(23, 59)))
@@ -181,7 +181,7 @@ def project_fan_from_close(close_price: float, anchor_time: datetime, target_day
     return pd.DataFrame(rows)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# STRATEGY TABLE (SPX — your simplified rules)
+# STRATEGY TABLE (SPX — simplified rules)
 # ───────────────────────────────────────────────────────────────────────────────
 def build_strategy_table(rth_prices: pd.DataFrame, fan_df: pd.DataFrame, anchor_close: float) -> pd.DataFrame:
     if rth_prices.empty or fan_df.empty: return pd.DataFrame()
@@ -283,15 +283,20 @@ def confirmation_from_ema(rth_prices: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# SIDEBAR (global)
+# SIDEBAR (global controls)
 # ───────────────────────────────────────────────────────────────────────────────
 st.sidebar.title("🧭 Navigation & Controls")
 today_ct = datetime.now(CT_TZ).date()
 
-# Shared SPX dates
+# SPX dates + manual anchor
 prev_day = st.sidebar.date_input("SPX • Previous Trading Day", value=today_ct - timedelta(days=1), key="spx_prev")
 proj_day = st.sidebar.date_input("SPX • Projection Day", value=prev_day + timedelta(days=1), key="spx_proj")
-st.sidebar.caption("SPX fan anchored at **3:00 PM CT** close of the previous trading day.")
+st.sidebar.caption("SPX fan anchored at **3:00 PM CT** of the previous trading day.")
+
+use_manual_close = st.sidebar.checkbox("Use manual 3:00 PM CT close", value=False)
+manual_close_val = None
+if use_manual_close:
+    manual_close_val = st.sidebar.number_input("Enter manual close (3:00 PM CT)", value=6400.00, step=0.10, format="%.2f")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Stocks (Mon/Tue)")
@@ -317,9 +322,9 @@ ct_proj  = st.sidebar.date_input("RTH Projection Day", value=p2_date, key="ct_pr
 
 st.sidebar.markdown("---")
 btn_spx     = st.sidebar.button("🔮 Generate SPX Fan & Strategy", type="primary")
-btn_stocks  = st.sidebar.button("🏢 Analyze Stock Anchors", type="secondary")
-btn_signals = st.sidebar.button("📡 Analyze Signals & EMA", type="secondary")
-btn_ct      = st.sidebar.button("📈 Analyze Contract Projection", type="secondary")
+btn_stocks  = st.sidebar.button("🏢 Analyze Stock Anchors")
+btn_signals = st.sidebar.button("📡 Analyze Signals & EMA")
+btn_ct      = st.sidebar.button("📈 Analyze Contract Projection")
 
 # ───────────────────────────────────────────────────────────────────────────────
 # HEADER METRICS
@@ -370,37 +375,42 @@ with tab1:
 
     if btn_spx:
         with st.spinner("Building SPX fan & strategy…"):
-            spx_prev = fetch_intraday("^GSPC", prev_day, prev_day)
-            if spx_prev.empty:
-                spx_prev = fetch_intraday("SPY", prev_day, prev_day)
+            # If manual close is used: we don't need prev-day fetch
+            anchor_close = None
+            anchor_time = fmt_ct(datetime.combine(prev_day, time(15, 0)))
+
+            if use_manual_close and manual_close_val is not None:
+                anchor_close = float(manual_close_val)
+            else:
+                # fallback to fetch previous day close if manual is OFF
+                spx_prev = fetch_intraday("^GSPC", prev_day, prev_day)
+                if spx_prev.empty:
+                    spx_prev = fetch_intraday("SPY", prev_day, prev_day)
+                anchor_close = get_prev_day_3pm_close(spx_prev, prev_day) if not spx_prev.empty else None
 
             spx_proj_df = fetch_intraday("^GSPC", proj_day, proj_day)
             if spx_proj_df.empty:
                 spx_proj_df = fetch_intraday("SPY", proj_day, proj_day)
 
-            if spx_prev.empty or spx_proj_df.empty:
-                st.error("❌ Market data connection failed for the selected dates.")
+            if anchor_close is None or spx_proj_df.empty:
+                st.error("❌ Missing anchor close or projection-day data.")
             else:
-                prev_3pm_close = get_prev_day_3pm_close(spx_prev, prev_day)
-                if prev_3pm_close is None:
-                    st.error("Could not find the previous day’s exact 3:00 PM CT close.")
+                fan_df = project_fan_from_close(anchor_close, anchor_time, proj_day)
+
+                rth_data = between_time(spx_proj_df, RTH_START, RTH_END)
+                strat_df = build_strategy_table(rth_data, fan_df, anchor_close) if not rth_data.empty else pd.DataFrame()
+
+                st.markdown(f"**Anchor (Prev Day 3:00 PM CT) Close:** {anchor_close:.2f}")
+                st.markdown("### 🎯 Fan Lines")
+                st.dataframe(fan_df, use_container_width=True, hide_index=True)
+
+                st.markdown("### 📋 Strategy Table")
+                if not strat_df.empty:
+                    st.dataframe(strat_df, use_container_width=True, hide_index=True)
                 else:
-                    anchor_time = fmt_ct(datetime.combine(prev_day, time(15, 0)))
-                    fan_df = project_fan_from_close(prev_3pm_close, anchor_time, proj_day)
-
-                    rth_data = between_time(spx_proj_df, RTH_START, RTH_END)
-                    strat_df = build_strategy_table(rth_data, fan_df, prev_3pm_close) if not rth_data.empty else pd.DataFrame()
-
-                    st.markdown("### 🎯 Fan Lines")
-                    st.dataframe(fan_df, use_container_width=True, hide_index=True)
-
-                    st.markdown("### 📋 Strategy Table")
-                    if not strat_df.empty:
-                        st.dataframe(strat_df, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("No RTH alignment for the projection day (check session times).")
+                    st.info("No RTH alignment for the projection day (check session times).")
     else:
-        st.info("Pick dates in the sidebar and click **Generate SPX Fan & Strategy**.")
+        st.info("Pick dates (and optionally a manual close) in the sidebar, then click **Generate SPX Fan & Strategy**.")
 
 # ╔═ TAB 2: STOCK ANCHORS ══════════════════════════════════════════════════════╗
 with tab2:
@@ -420,7 +430,6 @@ with tab2:
                     (hi_price, hi_time), (lo_price, lo_time) = anchors
                     slope_mag = STOCK_SLOPES.get(ticker, list(STOCK_SLOPES.values())[0])
 
-                    # Ascending from highest swing high; Descending from lowest swing low
                     hi_asc = project_line_from(hi_price, hi_time, +slope_mag, tue_date + timedelta(days=1), "High_Asc")
                     lo_desc= project_line_from(lo_price, lo_time, -slope_mag, tue_date + timedelta(days=1), "Low_Desc")
 
@@ -442,16 +451,20 @@ with tab3:
                 st.error("No intraday data for chosen symbol/day.")
             else:
                 rth = between_time(day_df, RTH_START, RTH_END)
-                # Build fan from **same day** 3:00 PM CT previous session? For signals, use prior day anchor:
-                prev_for_sig = fetch_intraday("^GSPC", (sig_day - timedelta(days=1)), (sig_day - timedelta(days=1))) if sig_symbol!="ES=F" else fetch_intraday("ES=F", (sig_day - timedelta(days=1)), (sig_day - timedelta(days=1)))
-                prev_close = get_prev_day_3pm_close(prev_for_sig, sig_day - timedelta(days=1))
+                # Prior day anchor for the analysis day
+                prior_day = sig_day - timedelta(days=1)
+                if use_manual_close and manual_close_val is not None and sig_symbol in ["^GSPC","SPY"]:
+                    prev_close = float(manual_close_val)  # allow reuse if you're syncing SPX logic
+                else:
+                    prev_for_sig = fetch_intraday(sig_symbol, prior_day, prior_day)
+                    prev_close = get_prev_day_3pm_close(prev_for_sig, prior_day) if not prev_for_sig.empty else None
+
                 if rth.empty or prev_close is None:
                     st.error("Missing RTH or previous-day 3:00 PM CT anchor for signals.")
                 else:
-                    anchor_time = fmt_ct(datetime.combine(sig_day - timedelta(days=1), time(15,0)))
+                    anchor_time = fmt_ct(datetime.combine(prior_day, time(15,0)))
                     fan_df = project_fan_from_close(prev_close, anchor_time, sig_day)
 
-                    # Touches then EMA confirmation
                     touches = detect_touches(rth, fan_df)
                     ema_df  = confirmation_from_ema(rth)
 
@@ -491,14 +504,14 @@ with tab4:
                     price = p1_price + slope*b
                     rows.append({"Time": slot.strftime("%H:%M"), "Contract_Price": round(price,2), "Blocks": round(b,1)})
                 proj_df = pd.DataFrame(rows)
-                st.markdown(f"**Derived slope:** {slope:+.4f} per 30-min block • Prices capped typically between 0–30")
+                st.markdown(f"**Derived slope:** {slope:+.4f} per 30-min block • Typical prices 0–30")
                 st.dataframe(proj_df, use_container_width=True, hide_index=True)
     else:
         st.info("Fill the two points in the sidebar, then click **Analyze Contract Projection**.")
 
 st.markdown("---")
 
-# Quick connectivity test (quiet UI)
+# Connectivity test (quiet)
 colA, colB = st.columns([1, 2])
 with colA:
     if st.button("🔌 Test Data Connection"):
@@ -510,4 +523,4 @@ with colA:
         else:
             st.error("Data fetch failed — try different dates later.")
 with colB:
-    st.caption("Note: **auto_adjust=False** preserves raw closes. We fall back to **SPY** only if ^GSPC is sparse.")
+    st.caption("Tip: Turn on **manual 3:00 PM CT close** in the sidebar to remove any data-source variance.")
