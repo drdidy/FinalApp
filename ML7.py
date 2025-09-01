@@ -1,8 +1,9 @@
 # app.py
 # ═══════════════════════════════════════════════════════════════════════════════
 # 🔮 SPX PROPHET — ENTERPRISE EDITION (All 4 tabs, unified)
-# Core: Close-anchor fan from previous day’s 3:00 PM CT close, slope ±0.277/30m
+# Core: Close-anchor fan from previous trading day’s 3:00 PM CT close, slope ±0.277/30m
 # UI: Light/glass, concise tables, no debug/dev text
+# Fix: Sidebar visible (no header hide), plus inline controls fallback
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import streamlit as st
@@ -17,15 +18,10 @@ from typing import Dict, List, Optional, Tuple
 # CORE SETTINGS
 # ───────────────────────────────────────────────────────────────────────────────
 CT_TZ = pytz.timezone('America/Chicago')
-
-# Regular Trading Hours (CT)
-RTH_START = "08:30"
-RTH_END   = "14:30"
-
-# Default slope magnitude per 30-min block (your calibrated value)
+RTH_START = "08:30"  # CT
+RTH_END   = "14:30"  # CT
 DEFAULT_SLOPE = 0.277  # Top = +slope, Bottom = −slope
 
-# Stock slope presets (kept for Stock tab input defaults)
 STOCK_SLOPES_DEFAULT = {
     "TSLA": 0.0285, "NVDA": 0.086, "AAPL": 0.0155, "MSFT": 0.0541,
     "AMZN": 0.0139, "GOOGL": 0.0122, "META": 0.0674, "NFLX": 0.0230
@@ -41,7 +37,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Light / glass (neumorphism) styling
+# Light / glass (neumorphism) styling — header is now visible so the sidebar toggle shows
 st.markdown("""
 <style>
     :root {
@@ -54,7 +50,7 @@ st.markdown("""
         --warning: #f59e0b;  /* amber-500 */
         --muted: #6b7280;    /* gray-500 */
     }
-    .block-container { padding-top: 1.5rem; }
+    .block-container { padding-top: 1.0rem; }
     body { background: linear-gradient(135deg,#f8fafc 0%,#eef2ff 50%,#f0fdf4 100%); }
 
     .glass {
@@ -79,7 +75,6 @@ st.markdown("""
     .warn { color: var(--warning); }
     .bad  { color: var(--danger); }
 
-    /* Buttons */
     .stButton>button {
         border-radius: 12px !important;
         padding: .6rem 1.0rem !important;
@@ -87,10 +82,7 @@ st.markdown("""
         box-shadow: 0 6px 18px rgba(37,99,235,0.15) !important;
         font-weight: 700 !important;
     }
-    /* Tables */
     .stDataFrame { background: rgba(255,255,255,0.92); border-radius: 14px; }
-    /* Hide default Streamlit header space */
-    header { visibility: hidden; height: 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -98,7 +90,6 @@ st.markdown("""
 # UTILITIES
 # ───────────────────────────────────────────────────────────────────────────────
 def rth_slots_ct(target_date: date) -> List[datetime]:
-    """Generate 30-min RTH time slots in CT for the projection day."""
     start_dt = CT_TZ.localize(datetime.combine(target_date, time(8,30)))
     end_dt   = CT_TZ.localize(datetime.combine(target_date, time(14,30)))
     slots = []
@@ -151,7 +142,6 @@ def fetch_live_data(symbol: str, start_date: date, end_date: date) -> pd.DataFra
         )
         df = _normalize(df)
         if df.empty:
-            # fallback by period
             days = max(7, (end_date - start_date).days + 7)
             df2 = t.history(period=f"{days}d", interval="30m",
                             prepost=True, auto_adjust=False, back_adjust=False)
@@ -175,36 +165,31 @@ def get_daily_ohlc(df: pd.DataFrame, target_date: date) -> Dict:
     open_ = day.iloc[0]['Open']
     high  = day['High'].max(); t_high = day[day['High']==high].index[0]
     low   = day['Low'].min();  t_low  = day[day['Low']==low].index[0]
-    close = day.loc[day.index == CT_TZ.localize(datetime.combine(target_date, time(15,0))), 'Close']
-    if close.empty:
-        # fallback: nearest bar in [14:30, 15:00]
+    # Use precise 15:00 close if present; otherwise last bar in [14:30, 15:00]
+    close_15 = day.loc[day.index == CT_TZ.localize(datetime.combine(target_date, time(15,0))), 'Close']
+    if close_15.empty:
         late = day.between_time("14:30","15:00")
         close_val = late.iloc[-1]['Close'] if not late.empty else day.iloc[-1]['Close']
         t_close   = late.index[-1] if not late.empty else day.index[-1]
     else:
-        close_val = float(close.iloc[0]); t_close = CT_TZ.localize(datetime.combine(target_date, time(15,0)))
+        close_val = float(close_15.iloc[0]); t_close = CT_TZ.localize(datetime.combine(target_date, time(15,0)))
     return {'open':(open_, day.index[0]),
             'high':(high, t_high),
             'low': (low,  t_low),
             'close':(close_val, t_close)}
 
 # ───────────────────────────────────────────────────────────────────────────────
-# BLOCK MATH (3:00 PM CT anchor → next-day RTH slots), skipping 1h maintenance
+# BLOCK MATH (3:00 PM CT anchor → next-day RTH), maintenance hour excluded
+# 08:30 → 33, 09:00 → 34, …, 14:30 → 45
 # ───────────────────────────────────────────────────────────────────────────────
 def blocks_from_3pm_to(time_label: str) -> int:
-    """
-    Returns the number of 30-min blocks from 3:00 PM CT (previous trading day)
-    to a given next-day RTH time label (HH:MM).
-    Maintenance (3:30–4:30 PM) = 2 blocks removed.
-    Mapping: 08:30 → 33, 09:00 → 34, ..., 14:30 → 45.
-    """
-    base = 33  # 3:00 → 08:30 next day
+    base = 33  # 3:00 PM → 08:30 next day
     hh, mm = map(int, time_label.split(":"))
     steps_after_830 = ((hh - 8) * 60 + (mm - 30)) // 30
     return base + max(0, steps_after_830)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# FAN PROJECTIONS
+# FAN PROJECTIONS + STRATEGY
 # ───────────────────────────────────────────────────────────────────────────────
 def project_close_fan(close_price: float, target_date: date, slope: float) -> pd.DataFrame:
     rows=[]
@@ -222,12 +207,7 @@ def project_close_fan(close_price: float, target_date: date, slope: float) -> pd
     return pd.DataFrame(rows)
 
 def project_line_from_anchor(anchor_price: float, anchor_time_label: str, target_date: date, slope: float, col_name:str) -> pd.DataFrame:
-    """
-    Generic line with the same slope rule: price + slope * blocks_from_3pm_to(time)
-    Uses the time-of-day label of the anchor (e.g. '15:00', '14:10' rounded logic not needed since anchor is 15:00 for OHLC).
-    For High (+slope) / Low (−slope) we still use the same block count function.
-    """
-    anchor_blocks = blocks_from_3pm_to(anchor_time_label)  # 15:00 → 33 base for next day; here anchor is 15:00, so 33 at 08:30, etc.
+    anchor_blocks = blocks_from_3pm_to(anchor_time_label)
     rows=[]
     for t in rth_slots_ct(target_date):
         label = format_ct_time(t)
@@ -240,8 +220,7 @@ def df_lookup(df: pd.DataFrame, price_col: str) -> Dict[str,float]:
     return {row['Time']: row[price_col] for _,row in df[['Time',price_col]].iterrows()}
 
 def build_strategy_table(spx_rth: pd.DataFrame, fan_df: pd.DataFrame,
-                         high_up_df: pd.DataFrame, low_dn_df: pd.DataFrame,
-                         close_anchor: float) -> pd.DataFrame:
+                         high_up_df: pd.DataFrame, low_dn_df: pd.DataFrame) -> pd.DataFrame:
     if spx_rth.empty or fan_df.empty:
         return pd.DataFrame()
 
@@ -261,7 +240,7 @@ def build_strategy_table(spx_rth: pd.DataFrame, fan_df: pd.DataFrame,
         bot = bot_at.get(t, np.nan)
         width = (top - bot) if (pd.notna(top) and pd.notna(bot)) else np.nan
 
-        # Bias by fan: above = UP, below = DOWN, within = RANGE
+        # Bias by fan: Above → UP, Below → DOWN, inside → RANGE
         if pd.isna(top) or pd.isna(bot):
             bias = "—"
         elif p > top:
@@ -271,28 +250,24 @@ def build_strategy_table(spx_rth: pd.DataFrame, fan_df: pd.DataFrame,
         else:
             bias = "RANGE"
 
-        # Strategy per your rules (concise)
         entry_side = ""; entry = tp1 = tp2 = np.nan; note = ""
 
         if bias == "RANGE":
-            # Within fan → trade back to opposite edge
             if p - ((top+bot)/2) >= 0:  # leaning high
                 entry_side = "SELL"; entry = top; tp1 = bot; tp2 = bot; note = "Within fan → sell top → exit bottom"
             else:
                 entry_side = "BUY";  entry = bot; tp1 = top; tp2 = top; note = "Within fan → buy bottom → exit top"
 
         elif bias == "UP":
-            # Above fan → entry = Top; TP2 = Top - width; TP1 = ascending High line
             entry_side = "SELL"; entry = top
             tp2 = (top - width) if pd.notna(width) else np.nan
-            tp1 = high_up.get(t, np.nan)
+            tp1 = high_up.get(t, np.nan)  # ascending line from previous High
             note = "Above fan → entry at Top; TP1=High+; TP2=Top−Width"
 
         elif bias == "DOWN":
-            # Below fan → entry = Bottom; TP2 = Bottom - width; TP1 = descending Low line
             entry_side = "SELL"; entry = bot
             tp2 = (bot - width) if pd.notna(width) else np.nan
-            tp1 = low_dn.get(t, np.nan)
+            tp1 = low_dn.get(t, np.nan)   # descending line from previous Low
             note = "Below fan → entry at Bottom; TP1=Low−; TP2=Bottom−Width"
 
         rows.append({
@@ -310,7 +285,7 @@ def build_strategy_table(spx_rth: pd.DataFrame, fan_df: pd.DataFrame,
         })
     return pd.DataFrame(rows)
 
-# Indicators used in Signals tab
+# Indicators for Signals tab
 def calculate_ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span).mean()
 
@@ -332,17 +307,15 @@ def calculate_market_volatility(data: pd.DataFrame) -> float:
 # SIDEBAR — GLOBAL CONTROLS
 # ───────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### 📊 SPX Prophet Controls")
+    st.header("📊 Controls")
     today_ct = datetime.now(CT_TZ).date()
-
-    prev_day = st.date_input("Previous Trading Day", value=today_ct - timedelta(days=1), key="prev_day")
-    proj_day = st.date_input("Projection Day", value=prev_day + timedelta(days=1), key="proj_day")
-
-    slope = st.number_input("Slope per 30-min block", value=DEFAULT_SLOPE, step=0.001, format="%.3f", help="Top = +slope × blocks; Bottom = −slope × blocks")
+    prev_day_sb = st.date_input("Previous Trading Day", value=today_ct - timedelta(days=1), key="prev_day_sb")
+    proj_day_sb = st.date_input("Projection Day", value=prev_day_sb + timedelta(days=1), key="proj_day_sb")
+    slope_sb = st.number_input("Slope per 30-min block", value=DEFAULT_SLOPE, step=0.001, format="%.3f")
 
     st.markdown("---")
-    st.markdown("### 🧪 Slope Calibrator (optional)")
-    st.caption("Use Yahoo 3:00 PM CT close + a desired time/price to compute a tuned slope.")
+    st.subheader("🧪 Slope Calibrator")
+    st.caption("Solve slope from Yahoo 3:00 PM CT close and a desired price/time.")
     calib_close = st.number_input("Yahoo 3:00 PM CT Close", value=0.0, step=0.01, format="%.2f", key="calib_close")
     calib_time  = st.selectbox("Target Time (CT)", ["08:30","09:00","09:30","10:00","10:30","11:00","11:30","12:00","12:30","13:00","13:30","14:00","14:30"], index=0)
     calib_price = st.number_input("Desired Price @ Target Time", value=0.0, step=0.01, format="%.2f", key="calib_price")
@@ -385,12 +358,31 @@ with colC:
     st.markdown(f"""
     <div class="metricCard">
       <div class="metricTitle">Slope per 30-min</div>
-      <div class="metricValue">📐 {slope:+.3f}</div>
+      <div class="metricValue">📐 {st.session_state.get('slope_effective', DEFAULT_SLOPE):+.3f}</div>
       <div style="color:#6b7280;">Top = +slope • Bottom = −slope</div>
     </div>
     """, unsafe_allow_html=True)
 
 st.markdown("<div class='glass'></div>", unsafe_allow_html=True)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# INLINE CONTROLS (fallback if user doesn’t use sidebar)
+# ───────────────────────────────────────────────────────────────────────────────
+with st.expander("⚙️ Inline Controls (use these if your sidebar is hidden)"):
+    today_ct = datetime.now(CT_TZ).date()
+    c1, c2, c3 = st.columns([1,1,1])
+    with c1:
+        prev_day_inline = st.date_input("Previous Trading Day (inline)", value=today_ct - timedelta(days=1), key="prev_day_inline")
+    with c2:
+        proj_day_inline = st.date_input("Projection Day (inline)", value=prev_day_inline + timedelta(days=1), key="proj_day_inline")
+    with c3:
+        slope_inline = st.number_input("Slope per 30-min (inline)", value=DEFAULT_SLOPE, step=0.001, format="%.3f", key="slope_inline")
+
+# Decide effective values: sidebar wins if used, else inline
+prev_day = st.session_state.get("prev_day_sb", st.session_state.get("prev_day_inline"))
+proj_day = st.session_state.get("proj_day_sb", st.session_state.get("proj_day_inline"))
+slope    = st.session_state.get("slope_sb",    st.session_state.get("slope_inline", DEFAULT_SLOPE))
+st.session_state['slope_effective'] = slope
 
 # ───────────────────────────────────────────────────────────────────────────────
 # TABS
@@ -404,38 +396,28 @@ with tab1:
     st.subheader("SPX Close-Anchor Fan")
     st.caption("Anchored at the previous trading day’s 3:00 PM CT close. Maintenance hour excluded (3:30–4:30 PM).")
 
-    # Pull SPX (^GSPC) for prev & proj days (SPX-only display)
     spx_prev = fetch_live_data("^GSPC", prev_day, prev_day)
     spx_proj = fetch_live_data("^GSPC", proj_day, proj_day)
 
     if spx_prev.empty or spx_proj.empty:
         st.error("Live market data not available for the selected dates.")
     else:
-        # RTH slice for projection day
         spx_proj_rth = get_session_window(spx_proj, RTH_START, RTH_END)
 
-        # Extract precise 3:00 PM CT close for prev day
         dprev = get_daily_ohlc(spx_prev, prev_day)
         if not dprev or 'close' not in dprev:
             st.error("Could not determine the 3:00 PM CT close for the previous day.")
         else:
-            close_px, close_t = dprev['close']
-            high_px, high_t = dprev['high']
-            low_px,  low_t  = dprev['low']
+            close_px, _ = dprev['close']
+            high_px, _  = dprev['high']
+            low_px,  _  = dprev['low']
 
-            # Build fan (+/- slope * blocks_from_3pm)
             fan_df = project_close_fan(close_px, proj_day, slope)
-
-            # High ascending (TP1 reference when above fan)
             high_up_df = project_line_from_anchor(high_px, "15:00", proj_day, +slope, "High_Asc")
-
-            # Low descending (TP1 reference when below fan)
             low_dn_df  = project_line_from_anchor(low_px,  "15:00", proj_day, -slope, "Low_Desc")
 
-            # Strategy table (concise)
-            strat_df = build_strategy_table(spx_proj_rth, fan_df, high_up_df, low_dn_df, close_px)
+            strat_df = build_strategy_table(spx_proj_rth, fan_df, high_up_df, low_dn_df)
 
-            # Display
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown("#### 🧭 Fan Lines")
@@ -444,7 +426,6 @@ with tab1:
                 st.markdown("#### 🎯 Strategy Summary")
                 st.dataframe(strat_df, use_container_width=True, hide_index=True)
 
-            # Quick bullets for clarity
             st.markdown("""
             <div class="glass">
                 <b>How to read:</b>
@@ -464,7 +445,6 @@ with tab2:
     st.subheader("Stock Anchors (Mon/Tue)")
     st.caption("Quick pull & combined preview (30-min).")
 
-    # Ticker pickers
     core_tickers = list(STOCK_SLOPES_DEFAULT.keys())
     tcols = st.columns(4)
     chosen = st.session_state.get("stock_ticker", None)
@@ -479,7 +459,6 @@ with tab2:
         st.session_state["stock_ticker"] = chosen
 
     if chosen:
-        # Defaults for slope controls (not used for SPX fan)
         st.caption(f"Default slope for {chosen}: {STOCK_SLOPES_DEFAULT.get(chosen, 0.0150):.4f}")
 
         left, mid, right = st.columns(3)
@@ -500,7 +479,7 @@ with tab2:
                 st.dataframe(combined.tail(48), use_container_width=True)
 
 # ╔═════════════════════════════════════════════════════════════════════════════╗
-# ║ TAB 3: SIGNALS & EMA (RTH, EMA 8/21, concise)                              ║
+# ║ TAB 3: SIGNALS & EMA (RTH, EMA 8/21)                                       ║
 # ╚═════════════════════════════════════════════════════════════════════════════╝
 with tab3:
     st.subheader("Signals & EMA (RTH)")
